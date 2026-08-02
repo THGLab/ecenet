@@ -34,7 +34,7 @@ import torch.nn as nn
 from ecenet.ace_basis import ACEBasisAnalytic
 from ecenet.equivariant import EquivariantLinear, RealSpaceNonlinearity
 from ecenet.radial import find_edges, get_cutoff_fn, radial_basis
-from ecenet.spherical import build_D1_from_rhat, build_D_block, spherical_harmonics_float64, wigner_rotate
+from ecenet.spherical import build_D_block, spherical_harmonics_float64, wigner_rotate
 
 # ---------------------------------------------------------------------------
 # Main model
@@ -251,99 +251,6 @@ class ECENet(nn.Module):
         return self.output_net(invariants, **out_kw).squeeze(-1) * env
 
 
-    def _pack_sph(self, A_cos, A_sin):
-        """Pack (n_edges, n_ch, n_angular) back to (n_edges, n_ch, n_sph).
-
-        Inverse of SphToAngular: scatters A_cos (m≥0) and A_sin (m<0) back
-        to their SH indices using the precomputed index buffers.
-        """
-        n_e = A_cos.shape[0]
-        cos_idx = self.sph_to_angular.cos_idx          # (n_ch, n_angular)
-        sin_idx = self.sph_to_angular.sin_idx
-        cos_valid = self.sph_to_angular.cos_valid
-        sin_valid = self.sph_to_angular.sin_valid
-        h = torch.zeros(n_e, self.n_features_per_m, self.n_sph,
-                        device=A_cos.device, dtype=A_cos.dtype)
-        h = h.scatter_add(2, cos_idx[None].expand(n_e, -1, -1), A_cos * cos_valid)
-        h = h.scatter_add(2, sin_idx[None].expand(n_e, -1, -1), A_sin * sin_valid)
-        return h  # (n_edges, n_ch, n_sph)
-
-    def _aggregate_lr_embeddings(self, A_cos, A_sin, r_hat, edge_j, n_atoms):
-        """Aggregate edge features to per-atom (l0, l1) equivariant embeddings
-        (exposed via return_embeddings; e.g. for downstream long-range terms).
-
-        Avoids the full Wigner T rotation by:
-          1. Pack A_cos/A_sin → full SH in bond frame  (E, n_ch, n_sph)
-          2. Sum over the l'-expansion axis first       (E, 2*embed_dim, n_sph)
-          3. l=0: D^0=1, rotation-invariant — take directly
-          4. l=1: apply D^1_T (3×3) to get global frame — much cheaper than full D^l_max
-          5. Scatter-sum to atoms
-
-        Returns:
-            l0: (n_atoms, 2*embed_dim)     per-atom invariant scalar embeddings
-            l1: (n_atoms, 2*embed_dim, 3)  per-atom equivariant vector embeddings
-        """
-        device, dtype = A_cos.device, A_cos.dtype
-        n_e = A_cos.shape[0]
-        n_base = 2 * self.embed_dim
-
-        h = self._pack_sph(A_cos, A_sin)                            # (E, n_ch, n_sph)
-
-        # Sum over l'-expansion axis first (rotation is linear, sum commutes with D^T)
-        h_sum = (h.view(n_e, n_base, self.l_max + 1, self.n_sph)
-                  .sum(dim=2))                                       # (E, 2*embed_dim, n_sph)
-
-        # l=0: D^0 = 1, no rotation needed
-        h_l0 = h_sum[:, :, 0]                                       # (E, 2*embed_dim)
-
-        # l=1: apply D^1_T (3×3) — unrotate bond-frame l=1 to global frame
-        # forward rotation: A_rot = A @ D  →  unrotate: h_global = h_bond @ D^T
-        # einsum: h_global[e,c,n] = Σ_m h_bond[e,c,m] * D[e,n,m]
-        D1 = build_D1_from_rhat(r_hat)                              # (E, 3, 3)
-        h_l1 = torch.einsum('ecm,enm->ecn', h_sum[:, :, 1:4], D1)  # (E, 2*embed_dim, 3)
-
-        idx_j0 = edge_j[:, None].expand_as(h_l0)
-        idx_j1 = edge_j[:, None, None].expand_as(h_l1)
-
-        l0 = torch.zeros(n_atoms, n_base, device=device, dtype=dtype
-                         ).scatter_add(0, idx_j0, h_l0)
-        l1 = torch.zeros(n_atoms, n_base, 3, device=device, dtype=dtype
-                         ).scatter_add(0, idx_j1, h_l1)
-        return l0, l1
-
-    def _aggregate_node_sph(self, A_cos, A_sin, r_hat, edge_j, n_atoms, D_block=None):
-        """Aggregate edge features to per-atom spherical embeddings (global frame).
-
-        Full-l counterpart of _aggregate_lr_embeddings: instead of extracting only
-        l=0 (l0) and l=1 (l1), it unrotates *every* l with the Wigner D-block and
-        scatters to atoms, yielding the per-node spherical tensor (exposed via
-        return_node_sph).
-
-          1. Pack A_cos/A_sin → full SH in the bond frame   (E, n_ch, n_sph)
-          2. Sum over the l-expansion axis                  (E, 2*embed_dim, n_sph)
-          3. Unrotate to the global frame: h_global = h_bond @ D^T (forward is A @ D)
-          4. Scatter-sum to atoms
-
-        Returns:
-            node_sph: (n_atoms, 2*embed_dim, n_sph) global-frame node embeddings
-        """
-        device, dtype = A_cos.device, A_cos.dtype
-        n_e = A_cos.shape[0]
-        n_base = 2 * self.embed_dim
-
-        h = self._pack_sph(A_cos, A_sin)                            # (E, n_ch, n_sph)
-        h_sum = (h.view(n_e, n_base, self.l_max + 1, self.n_sph)
-                  .sum(dim=2))                                       # (E, 2*embed_dim, n_sph)
-
-        if D_block is None:
-            D_block = build_D_block(r_hat, self.l_max)
-        h_global = torch.bmm(h_sum, D_block.transpose(-1, -2).contiguous())  # (E, n_base, n_sph)
-
-        idx = edge_j[:, None, None].expand_as(h_global)
-        node_sph = torch.zeros(n_atoms, n_base, self.n_sph, device=device, dtype=dtype
-                               ).scatter_add(0, idx, h_global)
-        return node_sph
-
     def _run_equivariant_layers(self, A_cos, A_sin, **kwargs):
         """Run the equivariant layers, interleaving a message-passing layer
         between consecutive stages when n_mp >= 2 (n_mp-1 MP layers, no trailing MP)."""
@@ -376,41 +283,22 @@ class ECENet(nn.Module):
 
     # ── Forward ────────────────────────────────────────────────────────────
 
-    def forward(self, positions: torch.Tensor, types: torch.Tensor,
-                return_embeddings: bool = False, return_node_sph: bool = False):
-        """Compute total energy, and optionally per-atom embeddings.
+    def forward(self, positions: torch.Tensor, types: torch.Tensor):
+        """Compute total energy.
 
         Args:
             positions:         (n_atoms, 3)
             types:             (n_atoms,) int tensor of atom-type indices
-            return_embeddings: if True, also return per-atom (l0, l1) equivariant
-                               embeddings for downstream use (e.g. long-range terms)
-            return_node_sph:   if True, also return the per-atom node_sph features
 
         Returns:
-            energy                          if neither flag is set
-            (energy, l0, l1)               if return_embeddings is True
-              l0: (N, 2*embed_dim)
-              l1: (N, 2*embed_dim, 3)
-            (energy, node_sph)             if return_node_sph is True
-              node_sph: (N, 2*embed_dim, n_sph)
+            energy: scalar tensor
         """
         device, dtype = positions.device, positions.dtype
 
         # ── Edges ─────────────────────────────────────────────────────────
         edge_i_undir, edge_j_undir = find_edges(positions, self.r_cut_edge)
         if len(edge_i_undir) == 0:
-            energy = torch.zeros(1, device=device, dtype=dtype).squeeze()
-            N = len(types)
-            if return_node_sph:
-                node_sph = torch.zeros(N, 2 * self.embed_dim, self.n_sph,
-                                       device=device, dtype=dtype)
-                return energy, node_sph
-            if return_embeddings:
-                l0 = torch.zeros(N, 2 * self.embed_dim, device=device, dtype=dtype)
-                l1 = torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype)
-                return energy, l0, l1
-            return energy
+            return torch.zeros(1, device=device, dtype=dtype).squeeze()
 
         edge_i = torch.cat([edge_i_undir, edge_j_undir])
         edge_j = torch.cat([edge_j_undir, edge_i_undir])
@@ -458,24 +346,13 @@ class ECENet(nn.Module):
         # ── Step 6+7: m=0 invariants → output_net → dot(rij_basis) ──────────
         invariants = self._contract(A_cos, A_sin)   # (n_edges, n_features_per_m)
         per_edge_energy = self._apply_output(invariants, dist_ij, type_i, type_j, type_idx=type_idx)
-        energy = per_edge_energy.sum() + self.atomic_energy[types].sum()
-
-        if return_node_sph:
-            node_sph = self._aggregate_node_sph(
-                A_cos, A_sin, r_hat, edge_j, len(types), D_block)
-            return energy, node_sph
-        if return_embeddings:
-            l0, l1 = self._aggregate_lr_embeddings(
-                A_cos, A_sin, r_hat, edge_j, len(types))
-            return energy, l0, l1
-        return energy
+        return per_edge_energy.sum() + self.atomic_energy[types].sum()
 
     def forward_pbc(self, positions: torch.Tensor, types: torch.Tensor,
                     edge_i: torch.Tensor, edge_j: torch.Tensor,
                     shift_vecs_edge: torch.Tensor,
                     nb_src: torch.Tensor, nb_dst: torch.Tensor,
-                    shift_vecs_nb: torch.Tensor,
-                    return_embeddings: bool = False, return_node_sph: bool = False):
+                    shift_vecs_nb: torch.Tensor):
         """Compute total energy with periodic boundary conditions.
 
         Args:
@@ -485,28 +362,15 @@ class ECENet(nn.Module):
             shift_vecs_edge:   (n_edges, 3) Cartesian PBC shift vectors for edges
             nb_src, nb_dst:    (n_nb,) directed neighbor pair indices
             shift_vecs_nb:     (n_nb, 3) Cartesian PBC shift vectors for neighbors
-            return_embeddings: if True, also return per-atom (l0, l1) embeddings
 
         Returns:
-            energy                  if return_embeddings is False
-            (energy, l0, l1)        if return_embeddings is True
-              l0: (N, 2*embed_dim)
-              l1: (N, 2*embed_dim, 3)
+            energy: scalar tensor
         """
         device, dtype = positions.device, positions.dtype
         n_edges = len(edge_i)
 
         if n_edges == 0:
-            energy = torch.zeros(1, device=device, dtype=dtype).squeeze()
-            N = len(types)
-            if return_node_sph:
-                return energy, torch.zeros(N, 2 * self.embed_dim, self.n_sph,
-                                           device=device, dtype=dtype)
-            if return_embeddings:
-                return (energy,
-                        torch.zeros(N, 2 * self.embed_dim, device=device, dtype=dtype),
-                        torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype))
-            return energy
+            return torch.zeros(1, device=device, dtype=dtype).squeeze()
 
         # ── Edges with PBC shifts ──────────────────────────────────────────
         diff_ij = (positions[edge_j] - positions[edge_i]
@@ -542,20 +406,9 @@ class ECENet(nn.Module):
 
         invariants = self._contract(A_cos, A_sin)
         per_edge_energy = self._apply_output(invariants, dist_ij, ti, tj, type_idx=type_idx)
-        energy = per_edge_energy.sum() + self.atomic_energy[types].sum()
+        return per_edge_energy.sum() + self.atomic_energy[types].sum()
 
-        if return_node_sph:
-            node_sph = self._aggregate_node_sph(
-                A_cos, A_sin, r_hat, edge_j, len(types), D_block)
-            return energy, node_sph
-        if return_embeddings:
-            l0, l1 = self._aggregate_lr_embeddings(
-                A_cos, A_sin, r_hat, edge_j, len(types))
-            return energy, l0, l1
-        return energy
-
-    def forward_batch_multi(self, positions_list, types_list,
-                            return_embeddings=False, return_node_sph=False):
+    def forward_batch_multi(self, positions_list, types_list):
         """Batch forward for variable-size, variable-composition structures.
 
         Topology is built per-structure in a cheap Python loop; the expensive
@@ -565,13 +418,9 @@ class ECENet(nn.Module):
         Args:
             positions_list:  list of B tensors, each (N_b, 3)
             types_list:      list of B tensors, each (N_b,) of type indices
-            return_embeddings: if True, also return per-atom (l0_list, l1_list) embeddings
 
         Returns:
-            energies                          if return_embeddings is False
-            (energies, l0_list, l1_list)      if return_embeddings is True
-              l0_list: list of B (N_b, 2*embed_dim) tensors
-              l1_list: list of B (N_b, 2*embed_dim, 3) tensors
+            energies: (B,) tensor
         """
         B = len(positions_list)
         device = positions_list[0].device
@@ -623,17 +472,6 @@ class ECENet(nn.Module):
 
         total_edges = sum(len(x) for x in r_hat_list)
         if total_edges == 0:
-            n_ch = 2 * self.embed_dim
-            if return_node_sph:
-                node_sph_list = [torch.zeros(c, n_ch, self.n_sph, dtype=dtype, device=device)
-                                 for c in atom_counts]
-                return energies, node_sph_list
-            if return_embeddings:
-                l0_list = [torch.zeros(c, n_ch, dtype=dtype, device=device)
-                           for c in atom_counts]
-                l1_list = [torch.zeros(c, n_ch, 3, dtype=dtype, device=device)
-                           for c in atom_counts]
-                return energies, l0_list, l1_list
             return energies
 
         # Merge flat edge arrays
@@ -668,30 +506,9 @@ class ECENet(nn.Module):
         energies = energies + torch.zeros(B, dtype=dtype, device=device).scatter_add(
             0, struct_idx, per_edge_energy)
 
-        if return_node_sph:
-            node_sph_flat = self._aggregate_node_sph(
-                A_cos, A_sin, r_hat, edge_j_flat, atom_offset, D_block)
-            node_sph_list = []
-            offset = 0
-            for N_b in atom_counts:
-                node_sph_list.append(node_sph_flat[offset:offset + N_b])
-                offset += N_b
-            return energies, node_sph_list
-        if return_embeddings:
-            l0_flat, l1_flat = self._aggregate_lr_embeddings(
-                A_cos, A_sin, r_hat, edge_j_flat, atom_offset)
-            # Slice per structure using atom offsets
-            l0_list, l1_list = [], []
-            offset = 0
-            for N_b in atom_counts:
-                l0_list.append(l0_flat[offset:offset + N_b])
-                l1_list.append(l1_flat[offset:offset + N_b])
-                offset += N_b
-            return energies, l0_list, l1_list
         return energies
 
-    def forward_batch(self, positions_list, types, topology=None,
-                      return_embeddings=False, return_node_sph=False):
+    def forward_batch(self, positions_list, types, topology=None):
         """Compute energies for a batch of structures sharing the same atom types.
 
         Args:
@@ -711,9 +528,7 @@ class ECENet(nn.Module):
             # vector). It builds topology per-structure and runs the expensive
             # ops once on the merged flat edge set — identical result.
             return self.forward_batch_multi(
-                positions_list, [types] * len(positions_list),
-                return_embeddings=return_embeddings,
-                return_node_sph=return_node_sph)
+                positions_list, [types] * len(positions_list))
 
         # ── Fixed topology: vectorized over B ─────────────────────────────
         B = len(positions_list)
@@ -781,17 +596,6 @@ class ECENet(nn.Module):
         energies = per_edge_energy.reshape(B, n_edges).sum(dim=1)        # (B,)
         energies = energies + self.atomic_energy[types].sum()
 
-        if return_node_sph:
-            node_sph_flat = self._aggregate_node_sph(
-                A_cos_flat, A_sin_flat, r_hat_flat, edge_j_flat, B * N, D_block)
-            node_sph_list = [node_sph_flat[b * N:(b + 1) * N] for b in range(B)]
-            return energies, node_sph_list
-        if return_embeddings:
-            l0_flat, l1_flat = self._aggregate_lr_embeddings(
-                A_cos_flat, A_sin_flat, r_hat_flat, edge_j_flat, B * N)
-            l0_list = [l0_flat[b * N:(b + 1) * N] for b in range(B)]
-            l1_list = [l1_flat[b * N:(b + 1) * N] for b in range(B)]
-            return energies, l0_list, l1_list
         return energies
 
 
