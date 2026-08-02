@@ -111,7 +111,8 @@ class ECENetCalculator(Calculator):
         from ecenet import ECENet
 
         if device is None:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') elif isinstance(device, str):
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        elif isinstance(device, str):
             device = torch.device(device)
 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -238,7 +239,7 @@ class ECENetCalculator(Calculator):
         return time.perf_counter()
 
     def _compute_stress(self, pos, types, edge_i, edge_j, shift_vecs_edge,
-                        nb_src, nb_dst, shift_vecs_nb): # Prototype, mainly implmented by Claude
+                        nb_src, nb_dst, shift_vecs_nb): # Prototype, mainly implemented by Claude
         """Strain-based energy / forces / stress for a periodic system.
 
         Applies an infinitesimal symbolic strain to the positions and the PBC
