@@ -1,3 +1,4 @@
+# Prototype, mainly implemented by Claude
 """Finite-difference test for stress (pressure) in ECENetCalculator.
 
 For each of the 9 strain components ε_ij the analytic stress

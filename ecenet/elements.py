@@ -7,7 +7,7 @@ elements becomes type indices.
 Type maps are kept **compact**: a dense ``0..n_types-1`` indexing over only the
 elements actually present, *not* a fixed global table. This is deliberate —
 model size scales with ``n_types`` (the type-conditioned contraction weight is
-``n_types²``), so a 4-element molecule must not pay for 100+ absent elements.
+``n_types²``), so a 4-element molecule must not pay for 80+ absent elements.
 
 Two equivalent representations appear:
   * ``type_map``         — ``{atomic_number: idx}`` (how the data, which carries
