@@ -134,6 +134,9 @@ class ECENetCalculator(Calculator):
         # separately; the rest of hparams maps directly onto ECENet's signature.
         hp = dict(hp)  # copy so we can pop
         n_mp = hp.pop('n_mp', 1)
+        # Removed feature; older checkpoints still carry it in hparams. It was
+        # never enabled (always 0), so no weights are affected.
+        hp.pop('n_dist_embed', None)
 
         model = ECENet(**hp, n_mp=n_mp)
         if dtype == torch.float64:

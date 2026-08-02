@@ -163,7 +163,6 @@ def train_ecenet(
     n_grid=None,
     output_hidden_dims=None,
     analytic_ace_basis=True,
-    n_dist_embed=0,
     m_max=None,
     edge_type_nonlin=False,
     edge_type_linear=False,
@@ -246,7 +245,6 @@ def train_ecenet(
         n_grid=n_grid,
         output_hidden_dims=output_hidden_dims,
         analytic_ace_basis=analytic_ace_basis,
-        n_dist_embed=n_dist_embed,
         m_max=m_max,
         edge_type_nonlin=edge_type_nonlin,
         edge_type_linear=edge_type_linear,
@@ -338,7 +336,6 @@ def train_ecenet(
                 use_nonlinearity=use_nonlinearity,
                 output_hidden_dims=output_hidden_dims,
                 analytic_ace_basis=analytic_ace_basis,
-                n_dist_embed=n_dist_embed,
                 n_mp=n_mp, n_dist_basis=n_dist_basis,
             ),
             # molecule-specific element mapping: {symbol: type_index}

@@ -228,7 +228,6 @@ def train_ecenet_spice(
     edge_type_linear=False,
     edge_type_output=False,
     analytic_ace_basis=True,
-    n_dist_embed=0,
     # Message passing
     n_mp=1,
     n_dist_basis=8,
@@ -339,7 +338,6 @@ def train_ecenet_spice(
         n_grid=n_grid,
         output_hidden_dims=output_hidden_dims,
         analytic_ace_basis=analytic_ace_basis,
-        n_dist_embed=n_dist_embed,
         edge_type_nonlin=edge_type_nonlin,
         edge_type_linear=edge_type_linear,
         edge_type_output=edge_type_output,
@@ -424,7 +422,6 @@ def train_ecenet_spice(
                 use_nonlinearity=use_nonlinearity,
                 output_hidden_dims=output_hidden_dims,
                 analytic_ace_basis=analytic_ace_basis,
-                n_dist_embed=n_dist_embed,
                 edge_type_nonlin=edge_type_nonlin,
                 edge_type_linear=edge_type_linear,
                 edge_type_output=edge_type_output,
