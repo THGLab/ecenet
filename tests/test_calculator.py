@@ -1,4 +1,7 @@
-"""Behavioural tests for ECENetCalculator.
+#Prototype, mainly implemented by Claude
+"""
+
+Behavioural tests for ECENetCalculator.
 
 These pin the *observable* contract of the calculator and of `from_checkpoint`.
 ecenet/calculator.py is dataset-agnostic: it reads only generic, self-describing

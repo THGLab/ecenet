@@ -31,11 +31,11 @@ def random_structure(n=6, seed=0):
     return pos, types
 
 
-def rand_rotation(seed=1):
+def rand_rotation(seed=1): #Cheap way to do a random rotation, scipy.spatial.transform.Rotation.random()
     g = torch.Generator().manual_seed(seed)
     A = torch.randn(3, 3, generator=g, dtype=DTYPE)
     Q, R = torch.linalg.qr(A)
-    Q = Q * torch.sign(torch.diag(R))           # proper-ish orthogonal
+    Q = Q * torch.sign(torch.diag(R)) # fix QR sign ambiguity -> Haar-uniform on O(3).
     if torch.det(Q) < 0:
         Q[:, 0] = -Q[:, 0]
     return Q

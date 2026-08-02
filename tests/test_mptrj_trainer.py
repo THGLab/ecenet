@@ -1,4 +1,6 @@
-"""Synthetic smoke + finite-difference test for train_ecenet_mptrj.py.
+# Prototype, mainly implemented by Claude
+"""
+Synthetic smoke + finite-difference test for train_ecenet_mptrj.py.
 
 No MPtrj download needed: builds a handful of random periodic structures and
   1. runs the trainer end-to-end (a few epochs, stress on) via injected

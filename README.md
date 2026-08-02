@@ -3,8 +3,8 @@
 **ECENet** is an SO(3)-equivariant interatomic potential (MLIP). It uses
 per-edge, SO(2)-equivariant features and passes SO(3)-equivariant messages through the nodes. The use of SO(2) features enables faster, more expressive operations than is possible with SO(3) features.
 
-- Exactly SO(3)-invariant energies (verified to ~1e-11 on random rotations).
-- Equivariant message passing (`n_mp >= 2`).
+- SO(3)-invariant energies.
+- Equivariant message passing.
 - Energy / forces / stress via autograd; ASE calculator for MD and relaxations.
 
 > 📄 **Paper forthcoming.** A preprint describing the method is in preparation.
