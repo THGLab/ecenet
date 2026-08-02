@@ -169,7 +169,6 @@ def main():
     parser.add_argument('--output_hidden_dims', type=int, nargs='+', default=None)
     parser.add_argument('--activation',       default='silu')
     parser.add_argument('--no_nonlinearity',  action='store_true')
-    parser.add_argument('--n_dist_embed',     type=int,   default=0)
     parser.add_argument('--n_mp', type=int, default=1)
     parser.add_argument('--n_dist_basis',     type=int,   default=8)
     # Eval options
@@ -225,7 +224,6 @@ def main():
             use_nonlinearity=not args.no_nonlinearity,
             output_hidden_dims=args.output_hidden_dims,
             analytic_ace_basis=True,
-            n_dist_embed=args.n_dist_embed,
             n_mp=args.n_mp, n_dist_basis=args.n_dist_basis,
         )
 

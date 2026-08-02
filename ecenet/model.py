@@ -86,7 +86,6 @@ class ECENet(nn.Module):
         n_grid: int = None,
         analytic_ace_basis: bool = True,
         output_hidden_dims: list = None,
-        n_dist_embed: int = 0,
         m_max: int = None,
         edge_type_nonlin: bool = False,
         edge_type_linear: bool = False,
@@ -110,7 +109,6 @@ class ECENet(nn.Module):
         self.n_sph = (l_max + 1) ** 2
         self.m_max = int(m_max) if m_max is not None else l_max
         self.n_angular = self.m_max + 1   # m = 0..m_max (layers only use up to m_max)
-        self.n_dist_embed = n_dist_embed
         self.edge_type_nonlin = edge_type_nonlin
         self.edge_type_linear = edge_type_linear
         self.edge_type_output = edge_type_output
@@ -118,6 +116,7 @@ class ECENet(nn.Module):
         # ── Joint (n_types, n_max) → embed_dim contraction per central atom type ──
         # W[type_i, t, n, c]: for central atom of type type_i, contract
         # neighbor type t and radial channel n into embed channel c.
+        # (Initial Atomic embedding)
         self.W = nn.Parameter(
             torch.randn(n_types, n_types, n_max, embed_dim)
             / (n_types * n_max) ** 0.5
@@ -125,21 +124,10 @@ class ECENet(nn.Module):
 
         # ── SH → A_cos/A_sin reshape ──────────────────────────────────────
         # m_max controls output angular modes; ACE basis always uses full l_max.
+        # Going from node to edge frame
         self.sph_to_angular = SphToAngular(embed_dim, l_max, m_max=self.m_max)
         # n_features_per_m = 2 * embed_dim * (l_max+1): one channel per (side, embed, l)
         self.n_features_per_m = 2 * embed_dim * (l_max + 1)
-
-        # ── Distance-conditioned edge transform (optional) ────────────────
-        # Applied to A_cos/A_sin after the Wigner rotation and reshape.
-        # Learns a per-channel distance-dependent scale:
-        #   f[e]        = radial_basis(r_ij[e])       # (n_edges, n_dist_embed)
-        #   scale[e, c] = Σ_n f[e,n] * V_dist[n, c]  # (n_edges, C)
-        #   A_cos_out   = A_cos * (1 + scale)         # broadcast over m; V_dist=0 → identity
-        # V_dist init to zero → identity at init.
-        if n_dist_embed > 0:
-            self.V_dist = nn.Parameter(
-                torch.zeros(n_dist_embed, self.n_features_per_m)
-            )
 
         # ── Equivariant layers: Linear → RealSpaceNonlinearity → residual ────
         _n_types_for_layers = n_types if edge_type_nonlin else None
@@ -240,15 +228,6 @@ class ECENet(nn.Module):
         """
         W_i = self.W[types]  # (n_atoms, n_types, n_max, embed_dim)
         return torch.einsum('itns,itnc->ics', A, W_i)
-
-    def _apply_dist_embed(self, A_cos, A_sin, dist_ij):
-        """Distance-conditioned per-channel scale on A_cos/A_sin."""
-        f = radial_basis(dist_ij, self.r_cut_edge, self.n_dist_embed,
-                         cutoff_type=self.cutoff_type)              # (n_edges, n_dist_embed)
-        scale = (f @ self.V_dist).unsqueeze(-1)                    # (n_edges, C, 1)
-        A_cos = A_cos * (1 + scale)
-        A_sin = A_sin * (1 + scale)
-        return A_cos, A_sin
 
     def _contract(self, A_cos, A_sin):
         """Extract m=0 invariants: (n_edges, n_features_per_m, n_angular) → (n_edges, n_features_per_m)."""
@@ -466,10 +445,6 @@ class ECENet(nn.Module):
         # ── Step 4: Reshape to A_cos / A_sin ──────────────────────────────
         A_cos, A_sin = self.sph_to_angular(A_rot)
 
-        # ── Step 4b: Distance-conditioned edge transform (optional) ───────
-        if self.n_dist_embed > 0:
-            A_cos, A_sin = self._apply_dist_embed(A_cos, A_sin, dist_ij)
-
         # ── Step 5: Equivariant layers ────────────────────────────────────
         ti, tj = types[edge_i], types[edge_j]
         type_idx = (precompute_type_idx_2pass(ti, tj, self.n_types)
@@ -555,9 +530,6 @@ class ECENet(nn.Module):
         A_rot  = wigner_rotate(A_both, D_block)
 
         A_cos, A_sin = self.sph_to_angular(A_rot)
-
-        if self.n_dist_embed > 0:
-            A_cos, A_sin = self._apply_dist_embed(A_cos, A_sin, dist_ij)
 
         ti, tj = types[edge_i], types[edge_j]
         type_idx = (precompute_type_idx_2pass(ti, tj, self.n_types)
@@ -681,9 +653,6 @@ class ECENet(nn.Module):
 
         A_cos, A_sin = self.sph_to_angular(A_rot)
 
-        if self.n_dist_embed > 0:
-            A_cos, A_sin = self._apply_dist_embed(A_cos, A_sin, dist_ij)
-
         type_idx = (precompute_type_idx_2pass(type_i, type_j, self.n_types)
                     if (self.edge_type_linear or self.edge_type_output) else None)
         A_cos, A_sin = self._run_equivariant_layers(
@@ -787,11 +756,6 @@ class ECENet(nn.Module):
         # ── Step 4: Reshape to A_cos / A_sin ─────────────────────────────
         A_cos_flat, A_sin_flat = self.sph_to_angular(A_rot_flat)
         # shapes: (B*n_edges, n_features_per_m, n_angular)
-
-        # ── Step 4b: Distance-conditioned edge transform (optional) ───────
-        if self.n_dist_embed > 0:
-            dist_flat = dist_ij.reshape(B * n_edges)
-            A_cos_flat, A_sin_flat = self._apply_dist_embed(A_cos_flat, A_sin_flat, dist_flat)
 
         # ── Step 5: Equivariant layers ────────────────────────────────────
         # For batched MP: offset edge indices so scatter targets B*N atoms
