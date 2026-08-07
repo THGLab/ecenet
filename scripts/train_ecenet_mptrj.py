@@ -682,7 +682,9 @@ def train_ecenet_mptrj(
     bottleneck_dim=None,
     # Message passing
     n_mp=1,
-    n_dist_basis=8,
+    mp_type='transformer',
+    mp_dim=None,
+    mp_n_heads=1,
     # Optimiser
     lr=1e-3,
     weight_decay=1e-5,
@@ -882,7 +884,9 @@ def train_ecenet_mptrj(
         output_hidden_dims=output_hidden_dims,
         analytic_ace_basis=analytic_ace_basis,
         bottleneck_dim=bottleneck_dim,
-        n_mp=n_mp, n_dist_basis=n_dist_basis,
+        n_mp=n_mp,
+        mp_type=mp_type, mp_dim=mp_dim,
+        mp_n_heads=mp_n_heads,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -956,7 +960,9 @@ def train_ecenet_mptrj(
                 output_hidden_dims=output_hidden_dims,
                 analytic_ace_basis=analytic_ace_basis,
                 bottleneck_dim=bottleneck_dim,
-                n_mp=n_mp, n_dist_basis=n_dist_basis,
+                n_mp=n_mp,
+                mp_type=mp_type, mp_dim=mp_dim,
+                mp_n_heads=mp_n_heads,
             ),
             'element_to_type': elements.to_element_to_type(type_map),  # {symbol: type_idx}
             'e_ref': e_ref,             # per-element reference energies (eV)

@@ -28,6 +28,9 @@ Pipeline:
      + per-type atomic energy baseline
 """
 
+import functools
+import warnings
+
 import torch
 import torch.nn as nn
 
@@ -57,7 +60,6 @@ class ECENet(nn.Module):
                         trailing MP). n_mp=1 (default) is the plain model with no
                         message passing. n_mp=K is equivalent to the old
                         (n_mp_steps=K-1, n_final_layers=n_layers) layout.
-        n_dist_basis:   radial basis size for the MP distance weighting
         n_max_d:        if set, outer-product the invariants with f_d(r_ij) of this rank
         m_max:          max angular mode |m| kept after the equivariant layers
                         (default: l_max); lower it to cut cost at large l_max
@@ -69,6 +71,23 @@ class ECENet(nn.Module):
         bottleneck_dim: if set, each equivariant layer becomes a low-rank block
                         (down → nonlin at this width → up, zero-init up so the
                         layer is identity at init); None → full-width layers
+        mp_type:        how messages are aggregated at each receiver atom (n_mp
+                        >= 2 only). Both styles share the same per-edge structure
+                        — a fused message/score trunk and a receiver transform —
+                        and differ only in the weight applied to each incoming
+                        message:
+                          'transformer' (default): softmax over the receiver's
+                            incoming edges, so the aggregate is a weighted
+                            *average* (intensive in coordination). Zero-init
+                            scores make the attention uniform at init.
+                          'sum': the raw signed score times the cutoff envelope,
+                            summed (extensive in coordination). Zero-init scores
+                            make the layer an exact no-op at init.
+        mp_dim:         bottleneck width of the fused message/score trunk and of
+                        the receiver block (default: n_features_per_m // 4)
+        mp_n_heads:     number of attention heads; the value channels
+                        (n_base = 2*embed_dim) split evenly across them
+                        (default 1). Ignored (with a warning) when n_mp=1.
     """
 
     def __init__(
@@ -81,7 +100,6 @@ class ECENet(nn.Module):
         embed_dim: int = 16,
         n_layers: int = 2,
         n_mp: int = 1,
-        n_dist_basis: int = 8,
         n_max_d: int = None,
         cutoff_type: str = 'cosine',
         activation: str = 'silu',
@@ -91,6 +109,9 @@ class ECENet(nn.Module):
         output_hidden_dims: list = None,
         m_max: int = None,
         bottleneck_dim: int = None,
+        mp_type: str = 'transformer',
+        mp_dim: int = None,
+        mp_n_heads: int = 1,
     ):
         super().__init__()
         self.n_types = n_types
@@ -108,6 +129,7 @@ class ECENet(nn.Module):
         self.n_grid = n_grid
         self.analytic_ace_basis = analytic_ace_basis
         self.bottleneck_dim = bottleneck_dim
+        self.mp_type = mp_type
         self.n_sph = (l_max + 1) ** 2
         self.m_max = int(m_max) if m_max is not None else l_max
         self.n_angular = self.m_max + 1   # m = 0..m_max (layers only use up to m_max)
@@ -143,6 +165,17 @@ class ECENet(nn.Module):
         ])
         # n_mp >= 2: regroup the flat layers into `n_mp` stages and build the
         # `n_mp - 1` MP layers that sit between them.
+        if mp_type not in ('transformer', 'sum'):
+            raise ValueError(
+                f"Unknown mp_type '{mp_type}' (expected 'transformer' or 'sum'). "
+                "The old distance/type-weighted 'edge' message passing has been removed.")
+        # Warn rather than silently ignore: an MP-only knob left at a non-default
+        # value with n_mp=1 does nothing, and a silent no-op looks like the
+        # setting was applied.
+        if mp_n_heads != 1 and n_mp == 1:
+            warnings.warn(
+                f"mp_n_heads={mp_n_heads} is ignored: message passing is off "
+                f"(n_mp=1).", stacklevel=2)
         if n_mp > 1:
             flat = list(self.layers)
             self.layers = nn.ModuleList([
@@ -150,11 +183,13 @@ class ECENet(nn.Module):
                 for g in range(n_mp)
             ])
             self.mp_layers = nn.ModuleList([
-                ECENetMPLayer(
+                ECENetTransformerMPLayer(
                     self.n_features_per_m, self.l_max, self.embed_dim,
-                    n_types=n_types, n_dist_basis=n_dist_basis,
+                    n_types=n_types,
                     r_cut=self.r_cut_edge, cutoff_type=self.cutoff_type,
-                    m_max=self.m_max,
+                    m_max=self.m_max, mp_dim=mp_dim,
+                    activation=activation, n_grid=n_grid, n_heads=mp_n_heads,
+                    aggregation=mp_type,
                 )
                 for _ in range(n_mp - 1)
             ])
@@ -649,131 +684,277 @@ class ECENetLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class ECENetMPLayer(nn.Module):
-    """Equivariant message passing for ECENet.
+@functools.lru_cache(maxsize=None)
+def _sph_pack_index(l_max, m_max, n_angular, n_sph, device):
+    """Precompute gather indices + validity masks for the angular↔SH pack/unpack.
 
-    For each atom j, aggregates full edge features from all incoming edges i→j,
-    then adds the result to all outgoing edges j→k.
+    The (l, m) → SH-slot mapping is data-independent (fixed by l_max/m_max), so
+    the per-l slice-assign+flip loop is exactly a fixed gather.
 
-    Algorithm:
-      1. Reshape A_cos/A_sin to (n_base, l_max+1, n_angular) — free view
-      2. Per l: assemble m-ordered (2l+1) vector from cos/sin, apply D_l^T (unrotate to global)
-         m>l components dropped here; no scatter to SH format needed
-      3. Distance/type scalar weight over n_base channels
-      4. Cat all l, scatter-sum to atoms → Delta (N, n_base, n_sph)
-      5. Per l: apply D_l (rotate back), split m-ordered → cos/sin, add to A_cos/A_sin
+    Returns long index + bool mask tensors on `device` (cached per shape/device):
+      pack_*   (n_sph,)            — gather source in the flat (lp1*n_angular) grid
+      unpack_* (lp1*n_angular,)    — gather source in the (n_sph) SH grid
+    cos = m≥0 modes, sin = m<0 modes (mirrors the flip). Masks zero the slots the
+    loop left untouched (|m|>m_out when m_max<l). Bit-identical to the loop.
+    """
+    lp1 = l_max + 1
+    pack_c  = torch.zeros(n_sph, dtype=torch.long)
+    pack_s  = torch.zeros(n_sph, dtype=torch.long)
+    pack_cm = torch.zeros(n_sph, dtype=torch.bool)
+    pack_sm = torch.zeros(n_sph, dtype=torch.bool)
+    up_c  = torch.zeros(lp1 * n_angular, dtype=torch.long)
+    up_s  = torch.zeros(lp1 * n_angular, dtype=torch.long)
+    up_cm = torch.zeros(lp1 * n_angular, dtype=torch.bool)
+    up_sm = torch.zeros(lp1 * n_angular, dtype=torch.bool)
+    for l in range(lp1):
+        m_out = min(l, m_max)
+        for m in range(0, m_out + 1):          # cos: SH slot l²+l+m ← angular (l, m)
+            s = l * l + l + m
+            pack_c[s] = l * n_angular + m
+            pack_cm[s] = True
+            up_c[l * n_angular + m] = s
+            up_cm[l * n_angular + m] = True
+        for k in range(1, m_out + 1):          # sin: SH slot l²+l-k ← angular (l, k)
+            s = l * l + l - k
+            pack_s[s] = l * n_angular + k
+            pack_sm[s] = True
+            up_s[l * n_angular + k] = s
+            up_sm[l * n_angular + k] = True
+    dev = torch.device(device)
+    return tuple(t.to(dev) for t in (pack_c, pack_cm, pack_s, pack_sm,
+                                     up_c, up_cm, up_s, up_sm))
+
+
+def _pack_angular_to_sph(A_cos, A_sin, n_base, l_max, m_max, n_angular, n_sph):
+    """(n_e, n_base*lp1, n_angular) → SH (n_e, n_base, n_sph). Vectorized pack."""
+    n_e = A_cos.shape[0]
+    lp1 = l_max + 1
+    pc, pcm, ps, psm, *_ = _sph_pack_index(l_max, m_max, n_angular, n_sph, A_cos.device)
+    ac  = A_cos.reshape(n_e, n_base, lp1 * n_angular)
+    asn = A_sin.reshape(n_e, n_base, lp1 * n_angular)
+    ic  = pc.view(1, 1, n_sph).expand(n_e, n_base, n_sph)
+    isn = ps.view(1, 1, n_sph).expand(n_e, n_base, n_sph)
+    return (ac.gather(2, ic) * pcm.to(A_cos.dtype)
+            + asn.gather(2, isn) * psm.to(A_cos.dtype))
+
+
+def _unpack_sph_to_angular(v_rot, n_base, l_max, m_max, n_angular, n_sph):
+    """SH (n_e, n_base, n_sph) → cos/sin (n_e, n_base, lp1, n_angular). Vectorized."""
+    n_e = v_rot.shape[0]
+    lp1 = l_max + 1
+    _, _, _, _, uc, ucm, us, usm = _sph_pack_index(l_max, m_max, n_angular, n_sph,
+                                                   v_rot.device)
+    L = lp1 * n_angular
+    ic  = uc.view(1, 1, L).expand(n_e, n_base, L)
+    isn = us.view(1, 1, L).expand(n_e, n_base, L)
+    d_cos = (v_rot.gather(2, ic)  * ucm.to(v_rot.dtype)).view(n_e, n_base, lp1, n_angular)
+    d_sin = (v_rot.gather(2, isn) * usm.to(v_rot.dtype)).view(n_e, n_base, lp1, n_angular)
+    return d_cos, d_sin
+
+
+class ECENetTransformerMPLayer(nn.Module):
+    """Attention-style message passing for ECENet.
+
+    Per edge (i→j):
+      * a low-rank residual *message* m_e (equivariant, edge frame), and
+      * an invariant scalar *score* s_e (down → nonlin → m=0 → scalar).
+    Messages are unrotated to the common global frame and aggregated at each
+    receiver atom as a score-weighted combination of that atom's incoming edges.
+    The result is rotated back into each edge's bond frame, passed through a
+    low-rank residual *receiver* transform, and added to the features.
+
+    ``aggregation`` selects how the per-edge weight is formed:
+
+    ``'transformer'`` — softmax over the receiver's incoming edges, with the
+    smooth cutoff envelope folded in as a multiplicative log-bias,
+
+        a_e = exp(s_e)·f_cut(r_ij) / (Σ_{e'→j} exp(s_e')·f_cut(r_e') + eps),
+
+    so a departing edge's weight vanishes continuously as it crosses r_cut_edge
+    (it leaves numerator and normalizer together — no jump), and the +eps floor
+    keeps a node's aggregate finite/continuous as its last edge leaves. Because
+    the aggregation is a normalized weighted average it is *intensive* in
+    coordination.
+
+    ``'sum'`` — the raw signed score times the same envelope, summed:
+
+        a_e = s_e·f_cut(r_ij).
+
+    There is no normalizer, so the aggregate is *extensive* in coordination and
+    the envelope is what carries the continuity at r_cut (it is no longer divided
+    back out, so the message also decays with absolute distance). Weights are
+    signed, so a neighbour can contribute negatively. The score read-out is
+    zero-init, which makes s_e = 0 and hence the whole layer an exact no-op at
+    initialisation — the softmax path cannot do this, since exp(0) = 1.
+
+    With ``n_heads > 1`` the layer is multi-head: the score head emits ``n_heads``
+    invariant scores per edge (one shared trunk, ``n_heads`` linear read-outs) and
+    the message's value channels (``n_base``) are split into ``n_heads``
+    contiguous groups — whole spherical channels, full ``n_sph`` each. Head h
+    weights the receiver's in-edges independently and gates *its own* value slice,
+    so a neighbour can matter for one feature subspace and be suppressed for
+    another (the per-subspace routing a single scalar can't represent). All splits
+    are along channels (never within ``n_sph`` / across ``m``, which would break
+    rotation-invariance); ``n_base = 2·embed_dim`` must be divisible by ``n_heads``.
+
+    Message and scores come out of ONE fused trunk: down → nonlin at ``mp_dim`` →
+    up, where the up-projection emits ``n_ch + n_heads`` channels. The first
+    ``n_ch`` are the message (added residually to the input), and the m=0
+    components of the trailing ``n_heads`` channels are the per-head scores. Since
+    score and message share a trunk there is no dedicated score head, which makes
+    this cheaper than computing the two separately. The up-projection is zero-init,
+    so at initialisation the message residual is 0 and every score is 0 — which for
+    ``'sum'`` means the layer is an exact identity, and for ``'transformer'`` means
+    attention starts uniform (exp(0) = 1) over each receiver's in-edges.
+
+    Equivariance: the trunk and receiver are EquivariantLinear +
+    RealSpaceNonlinearity in a bond frame; the per-head scores (m=0 channel) and
+    the cutoff (a function of the invariant distance) make the per-head weights
+    rotation-invariant (for the softmax, its per-node normalizer is a sum of
+    invariant scalars); the cross-edge sum happens in the common global frame via
+    the Wigner-D unrotate/rotate.
+
+    The receiver is an ``ECENetLayer`` bottleneck block (down → nonlin at
+    ``mp_dim`` → up, zero-init up so it is identity at init).
     """
 
     def __init__(self, n_features_per_m: int, l_max: int, embed_dim: int,
-                 n_types: int, n_dist_basis: int = 8, r_cut: float = 5.0,
-                 cutoff_type: str = 'cosine', m_max: int = None):
+                 n_types: int, r_cut: float = 5.0,
+                 cutoff_type: str = 'cosine', m_max: int = None,
+                 mp_dim: int = None,
+                 activation: str = 'silu', n_grid: int = None, n_heads: int = 1,
+                 aggregation: str = 'transformer'):
         super().__init__()
+        if aggregation not in ('transformer', 'sum'):
+            raise ValueError(
+                f"Unknown aggregation '{aggregation}' (expected 'transformer' or 'sum').")
+        self.aggregation = aggregation
         self.l_max     = l_max
         self.n_sph     = (l_max + 1) ** 2
         self.m_max     = m_max if m_max is not None else l_max
-        self.n_angular = self.m_max + 1   # pack/unpack only m=0..m_max; rest are zero
+        self.n_angular = self.m_max + 1
         self.n_ch      = n_features_per_m
-        self.n_base    = n_features_per_m // (l_max + 1)  # = 2*embed_dim; channels before l-expansion
-        self.r_cut     = r_cut
-        self.cutoff_type  = cutoff_type
-        self.n_dist_basis = n_dist_basis
+        self.n_base    = n_features_per_m // (l_max + 1)
+        # Multi-head attention: each head emits its own score → its own weights
+        # over the receiver's in-edges → gates its own contiguous slice of the
+        # value channels (whole spherical channels, full n_sph each — NEVER a
+        # split within n_sph / across m, which would break rotation-invariance).
+        # So n_base = 2·embed_dim must be divisible by n_heads (the value split).
+        if self.n_base % n_heads != 0:
+            raise ValueError(
+                f"{aggregation} MP: n_base (=2·embed_dim={self.n_base}) must be "
+                f"divisible by n_heads ({n_heads}) to split the value across heads.")
+        self.n_heads = n_heads
+        self.n_scores = n_heads          # one invariant score per head
+        # +eps floor on the per-node softmax normalizer: keeps it finite (no 0/0 →
+        # NaN when a node's last edge reaches r_cut and every num → 0 together).
+        self.softmax_eps = 1e-6
+        n_ch = n_features_per_m
+        mp_dim = mp_dim if mp_dim is not None else max(n_ch // 4, 1)
 
-        # l_of_c[c] = c % (l_max+1) for ECENet channel layout
-        l_of_c = torch.arange(n_features_per_m, dtype=torch.long) % (l_max + 1)
+        # Receiver: low-rank residual block (down → nonlin(mp_dim) → up).
+        self.receiver = ECENetLayer(n_ch, self.m_max, activation=activation,
+                                    n_grid=n_grid, bottleneck_dim=mp_dim)
+        # Fused message + score trunk: ONE low-rank trunk (down → nonlin → up)
+        # whose up-projection emits n_ch message channels PLUS n_scores score
+        # channels; the m=0 invariants of the extra channels are the per-head
+        # scores. This replaces a separate message block *and* a separate score
+        # head, so it is cheaper than computing the two independently. up is
+        # zero-init → message residual = 0 and scores = 0 at init.
+        self.msg_down   = EquivariantLinear(n_ch, mp_dim, self.n_angular, self.m_max)
+        self.msg_nonlin = RealSpaceNonlinearity(mp_dim, self.m_max, n_grid=n_grid,
+                                                activation=activation)
+        self.msg_up     = EquivariantLinear(mp_dim, n_ch + self.n_scores,
+                                            self.n_angular, self.m_max)
+        nn.init.zeros_(self.msg_up.weights)
+        nn.init.zeros_(self.msg_up.bias)
 
-        # Pack/unpack indices: (n_ch, n_angular)
-        pack_cos_idx   = torch.zeros(n_features_per_m, self.n_angular, dtype=torch.long)
-        pack_sin_idx   = torch.zeros(n_features_per_m, self.n_angular, dtype=torch.long)
-        pack_cos_valid = torch.zeros(n_features_per_m, self.n_angular, dtype=torch.bool)
-        pack_sin_valid = torch.zeros(n_features_per_m, self.n_angular, dtype=torch.bool)
-        for c in range(n_features_per_m):
-            lp = int(l_of_c[c].item())
-            for m in range(self.n_angular):
-                if m <= lp:
-                    pack_cos_idx[c, m]   = lp * lp + lp + m
-                    pack_cos_valid[c, m] = True
-                    if m > 0:
-                        pack_sin_idx[c, m]   = lp * lp + lp - m
-                        pack_sin_valid[c, m] = True
-        self.register_buffer('pack_cos_idx',     pack_cos_idx)
-        self.register_buffer('pack_sin_idx',     pack_sin_idx)
-        self.register_buffer('pack_cos_valid_f', pack_cos_valid.float())
-        self.register_buffer('pack_sin_valid_f', pack_sin_valid.float())
-
-        # Per-channel distance/type weight over n_base = 2*embed_dim compact channels.
-        # (l_max+1) l-channels share one weight; rotation commutes with the l-sum.)
-        # w[e] is a per-pair linear map f_d (n_dist_basis) → (n_base); zero at init
-        # → MP starts as a no-op. No bias (the cutoff envelope lives in f_d).
-        self.W_msg = nn.Parameter(
-            torch.zeros(n_types, n_types, n_dist_basis, self.n_base)
-        )
+        # Smooth cutoff envelope for the per-edge weight (→ 0 at r_cut_edge).
+        self.r_cut = r_cut
+        self.cutoff_fn = get_cutoff_fn(cutoff_type)
 
     def _pack(self, A_cos, A_sin):
-        """(n_edges, n_ch, n_angular) → (n_edges, n_ch, n_sph)."""
-        n_e = A_cos.shape[0]
-        idx_cos = self.pack_cos_idx[None].expand(n_e, -1, -1)
-        idx_sin = self.pack_sin_idx[None].expand(n_e, -1, -1)
-        h = (torch.zeros(n_e, self.n_ch, self.n_sph, device=A_cos.device, dtype=A_cos.dtype)
-             .scatter_add(2, idx_cos, A_cos * self.pack_cos_valid_f)
-             .scatter_add(2, idx_sin, A_sin * self.pack_sin_valid_f))
-        return h
+        """(n_e, n_ch, n_angular) → SH (n_e, n_base, n_sph)."""
+        return _pack_angular_to_sph(A_cos, A_sin, self.n_base, self.l_max,
+                                    self.m_max, self.n_angular, self.n_sph)
 
-    def _unpack(self, h):
-        """(n_edges, n_ch, n_sph) → (n_edges, n_ch, n_angular)."""
-        n_e = h.shape[0]
-        idx_cos = self.pack_cos_idx[None].expand(n_e, -1, -1)
-        idx_sin = self.pack_sin_idx[None].expand(n_e, -1, -1)
-        A_cos = torch.gather(h, 2, idx_cos) * self.pack_cos_valid_f
-        A_sin = torch.gather(h, 2, idx_sin) * self.pack_sin_valid_f
-        return A_cos, A_sin
+    def _unpack(self, v_rot, n_e):
+        """SH (n_e, n_base, n_sph) → (n_e, n_ch, n_angular)."""
+        d_cos, d_sin = _unpack_sph_to_angular(
+            v_rot, self.n_base, self.l_max, self.m_max, self.n_angular, self.n_sph)
+        return (d_cos.reshape(n_e, self.n_ch, self.n_angular),
+                d_sin.reshape(n_e, self.n_ch, self.n_angular))
 
     def forward(self, A_cos, A_sin, r_hat, dist_ij, edge_i, edge_j,
                 n_atoms, type_i, type_j, D_block=None):
         n_e = A_cos.shape[0]
         device, dtype = A_cos.device, A_cos.dtype
-        lp1 = self.l_max + 1
-
-        # 1. Reshape to (n_e, n_base, l_max+1, n_angular) — free view
-        Ac = A_cos.view(n_e, self.n_base, lp1, self.n_angular)
-        As = A_sin.view(n_e, self.n_base, lp1, self.n_angular)
-
         if D_block is None:
             D_block = build_D_block(r_hat, self.l_max)
 
-        # 2. Pack cos/sin → (n_e, n_base, n_sph); zeros where m > m_max
-        h = torch.zeros(n_e, self.n_base, self.n_sph, device=device, dtype=dtype)
-        for l in range(lp1):
-            m_out = min(l, self.m_max)
-            h[:, :, l*l + l : l*l + l + m_out + 1] = Ac[:, :, l, :m_out + 1]
-            if m_out > 0:
-                h[:, :, l*l + l - m_out : l*l + l] = As[:, :, l, 1:m_out + 1].flip(-1)
+        # 1+2. Fused trunk: down → nonlin → up(n_ch + n_scores). The first n_ch
+        #      channels are the message (added residually, so the block is a
+        #      low-rank update); the m=0 components of the trailing n_scores
+        #      channels are the per-head scores (invariant, hence equivariance-safe).
+        u_cos, u_sin = self.msg_down(A_cos, A_sin)
+        u_cos, u_sin = self.msg_nonlin(u_cos, u_sin)
+        u_cos, u_sin = self.msg_up(u_cos, u_sin)          # (n_e, n_ch+n_scores, n_angular)
+        m_cos = u_cos[:, :self.n_ch] + A_cos
+        m_sin = u_sin[:, :self.n_ch] + A_sin
+        s = u_cos[:, self.n_ch:self.n_ch + self.n_scores, 0]   # (n_e, n_heads)
 
-        # 3. Weight: w[e, c_base] = Σ_n f_n(r_ij) * W[t_i, t_j, n, c_base]
-        f_d = radial_basis(dist_ij, self.r_cut, self.n_dist_basis, cutoff_type=self.cutoff_type)
-        w = torch.einsum('en,enc->ec', f_d, self.W_msg[type_i, type_j])  # (n_e, n_base)
+        # 3. Pack message → SH, unrotate to the common global frame.
+        h = self._pack(m_cos, m_sin)
+        h_global = torch.bmm(h, D_block.transpose(-1, -2))  # transposed view, no copy
 
-        # 4. Unrotate to global frame, weight, scatter-sum to atoms
-        D_block_T = D_block.transpose(-1, -2).contiguous()
-        h_global = torch.bmm(h, D_block_T) * w.unsqueeze(-1)
-        idx   = edge_j[:, None, None].expand_as(h_global)
-        Delta = torch.zeros(n_atoms, self.n_base, self.n_sph, device=device, dtype=dtype
-                            ).scatter_add(0, idx, h_global)
+        # 4. Per-edge weights, formed INDEPENDENTLY per head. Either way the smooth
+        #    cutoff f_cut enters multiplicatively so a departing edge's weight
+        #    vanishes continuously as it crosses r_cut, and every factor is an
+        #    invariant scalar, so SO(3)-equivariance is preserved.
+        H = self.n_heads
+        f_cut = self.cutoff_fn(dist_ij, self.r_cut)          # (n_e,) smooth → 0 at r_cut
+        if self.aggregation == 'sum':
+            #    a_e^k = s_e^k·f_cut_e — a plain signed weighted sum. No normalizer,
+            #    so the aggregate is extensive in coordination and decays with
+            #    absolute distance (f_cut is not divided back out).
+            a = s * f_cut[:, None]                           # (n_e, H)
+        else:
+            #    Segment-softmax over the edges arriving at each receiver atom j,
+            #    with the cutoff as a multiplicative log-bias on exp(s):
+            #        a_e^k = exp(s_e^k)·f_cut_e / (Σ_{e'→j} exp(s_e'^k)·f_cut_e' + eps)
+            #    A normalized weighted average → the aggregation is intensive in
+            #    coordination. The +eps floor keeps it finite and continuous as a
+            #    node's last edge leaves (all f_cut → 0 ⇒ Delta → 0, no jump).
+            #    Per-(receiver, head) max-subtraction for numerical stability
+            #    (detached, so this stays an exact softmax — invariant to the
+            #    constant per-node shift). Receivers with no incoming edge keep
+            #    -inf but are never gathered (every edge has a receiver in edge_j).
+            ej_k = edge_j[:, None].expand(-1, H)             # (n_e, H)
+            s_max = torch.full((n_atoms, H), float('-inf'), device=device, dtype=dtype
+                               ).scatter_reduce(0, ej_k, s.detach(), reduce='amax',
+                                                include_self=True)
+            num = torch.exp(s - s_max[edge_j]) * f_cut[:, None]   # (n_e, H)
+            denom = torch.zeros(n_atoms, H, device=device, dtype=dtype).scatter_add(0, ej_k, num)
+            a = num / (denom[edge_j] + self.softmax_eps)     # (n_e, H) softmax weights
 
+        # 5. Weighted aggregation to receiver atoms. The value channels (n_base)
+        #    split into H contiguous groups (full n_sph each); head h's weight gates
+        #    head h's value slice, uniformly across all m (equivariant). Heads then
+        #    concat back to n_base.
+        hb = self.n_base // H
+        contrib = h_global.reshape(n_e, H, hb, self.n_sph) * a[:, :, None, None]
+        idx = edge_j[:, None, None, None].expand_as(contrib)
+        Delta = torch.zeros(n_atoms, H, hb, self.n_sph, device=device, dtype=dtype
+                            ).scatter_add(0, idx, contrib).reshape(n_atoms, self.n_base, self.n_sph)
 
-        # 5. Rotate back into edge frame
-        v_rot = torch.bmm(Delta[edge_i], D_block)              # (n_e, n_base, n_sph)
+        # 6. Gather to edges (source atom), rotate back to the edge frame.
+        v_rot = torch.bmm(Delta[edge_i], D_block)            # (n_e, n_base, n_sph)
+        d_cos, d_sin = self._unpack(v_rot, n_e)
 
-        # 6. Unpack → delta_cos/delta_sin, add to features
-        delta_cos = torch.zeros(n_e, self.n_base, lp1, self.n_angular, device=device, dtype=dtype)
-        delta_sin = torch.zeros(n_e, self.n_base, lp1, self.n_angular, device=device, dtype=dtype)
-        for l in range(lp1):
-            m_out = min(l, self.m_max)
-            delta_cos[:, :, l, :m_out + 1] = v_rot[:, :, l*l + l : l*l + l + m_out + 1]
-            if m_out > 0:
-                delta_sin[:, :, l, 1:m_out + 1] = v_rot[:, :, l*l + l - m_out : l*l + l].flip(-1)
+        # 7. Receiver: low-rank residual (equivariant, edge frame).
+        r_cos, r_sin = self.receiver(d_cos, d_sin)
 
-        return (A_cos + delta_cos.view(n_e, self.n_ch, self.n_angular),
-                A_sin + delta_sin.view(n_e, self.n_ch, self.n_angular))
+        return A_cos + r_cos, A_sin + r_sin
 
 
 # ---------------------------------------------------------------------------

@@ -306,26 +306,22 @@ _ETHANOL_MDL = os.path.join(
     'examples', 'ethanol.mdl')
 
 
-def test_real_ethanol_checkpoint_single_point():
-    """Load the committed ethanol checkpoint (real trained weights) and run a
-    single-point on an ethanol molecule. The synthetic tests use random weights;
-    this exercises from_checkpoint + the molecular path on a real model."""
+def test_legacy_edge_mp_checkpoint_raises():
+    """The committed ethanol checkpoint was trained with the removed
+    mp_type='edge' message passing (n_mp=2, with mp_layers.*.W_msg weights).
+    Loading it must fail loudly: those weights have no counterpart in the current
+    MP layer, so a tolerant load would silently run a randomly initialised MP
+    layer and return wrong energies."""
     if not os.path.exists(_ETHANOL_MDL):
         print(f"  [skip] {_ETHANOL_MDL} not present")
         return
-    from ase.build import molecule
-
-    calc = ECENetCalculator.from_checkpoint(_ETHANOL_MDL)
-    assert calc.element_to_type == {'H': 0, 'C': 1, 'O': 2}
-    assert abs(calc._to_ev - _KCAL) < 1e-15          # rMD17 model → kcal/mol
-
-    atoms = molecule('CH3CH2OH')                     # 9-atom ethanol (H/C/O)
-    atoms.calc = calc
-    e = atoms.get_potential_energy()
-    f = atoms.get_forces()
-    assert np.isfinite(e)
-    assert f.shape == (len(atoms), 3) and np.isfinite(f).all()
-    print(f"  real ethanol.mdl: {len(atoms)} atoms, E={e:.2f} eV, |F|max={np.abs(f).max():.3f}")
+    try:
+        ECENetCalculator.from_checkpoint(_ETHANOL_MDL)
+    except ValueError as e:
+        assert 'W_msg' in str(e) and 'edge' in str(e), f"unhelpful message: {e}"
+        print(f"  legacy edge-MP ethanol.mdl rejected: {str(e)[:64]}…")
+    else:
+        raise AssertionError("expected a ValueError for a legacy edge-MP checkpoint")
 
 
 if __name__ == '__main__':
@@ -343,5 +339,5 @@ if __name__ == '__main__':
     test_from_checkpoint_spice_style()
     test_from_checkpoint_missing_mapping_raises()
     test_from_checkpoint_missing_hparams_raises()
-    test_real_ethanol_checkpoint_single_point()
+    test_legacy_edge_mp_checkpoint_raises()
     print("All tests passed.")

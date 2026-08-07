@@ -10,7 +10,7 @@ Usage (run from the repo root):
         --r_cut_edge 8.0 --r_cut_neighbor 6.0 \
         --n_mp 2 \
         --output_hidden_dims 128 128 \
-        --n_dist_basis 16 --n_grid 16 \
+        --n_grid 16 \
         --batch_size 8
 """
 
@@ -170,7 +170,6 @@ def main():
     parser.add_argument('--activation',       default='silu')
     parser.add_argument('--no_nonlinearity',  action='store_true')
     parser.add_argument('--n_mp', type=int, default=1)
-    parser.add_argument('--n_dist_basis',     type=int,   default=8)
     # Eval options
     parser.add_argument('--batch_size',       type=int,   default=8)
     parser.add_argument('--float32',          action='store_true')
@@ -224,11 +223,12 @@ def main():
             use_nonlinearity=not args.no_nonlinearity,
             output_hidden_dims=args.output_hidden_dims,
             analytic_ace_basis=True,
-            n_mp=args.n_mp, n_dist_basis=args.n_dist_basis,
+            n_mp=args.n_mp,
         )
 
     # Strip any long-range-only keys from old checkpoints (not SR constructor args)
-    for k in ['r_cut_lr', 'lr_n_rbf', 'lr_embed_dim', 'lr_hidden_layers', 'lr_module_type']:
+    for k in ['r_cut_lr', 'lr_n_rbf', 'lr_embed_dim', 'lr_hidden_layers', 'lr_module_type',
+              'n_dist_basis']:
         hp.pop(k, None)
 
     # nonlinearity_type removed (the only kind was 'realspace'). A legacy 'none'

@@ -30,7 +30,8 @@ scripts/               training / data entry points (run from the repo root)
 
 examples/              runnable examples + a small example checkpoint
   run_md_*.py            ASE MD drivers (NVT/NPT); importable or CLI
-  ethanol.mdl            example rMD17 ethanol model (used by the tests)
+  ethanol.mdl            legacy rMD17 ethanol model (edge MP; now rejected on load —
+                         kept as the fixture for the legacy-checkpoint test)
 
 tests/                 test suite (test_*.py, run from the repo root)
 tools/                 developer utilities (run from the repo root)
@@ -85,6 +86,44 @@ zero-init up-projection, so each layer is the identity at initialisation:
 train_ecenet(..., bottleneck_dim=16)
 ```
 
+### Message passing
+
+With `n_mp >= 2`, every message-passing layer computes, per edge, a low-rank
+**message** and an invariant scalar **score**, aggregates the messages at each
+receiver atom in the common global frame, and passes the result through a
+**receiver** transform back in the bond frame. `mp_type` selects how the
+per-edge weight is formed:
+
+```python
+train_ecenet(..., n_mp=2, mp_type='transformer', mp_n_heads=4)   # default
+train_ecenet(..., n_mp=2, mp_type='sum')
+```
+
+| `mp_type` | weight | behaviour |
+| --- | --- | --- |
+| `'transformer'` (default) | `exp(s)·f_cut / Σ_{e→j}(exp(s)·f_cut)` | softmax over the receiver's incoming edges — a weighted *average*, intensive in coordination |
+| `'sum'` | `s·f_cut` | raw signed score × cutoff envelope — *extensive* in coordination, and signed, so a neighbour can contribute negatively |
+
+Either way the smooth cutoff envelope keeps the energy continuous as an edge
+crosses `r_cut_edge`.
+
+Message and scores share **one fused trunk**: a low-rank block (down →
+nonlinearity at `mp_dim` → up) whose up-projection emits `2*embed_dim*(l_max+1)`
+message channels plus one score channel per head, the score being that channel's
+`m=0` (rotation-invariant) component. Sharing a trunk is cheaper than a separate
+message block and score head. The up-projection is zero-init, so at
+initialisation the message residual and every score are 0 — which makes `'sum'`
+an exact no-op and leaves `'transformer'` with uniform attention (`exp(0) = 1`).
+
+`mp_dim` sets that trunk's bottleneck width (and the receiver's); `mp_n_heads`
+splits the value channels (`2*embed_dim`) into that many attention heads, so it
+must divide them evenly.
+
+> **Note.** The older distance/type-weighted `mp_type='edge'` message passing has
+> been removed. Checkpoints trained with it (identifiable by `W_msg` weights) are
+> rejected with an explicit error rather than silently loading — retrain with
+> `'transformer'` or `'sum'`.
+
 Train on SPICE dataset (10 elements):
 
 ```python
@@ -127,6 +166,7 @@ The test suite is pure PyTorch and runs on CPU. Each file is runnable as a scrip
 ```bash
 python tests/test_ecenet.py                  # ECENet integration: SO(3) invariance, forces, MP
 python tests/test_bottleneck.py              # low-rank layers: identity at init, SO(3)
+python tests/test_transformer_mp.py          # attention MP: SO(3), cutoff continuity, sum vs softmax
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 ```
 

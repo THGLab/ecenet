@@ -136,16 +136,29 @@ class ECENetCalculator(Calculator):
         n_mp = hp.pop('n_mp', 1)
         # Removed features; older checkpoints still carry them in hparams. All
         # were disabled in every training script, so no weights are affected.
+        # n_dist_basis only ever fed the removed 'edge' MP layer, so an n_mp=1
+        # checkpoint that carries it still loads unchanged.
         for _removed in ('n_dist_embed', 'edge_type_nonlin',
-                         'edge_type_linear', 'edge_type_output'):
+                         'edge_type_linear', 'edge_type_output', 'n_dist_basis'):
             hp.pop(_removed, None)
+
+        state = ckpt.get('best_state') or ckpt.get('model')
+        # The distance/type-weighted 'edge' message passing was removed. Its
+        # weights (mp_layers.*.W_msg) have no counterpart in the current MP
+        # layers, so such a checkpoint would otherwise load with a randomly
+        # initialised MP layer and silently return wrong energies.
+        if any(k.endswith('W_msg') for k in state):
+            raise ValueError(
+                "Checkpoint uses the removed mp_type='edge' message passing "
+                "(found 'W_msg' in the state dict). That layer no longer exists; "
+                "retrain the model with mp_type='transformer' or 'sum'."
+            )
 
         model = ECENet(**hp, n_mp=n_mp)
         if dtype == torch.float64:
             model = model.double()
         model = model.to(device)
 
-        state = ckpt.get('best_state') or ckpt.get('model')
         model.load_state_dict(state, strict=False)
         model.eval()
 

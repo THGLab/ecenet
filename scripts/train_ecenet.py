@@ -167,7 +167,9 @@ def train_ecenet(
     bottleneck_dim=None,
     # Message passing
     n_mp=1,
-    n_dist_basis=8,
+    mp_type='transformer',
+    mp_dim=None,
+    mp_n_heads=1,
     # Batching
     use_graph_batch=True,
     # Optimiser
@@ -246,7 +248,9 @@ def train_ecenet(
         m_max=m_max,
         bottleneck_dim=bottleneck_dim,
         n_mp=n_mp,
-        n_dist_basis=n_dist_basis,
+        mp_type=mp_type,
+        mp_dim=mp_dim,
+        mp_n_heads=mp_n_heads,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -333,7 +337,9 @@ def train_ecenet(
                 output_hidden_dims=output_hidden_dims,
                 analytic_ace_basis=analytic_ace_basis,
                 bottleneck_dim=bottleneck_dim,
-                n_mp=n_mp, n_dist_basis=n_dist_basis,
+                n_mp=n_mp,
+                mp_type=mp_type, mp_dim=mp_dim,
+                mp_n_heads=mp_n_heads,
             ),
             # molecule-specific element mapping: {symbol: type_index}
             'element_to_type': elements.to_element_to_type(type_to_idx),
