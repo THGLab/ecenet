@@ -224,9 +224,6 @@ def train_ecenet_spice(
     use_nonlinearity=True,
     n_grid=None,
     output_hidden_dims=None,
-    edge_type_nonlin=False,
-    edge_type_linear=False,
-    edge_type_output=False,
     analytic_ace_basis=True,
     # Message passing
     n_mp=1,
@@ -338,9 +335,6 @@ def train_ecenet_spice(
         n_grid=n_grid,
         output_hidden_dims=output_hidden_dims,
         analytic_ace_basis=analytic_ace_basis,
-        edge_type_nonlin=edge_type_nonlin,
-        edge_type_linear=edge_type_linear,
-        edge_type_output=edge_type_output,
         n_mp=n_mp,
         n_dist_basis=n_dist_basis,
     )
@@ -422,9 +416,6 @@ def train_ecenet_spice(
                 use_nonlinearity=use_nonlinearity,
                 output_hidden_dims=output_hidden_dims,
                 analytic_ace_basis=analytic_ace_basis,
-                edge_type_nonlin=edge_type_nonlin,
-                edge_type_linear=edge_type_linear,
-                edge_type_output=edge_type_output,
                 n_mp=n_mp, n_dist_basis=n_dist_basis,
             ),
             'e_ref': e_ref,  # per-element reference energies (eV/atom)

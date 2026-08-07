@@ -26,73 +26,22 @@ class EquivariantLinear(nn.Module):
     Angular channels: m = 0, 1, ..., m_max (index 0 is m=0).
     """
 
-    def __init__(self, in_features, out_features, n_angular, m_max, n_types=None):
+    def __init__(self, in_features, out_features, n_angular, m_max):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.n_angular = n_angular
         self.m_max = m_max
-        self.edge_type_linear = (n_types is not None)
 
         # (n_angular, out_features, in_features)
         std = (2.0 / (in_features + out_features)) ** 0.5
         self.weights = nn.Parameter(torch.randn(n_angular, out_features, in_features) * std)
 
-        # Factorized per-type additive correction to weights; zero-init → shared baseline at start
-        # W_corr[e] = weights_src[type_i[e]] + weights_tgt[type_j[e]]
-        if self.edge_type_linear:
-            self.weights_src = nn.Parameter(
-                torch.zeros(n_types, n_angular, out_features, in_features)
-            )
-            self.weights_tgt = nn.Parameter(
-                torch.zeros(n_types, n_angular, out_features, in_features)
-            )
-
         self.bias = nn.Parameter(torch.zeros(out_features))
 
-    def forward(self, A_cos, A_sin, type_i=None, type_j=None, type_idx=None):
-        if self.edge_type_linear and (type_idx is not None or type_i is not None):
-            n_t = self.weights_src.shape[0]
-
-            # 2-pass type grouping (W_eff = weights + W_src[z_i] + W_tgt[z_j]):
-            # sort edges by source type, then by target type. type_idx is the
-            # precomputed (src_perm, src_sizes, tgt_perm, tgt_sizes) tuple from
-            # precompute_type_idx_2pass; compute it inline if not supplied.
-            if type_idx is not None:
-                src_perm, src_sizes, tgt_perm, tgt_sizes = type_idx
-            else:
-                src_perm  = type_i.argsort(stable=True)
-                src_sizes = type_i.bincount(minlength=n_t).tolist()
-                tgt_perm  = type_j.argsort(stable=True)
-                tgt_sizes = type_j.bincount(minlength=n_t).tolist()
-
-            A_cos_out = A_cos.new_zeros(A_cos.shape[0], self.out_features, self.n_angular)
-            A_sin_out = A_sin.new_zeros(A_sin.shape[0], self.out_features, self.n_angular)
-            # Pass 1: (W + W_src[ti]) per source type
-            offset = 0
-            for ti, sz in enumerate(src_sizes):
-                if sz > 0:
-                    W_eff = self.weights + self.weights_src[ti]
-                    idx   = src_perm[offset:offset + sz]
-                    A_cos_out = A_cos_out.index_add(0, idx,
-                        torch.einsum('eid,doi->eod', A_cos[idx], W_eff))
-                    A_sin_out = A_sin_out.index_add(0, idx,
-                        torch.einsum('eid,doi->eod', A_sin[idx], W_eff))
-                offset += sz
-            # Pass 2: add W_tgt[tj] per target type
-            offset = 0
-            for tj, sz in enumerate(tgt_sizes):
-                if sz > 0:
-                    idx = tgt_perm[offset:offset + sz]
-                    A_cos_out = A_cos_out.index_add(0, idx,
-                        torch.einsum('eid,doi->eod', A_cos[idx], self.weights_tgt[tj]))
-                    A_sin_out = A_sin_out.index_add(0, idx,
-                        torch.einsum('eid,doi->eod', A_sin[idx], self.weights_tgt[tj]))
-                offset += sz
-        else:
-            # No type dependence: standard single matmul
-            A_cos_out = torch.einsum('...id,doi->...od', A_cos, self.weights)
-            A_sin_out = torch.einsum('...id,doi->...od', A_sin, self.weights)
+    def forward(self, A_cos, A_sin):
+        A_cos_out = torch.einsum('...id,doi->...od', A_cos, self.weights)
+        A_sin_out = torch.einsum('...id,doi->...od', A_sin, self.weights)
 
         # Bias only on m=0 (index 0)
         A_cos_out[..., 0] = A_cos_out[..., 0] + self.bias
@@ -117,13 +66,11 @@ class RealSpaceNonlinearity(nn.Module):
         activation: pointwise nonlinearity ('silu', 'relu', 'tanh', 'gelu')
     """
 
-    def __init__(self, n_features, m_max, n_grid=None, activation='silu',
-                 n_types=None):
+    def __init__(self, n_features, m_max, n_grid=None, activation='silu'):
         super().__init__()
         self.n_features = n_features
         self.m_max = m_max
         self.n_angular = m_max + 1
-        self.edge_type_nonlin = (n_types is not None)
 
         # Grid size: oversample to reduce aliasing from the nonlinearity.
         if n_grid is None:
@@ -149,32 +96,20 @@ class RealSpaceNonlinearity(nn.Module):
         self.register_buffer('cos_analysis', cos_synth.T * norm.unsqueeze(0))  # (n_grid, n_angular)
         self.register_buffer('sin_analysis', sin_synth.T * norm.unsqueeze(0))  # (n_grid, n_angular)
 
-        # Pre-activation scale and shift
+        # No learnable affine on this nonlinearity: pure σ(f(θ)). Fixed
+        # buffers (scale=1, shift=0) keep the pre-activation step an identity.
         nonlin_features = n_features
-        if self.edge_type_nonlin:
-            # Factorized: scale/shift = src[type_i] + tgt[type_j]; ones/zeros init → identity
-            self.pre_scale_src = nn.Parameter(torch.zeros(n_types, nonlin_features, 1))
-            self.pre_scale_tgt = nn.Parameter(torch.zeros(n_types, nonlin_features, 1))
-            self.pre_shift_src = nn.Parameter(torch.zeros(n_types, nonlin_features, 1))
-            self.pre_shift_tgt = nn.Parameter(torch.zeros(n_types, nonlin_features, 1))
-            # Shared baseline so (src=0, tgt=0) → scale=1, shift=0
-            self.pre_scale_base = nn.Parameter(torch.ones(nonlin_features, 1))
-            self.pre_shift_base = nn.Parameter(torch.zeros(nonlin_features, 1))
-        else:
-            # No learnable affine on this nonlinearity: pure σ(f(θ)). Fixed
-            # buffers (scale=1, shift=0) keep the pre-activation step an identity.
-            self.register_buffer('pre_scale', torch.ones(nonlin_features, 1))
-            self.register_buffer('pre_shift', torch.zeros(nonlin_features, 1))
+        self.register_buffer('pre_scale', torch.ones(nonlin_features, 1))
+        self.register_buffer('pre_shift', torch.zeros(nonlin_features, 1))
 
         # Nonlinearity
         act_map = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh, 'gelu': nn.GELU}
         self.activation = act_map[activation]()
 
-    def forward(self, A_cos, A_sin, type_i=None, type_j=None):
+    def forward(self, A_cos, A_sin):
         """
         Args:
             A_cos, A_sin: (n_edges, n_features, n_angular)
-            type_i, type_j: (n_edges,) int tensors of source/target atom types, or None
 
         Returns:
             A_cos_out, A_sin_out: (n_edges, n_features, n_angular)
@@ -183,16 +118,7 @@ class RealSpaceNonlinearity(nn.Module):
         f_grid = A_cos @ self.cos_synth + A_sin @ self.sin_synth
 
         # Pre-activation affine transform
-        if self.edge_type_nonlin:
-            scale = (self.pre_scale_base
-                     + self.pre_scale_src[type_i]
-                     + self.pre_scale_tgt[type_j])   # (n_edges, n_features, 1)
-            shift = (self.pre_shift_base
-                     + self.pre_shift_src[type_i]
-                     + self.pre_shift_tgt[type_j])
-            f_grid = scale * f_grid + shift
-        else:
-            f_grid = self.pre_scale * f_grid + self.pre_shift
+        f_grid = self.pre_scale * f_grid + self.pre_shift
 
         # Apply nonlinearity
         f_grid = self.activation(f_grid)
