@@ -170,6 +170,13 @@ def train_ecenet(
     mp_type='transformer',
     mp_dim=None,
     mp_n_heads=1,
+    # FiLM gate
+    element_film=False,
+    film_embed_dim=16,
+    film_n_rbf=0,
+    film_hidden=None,
+    film_per_m=False,
+    film_shift=False,
     # Batching
     use_graph_batch=True,
     # Optimiser
@@ -251,6 +258,9 @@ def train_ecenet(
         mp_type=mp_type,
         mp_dim=mp_dim,
         mp_n_heads=mp_n_heads,
+        element_film=element_film, film_embed_dim=film_embed_dim,
+        film_n_rbf=film_n_rbf, film_hidden=film_hidden,
+        film_per_m=film_per_m, film_shift=film_shift,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -340,6 +350,9 @@ def train_ecenet(
                 n_mp=n_mp,
                 mp_type=mp_type, mp_dim=mp_dim,
                 mp_n_heads=mp_n_heads,
+                element_film=element_film, film_embed_dim=film_embed_dim,
+                film_n_rbf=film_n_rbf, film_hidden=film_hidden,
+                film_per_m=film_per_m, film_shift=film_shift,
             ),
             # molecule-specific element mapping: {symbol: type_index}
             'element_to_type': elements.to_element_to_type(type_to_idx),

@@ -15,6 +15,7 @@ per-edge, SO(2)-equivariant features and passes SO(3)-equivariant messages throu
 ecenet/
   model.py         ECENet — the model (message passing when n_mp >= 2)
   equivariant.py   EquivariantLinear, RealSpaceNonlinearity
+  film.py          ElementFiLM — element(+distance)-conditioned edge gate
   ace_basis.py     analytic ACE basis + Wigner-rotation autograd functions
   spherical.py     real spherical harmonics, Clebsch–Gordan, Wigner-D (recursion + rotation)
   radial.py        radial bases, cutoff envelopes, edge/neighbour lists
@@ -85,6 +86,36 @@ zero-init up-projection, so each layer is the identity at initialisation:
 ```python
 train_ecenet(..., bottleneck_dim=16)
 ```
+
+### FiLM gate
+
+`element_film=True` modulates the edge features once — right after they are
+built and rotated into the bond frame, before the equivariant layer stack. A
+small MLP on `[embed(type_i), embed(type_j), φ(r_ij)]` predicts a scale `γ`
+(and optionally a shift `β`), applied as `γ⊙A + β`:
+
+```python
+train_ecenet(..., element_film=True, film_n_rbf=8)   # element + distance
+train_ecenet(..., element_film=True)                 # element-only (film_n_rbf=0)
+```
+
+The gate MLP's last layer is zero-init, so `γ=1`, `β=0`, and the model is
+unchanged at initialisation — the gate learns away from the identity.
+
+| option | effect |
+| --- | --- |
+| `film_n_rbf` | size of the radial leg `φ(r_ij)`; `0` (default) makes the gate element-only, so `γ` does not vary with bond length |
+| `film_embed_dim` | width of each element embedding (default 16) |
+| `film_hidden` | gate-MLP hidden width(s); `None` → `[max(2*C, 32)]` |
+| `film_per_m` | emit a scale per `(channel, m)` instead of one per channel broadcast over `m` |
+| `film_shift` | also predict a shift `β`, as an extra head on the *same* MLP |
+
+Both extras keep the symmetry intact, which constrains where they may act.
+`A_cos` and `A_sin` of a given `(channel, m)` share `γ`, so a per-`m` scale still
+commutes with the bond frame's per-mode SO(2) rotation; the structural-zero slots
+(`m > l` of that channel) are masked to `γ=1`. An additive shift does *not*
+commute with that rotation, so `β` lands on the `m=0` slot of `A_cos` only — the
+rotation-invariant mode, and the one place a shift is exactly equivariant.
 
 ### Message passing
 
@@ -166,6 +197,7 @@ The test suite is pure PyTorch and runs on CPU. Each file is runnable as a scrip
 ```bash
 python tests/test_ecenet.py                  # ECENet integration: SO(3) invariance, forces, MP
 python tests/test_bottleneck.py              # low-rank layers: identity at init, SO(3)
+python tests/test_element_film.py            # FiLM gate: identity at init, SO(3), per-m, shift
 python tests/test_transformer_mp.py          # attention MP: SO(3), cutoff continuity, sum vs softmax
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 ```

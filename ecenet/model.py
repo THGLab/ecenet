@@ -36,6 +36,7 @@ import torch.nn as nn
 
 from ecenet.ace_basis import ACEBasisAnalytic
 from ecenet.equivariant import EquivariantLinear, RealSpaceNonlinearity
+from ecenet.film import ElementFiLM
 from ecenet.radial import find_edges, get_cutoff_fn, radial_basis
 from ecenet.spherical import build_D_block, spherical_harmonics_float64, wigner_rotate
 
@@ -88,6 +89,23 @@ class ECENet(nn.Module):
         mp_n_heads:     number of attention heads; the value channels
                         (n_base = 2*embed_dim) split evenly across them
                         (default 1). Ignored (with a warning) when n_mp=1.
+        element_film:   if True, modulate the edge features once — right after
+                        they are built and rotated into the bond frame, before
+                        the layer stack — by an element(+distance)-conditioned
+                        FiLM gate (see ecenet/film.py). Identity at init.
+        film_embed_dim: width of each element embedding in the FiLM gate (default 16)
+        film_n_rbf:     radial-basis size φ(r) for the FiLM gate (0 → element-only,
+                        so the gate depends on the element pair but not the bond
+                        length)
+        film_hidden:    FiLM gate MLP hidden width(s); None → [max(2*C, 32)]
+        film_per_m:     if True the gate emits a scale per (channel, m) rather than
+                        one per channel broadcast over m. Still equivariant: cos and
+                        sin of a given (channel, m) share the scale. Structural-zero
+                        slots (m > l of that channel) are masked to γ=1.
+        film_shift:     if True the gate also predicts a shift β (full FiLM,
+                        γ⊙x + β) as an extra head on the same MLP. β lands on the
+                        m=0 slot of A_cos only — the invariant mode, the only place
+                        an additive shift preserves equivariance.
     """
 
     def __init__(
@@ -112,6 +130,12 @@ class ECENet(nn.Module):
         mp_type: str = 'transformer',
         mp_dim: int = None,
         mp_n_heads: int = 1,
+        element_film: bool = False,
+        film_embed_dim: int = 16,
+        film_n_rbf: int = 0,
+        film_hidden=None,
+        film_per_m: bool = False,
+        film_shift: bool = False,
     ):
         super().__init__()
         self.n_types = n_types
@@ -149,6 +173,55 @@ class ECENet(nn.Module):
         self.sph_to_angular = SphToAngular(embed_dim, l_max, m_max=self.m_max)
         # n_features_per_m = 2 * embed_dim * (l_max+1): one channel per (side, embed, l)
         self.n_features_per_m = 2 * embed_dim * (l_max + 1)
+
+        # ── Element(+distance)-conditioned FiLM gate (optional) ───────────────
+        # A small MLP on [embed(type_i), embed(type_j), φ(r_ij)] → a scale γ on
+        # A_cos/A_sin, applied once to the freshly built edge features. Identity
+        # at init (the gate MLP's last layer is zero-init → γ=1, β=0).
+        #   film_per_m=False (default): one scale γ_c per channel, broadcast over
+        #     the angular modes m.
+        #   film_per_m=True: a scale γ_{c,m} per (channel, m). Still equivariant —
+        #     the bond frame's residual symmetry rotates (A_cos_m, A_sin_m) by mφ,
+        #     which any scale commutes with as long as cos and sin of that mode
+        #     share it (they do). The structural-zero slots (m > l_of_c[c]) are
+        #     masked to γ=1: they can carry rotation-inconsistent values, so a
+        #     per-mode scale must not touch them differentially (a per-channel γ
+        #     scales them uniformly with the rest of the channel, which is safe).
+        # film_shift=True adds a shift β (γ⊙x + β) as an extra head on the same gate
+        # MLP. β lands on the m=0 slot of A_cos only: m=0 is the invariant mode, so
+        # an invariant scalar added there is exactly equivariant, whereas a shift on
+        # any m>0 mode is not (it does not commute with the e^{imφ} gauge rotation).
+        # The m=0 *sin* slot is a structural zero (sin(0·φ)=0) and stays untouched.
+        self.film_per_m = bool(film_per_m)
+        self.film_shift = bool(film_shift)
+        if not element_film:
+            # Warn rather than silently ignore: a configured gate that is never
+            # built looks like it was applied.
+            _set = [n for n, v, d in (('film_embed_dim', film_embed_dim, 16),
+                                      ('film_n_rbf', film_n_rbf, 0),
+                                      ('film_hidden', film_hidden, None),
+                                      ('film_per_m', film_per_m, False),
+                                      ('film_shift', film_shift, False)) if v != d]
+            if _set:
+                warnings.warn(
+                    f"{', '.join(_set)} ignored: they configure the FiLM gate, "
+                    "which is off (element_film=False).", stacklevel=2)
+        film_n_modes, film_mode_valid = 1, None
+        if self.film_per_m:
+            film_n_modes = self.n_angular
+            l_of_c = torch.arange(self.n_features_per_m) % (l_max + 1)
+            film_mode_valid = (torch.arange(film_n_modes)[None, :]
+                               <= l_of_c[:, None]).to(torch.get_default_dtype())
+        if self.film_shift:
+            # one-hot selector for m=0, to add β without an in-place index write
+            m0 = torch.zeros(1, 1, self.n_angular)
+            m0[..., 0] = 1.0
+            self.register_buffer('film_m0', m0)
+        self.element_film = ElementFiLM(
+            self.n_features_per_m, n_types,
+            embed_dim=film_embed_dim, n_rbf=film_n_rbf, hidden=film_hidden,
+            shift=self.film_shift, n_modes=film_n_modes,
+            mode_valid=film_mode_valid) if element_film else None
 
         # ── Equivariant layers: Linear → RealSpaceNonlinearity → residual ────
         # Message passing: the model is `n_mp` stages of `n_layers` equivariant
@@ -260,6 +333,41 @@ class ECENet(nn.Module):
         W_i = self.W[types]  # (n_atoms, n_types, n_max, embed_dim)
         return torch.einsum('itns,itnc->ics', A, W_i)
 
+    def _apply_element_film(self, A_cos, A_sin, type_i, type_j, dist_ij):
+        """Element(+distance)-conditioned FiLM scale on A_cos/A_sin.
+
+        A_cos and A_sin of a given (channel, m) share the scale, which is what
+        keeps the e^{imφ} transformation intact → SO(2)/SO(3)-equivariant, whether
+        the scale is per-channel or per-(channel, m) (``film_per_m``). With
+        ``film_shift`` a shift β is added to the m=0 slot of A_cos only — the
+        invariant mode. Identity at init.
+        """
+        gamma, beta = self._film_params(type_i, type_j, dist_ij)
+        return self._film_apply(A_cos, A_sin, gamma, beta)
+
+    def _film_params(self, type_i, type_j, dist_ij):
+        """FiLM scale γ and (with film_shift) the m=0 shift β.
+
+        γ is shaped to broadcast against (n_edges, C, n_angular): (n_edges, C, 1)
+        per-channel, or (n_edges, C, n_angular) with film_per_m. β is (n_edges, C)
+        — the m=0 slot only — or None.
+        """
+        r_basis = None
+        if self.element_film.n_rbf:
+            r_basis = radial_basis(dist_ij, self.r_cut_edge, self.element_film.n_rbf,
+                                   cutoff_type=self.cutoff_type)      # (n_edges, n_rbf)
+        gamma, beta = self.element_film(type_i, type_j, r_basis)
+        if gamma.dim() == 2:
+            gamma = gamma.unsqueeze(-1)          # broadcast over m
+        return gamma, beta
+
+    def _film_apply(self, A_cos, A_sin, gamma, beta):
+        """γ⊙A (+ β on the m=0 slot of A_cos). β is None unless film_shift."""
+        A_cos, A_sin = A_cos * gamma, A_sin * gamma
+        if beta is not None:
+            A_cos = A_cos + beta.unsqueeze(-1) * self.film_m0     # m=0 slot only
+        return A_cos, A_sin
+
     def _contract(self, A_cos, A_sin):
         """Extract m=0 invariants: (n_edges, n_features_per_m, n_angular) → (n_edges, n_features_per_m)."""
         return A_cos[:, :, 0]
@@ -285,6 +393,13 @@ class ECENet(nn.Module):
         between consecutive stages when n_mp >= 2 (n_mp-1 MP layers, no trailing MP)."""
         type_i   = kwargs.get('type_i')
         type_j   = kwargs.get('type_j')
+        dist_ij  = kwargs.get('dist_ij')
+
+        # Element(+distance)-conditioned FiLM scale on the edge features, applied
+        # once before the layer stack (covers every forward path through here).
+        if self.element_film is not None:
+            A_cos, A_sin = self._apply_element_film(A_cos, A_sin, type_i, type_j, dist_ij)
+
         if self.n_mp == 1:
             # Plain model: a flat list of equivariant layers, no message passing.
             for layer in self.layers:
@@ -294,7 +409,6 @@ class ECENet(nn.Module):
         r_hat   = kwargs.get('r_hat')
         edge_i  = kwargs.get('edge_i')
         edge_j  = kwargs.get('edge_j')
-        dist_ij = kwargs.get('dist_ij')
         n_atoms = kwargs.get('n_atoms')
         D_block = kwargs.get('D_block')
         for gi, stage in enumerate(self.layers):
