@@ -206,23 +206,32 @@ over a full run.
 
 ### Batching and precision (SPICE / MPtrj trainers)
 
-`max_atoms_per_batch` (SPICE only) packs each batch to a total-atom budget
-instead of a fixed number of structures, so memory and compute per step are
-roughly uniform and a batch of several large molecules can no longer OOM:
+Two size-aware batching modes for the SPICE trainer, both off by default:
 
 ```python
-train_ecenet_spice(..., max_atoms_per_batch=250)   # ~batch_size * mean_atoms
+train_ecenet_spice(..., bucket=True)               # size-bucketed, fixed batch_size
+train_ecenet_spice(..., max_atoms_per_batch=250)   # atom budget; implies bucket
 train_ecenet_spice(..., max_atoms_per_batch=250, max_batch_count=16)
 ```
 
-Under DDP every rank must run the same *number* of batches or the collective in
-backward deadlocks, so the assignment is derived identically on every rank: sort
-by atom count, pack, group into rounds of `world_size`, drop any partial final
-round, shuffle the round order with a shared seed, and give rank r the r-th batch
-of each round. Adjacent (similar-cost) batches share a round, so ranks stay
-load-balanced — measured under 1% spread in total atoms at `world_size=8`.
-`max_batch_count` optionally caps structures per batch, which bounds the
-per-structure Python overhead when a batch is all tiny molecules.
+`bucket=True` sorts the epoch's structures by atom count and batches consecutive
+ones, so a batch holds similar-sized molecules rather than one giant molecule
+alongside several small ones (measured: mean within-batch atom spread 0.2 vs 44.1
+unsorted). `max_atoms_per_batch` goes further and packs to a total-atom budget, so
+memory and compute per step are roughly uniform and a batch of several large
+molecules can no longer OOM; `max_batch_count` optionally caps structures per
+batch, bounding the per-structure Python overhead when a batch is all tiny
+molecules.
+
+Both share the cross-rank alignment, which is what makes them useful under DDP.
+Every rank must run the same *number* of batches or the collective in backward
+deadlocks, so the assignment is derived identically on every rank rather than
+communicated: sort by atom count, form batches, group into rounds of
+`world_size`, drop any partial final round, shuffle the round order with a shared
+seed, and give rank r the r-th batch of each round. Adjacent (similar-cost)
+batches share a round, so per-step work is aligned across ranks and the
+molecule-size straggler disappears — the biggest win multi-node. Measured spread
+in per-rank total atoms at `world_size=8`: 3.4% bucketed, 0.9% atom-budget.
 
 `tf32=True` (both trainers) routes float32 matmuls to TF32 tensor cores on
 Ampere+. TF32 keeps ~10 mantissa bits, so A/B the validation MAE before trusting

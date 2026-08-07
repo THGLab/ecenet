@@ -51,46 +51,62 @@ def print_flush(*args, **kwargs):
     sys.stdout.flush()
 
 
-def atom_budget_batches(all_idx, n_atoms, max_atoms_per_batch, max_batch_count,
-                        world_size, rank, seed):
-    """Pack ``all_idx`` into batches of at most ``max_atoms_per_batch`` atoms and
-    return the ones belonging to ``rank``.
+def size_aware_batches(all_idx, n_atoms, world_size, rank, epoch, seed,
+                       batch_size=None, max_atoms_per_batch=None,
+                       max_batch_count=None, verbose=False):
+    """Size-grouped, cross-rank-aligned batches for one epoch; returns ``rank``'s.
 
-    Fixed batch_size means a batch of several large molecules costs far more than
-    a batch of small ones, and the largest batches decide whether the run OOMs.
-    Packing to a total-atom budget instead gives ~uniform memory and compute per
-    step, at a variable number of structures.
+    Every rank holds the whole dataset, so this is a *global* length-grouped
+    sampler: sort the epoch's indices by atom count, form batches from that sorted
+    order, group the batches into rounds of ``world_size`` adjacent ones, shuffle
+    the round order, and give rank r the r-th batch of each round.
 
-    Under DDP every rank MUST run the same number of batches or the collective in
-    backward deadlocks, which a variable batch size makes non-trivial. The
-    assignment is therefore derived identically on every rank: sort by atom count,
-    pack, group the batches into rounds of ``world_size``, drop any partial final
-    round, shuffle the round order with a shared seed, and give rank r the r-th
-    batch of each round. Same data + same seed on every rank → same batch count.
-    Adjacent (similar-cost) batches land in the same round, so ranks stay
-    load-balanced too.
+    Two properties fall out, both of which matter under DDP:
+
+    * Batches within a round have similar cost, so per-step work is aligned across
+      ranks — no straggler from molecule-size variance (the biggest win
+      multi-node).
+    * Every rank derives the same assignment from the same data and seed, and only
+      full rounds are used, so all ranks run the *same number* of batches. That is
+      load-bearing: a mismatch deadlocks the collective in backward rather than
+      raising.
+
+    Batches are formed either at fixed ``batch_size`` (size bucketing) or packed to
+    a total-atom budget (``max_atoms_per_batch``, optionally capped at
+    ``max_batch_count`` structures). The budget keeps memory and compute per step
+    roughly uniform, so a batch of several large molecules cannot OOM the run.
     """
     order = all_idx[np.argsort(n_atoms[all_idx], kind='stable')]
-    batches, cur, cur_atoms = [], [], 0
-    for idx in order:
-        a = int(n_atoms[idx])
-        if cur and (cur_atoms + a > max_atoms_per_batch
-                    or (max_batch_count and len(cur) >= max_batch_count)):
+    if max_atoms_per_batch is not None:
+        batches, cur, cur_atoms = [], [], 0
+        for idx in order:
+            a = int(n_atoms[idx])
+            if cur and (cur_atoms + a > max_atoms_per_batch
+                        or (max_batch_count and len(cur) >= max_batch_count)):
+                batches.append(np.array(cur))
+                cur, cur_atoms = [], 0
+            cur.append(int(idx))
+            cur_atoms += a
+        if cur:
             batches.append(np.array(cur))
-            cur, cur_atoms = [], 0
-        cur.append(int(idx))
-        cur_atoms += a
-    if cur:
-        batches.append(np.array(cur))
-    # whole rounds only, so every rank gets exactly n_rounds batches
+    else:
+        batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
+
+    # Whole rounds only, so every rank gets exactly n_rounds batches.
     n_rounds = len(batches) // world_size
     if n_rounds == 0:
-        raise ValueError(
-            f"atom-budget batching produced {len(batches)} batches for "
-            f"world_size={world_size}: raise n_per_epoch or lower "
-            "max_atoms_per_batch.")
-    round_order = np.random.RandomState(seed).permutation(n_rounds)
-    return [batches[r * world_size + rank] for r in round_order]
+        # Degenerate tiny epoch. Still hand every rank exactly one batch so the
+        # ranks stay aligned (a deadlock here would be far worse), but they now
+        # share structures — worth saying out loud.
+        if verbose:
+            print_flush(f"  WARNING: only {len(batches)} batches for "
+                        f"world_size={world_size}; ranks will share structures "
+                        "this epoch. Raise n_per_epoch or lower the batch size.")
+        return [batches[rank % len(batches)]]
+    # Decorrelated from the epoch's sampling RNG, which is seeded on (seed+epoch);
+    # reusing that here would tie the round order to the sample draw.
+    round_order = np.random.RandomState(seed + 7919 * (epoch + 1)).permutation(n_rounds)
+    return [batches[int(r) * world_size + rank] for r in round_order]
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +323,8 @@ def train_ecenet_spice(
     dtype=torch.float64,
     tf32=False,              # route float32 matmuls to TF32 tensor cores (Ampere+)
     # Batching
-    max_atoms_per_batch=None,  # atom-budget batching: cap total atoms/batch (no OOM)
+    bucket=False,              # size-bucketed, cross-rank-aligned batching (DDP load balance)
+    max_atoms_per_batch=None,  # atom-budget batching: cap total atoms/batch (no OOM); implies bucket
     max_batch_count=None,      # optional cap on structures/batch in atom-budget mode
     device=None,
     checkpoint_path=None,
@@ -621,8 +638,11 @@ def train_ecenet_spice(
                     f"(batch={batch_size}, epoch_size={epoch_size:,}, world_size={world_size}, "
                     f"lr={lr}, E-weight={energy_weight}, F-weight={force_weight}, {loss_desc})")
 
-    # Atom-budget batching (see atom_budget_batches). Off unless requested.
+    # Size-aware batching (see size_aware_batches). Off unless requested.
     n_atoms_train = np.array([p.shape[0] for p in pos_train], dtype=np.int64)
+    if verbose and bucket and max_atoms_per_batch is None:
+        print_flush(f"  Size-bucketed batching: fixed batch_size={batch_size}, "
+                    f"sorted by atom count and aligned across {world_size} rank(s)")
     if max_atoms_per_batch is not None:
         _largest = int(n_atoms_train.max())
         if _largest > max_atoms_per_batch:
@@ -663,10 +683,11 @@ def train_ecenet_spice(
         else:
             rng     = np.random.RandomState(seed + epoch)
             all_idx = rng.choice(n_train_actual, epoch_size, replace=(epoch_size > n_train_actual))
-        if max_atoms_per_batch is not None:
-            rank_batches = atom_budget_batches(
-                all_idx, n_atoms_train, max_atoms_per_batch, max_batch_count,
-                world_size, rank, seed + epoch)
+        if bucket or max_atoms_per_batch is not None:
+            rank_batches = size_aware_batches(
+                all_idx, n_atoms_train, world_size, rank, epoch, seed,
+                batch_size=batch_size, max_atoms_per_batch=max_atoms_per_batch,
+                max_batch_count=max_batch_count, verbose=verbose)
         else:
             rank_idx = all_idx[rank * rank_epoch_size:(rank + 1) * rank_epoch_size]
             n_b = (len(rank_idx) + batch_size - 1) // batch_size
