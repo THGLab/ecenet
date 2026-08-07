@@ -331,7 +331,7 @@ def train_ecenet(
                 n_types=n_types,
                 r_cut_edge=r_cut_edge, r_cut_neighbor=r_cut_neighbor,
                 l_max=l_max, n_max=n_max, embed_dim=embed_dim,
-                n_layers=n_layers, n_max_d=n_max_d, n_grid=n_grid,
+                n_layers=n_layers, n_max_d=n_max_d, m_max=m_max, n_grid=n_grid,
                 cutoff_type=cutoff_type, activation=activation,
                 use_nonlinearity=use_nonlinearity,
                 output_hidden_dims=output_hidden_dims,

@@ -324,6 +324,39 @@ def test_legacy_edge_mp_checkpoint_raises():
         raise AssertionError("expected a ValueError for a legacy edge-MP checkpoint")
 
 
+def test_trainers_save_every_architecture_hparam():
+    """Every ECENet constructor argument that changes the architecture must be in
+    the 'hparams' each trainer saves — from_checkpoint rebuilds the model from
+    that dict alone, so a missing key silently substitutes a default (and, when
+    it changes tensor shapes, makes the checkpoint fail to load at all)."""
+    import ast
+    import inspect
+
+    from ecenet import ECENet
+
+    # Args that describe the *architecture*. Excluded: n_types (data-derived) and
+    # options that do not affect the built module tree.
+    required = set(inspect.signature(ECENet).parameters) - {'self', 'n_types'}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    trainers = ('train_ecenet.py', 'train_ecenet_spice.py', 'train_ecenet_mptrj.py')
+
+    for name in trainers:
+        tree = ast.parse(open(os.path.join(root, 'scripts', name)).read())
+        saved = set()
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call) and getattr(call.func, 'id', None) == 'dict':
+                keys = {k.arg for k in call.keywords if k.arg}
+                if {'n_types', 'l_max'} <= keys:      # the hparams dict
+                    saved |= keys
+        assert saved, f"{name}: no hparams dict found"
+        missing = sorted(required - saved)
+        assert not missing, f"{name}: hparams omits architecture args {missing}"
+        stale = sorted(saved - required - {'n_types'})
+        assert not stale, f"{name}: hparams saves non-ECENet args {stale}"
+    print(f"  all {len(trainers)} trainers save every architecture hparam "
+          f"({len(required)} args)")
+
+
 def test_architecture_mismatch_raises():
     """A checkpoint whose weights disagree with the architecture rebuilt from
     'hparams' must raise rather than load a partly random model."""
@@ -362,5 +395,6 @@ if __name__ == '__main__':
     test_from_checkpoint_missing_mapping_raises()
     test_from_checkpoint_missing_hparams_raises()
     test_legacy_edge_mp_checkpoint_raises()
+    test_trainers_save_every_architecture_hparam()
     test_architecture_mismatch_raises()
     print("All tests passed.")
