@@ -162,53 +162,77 @@ if hasattr(model, 'layers') and hasattr(model, 'mp_layers'):
             zip(model.layers, model.mp_layers)):
         sep(f"MP step {step_idx+1}")
         for li, layer in enumerate(layer_group):
-            time_fn(f"  EquivariantLinear [{step_idx},{li}]",
-                    lambda l=layer: l.linear(A_cos, A_sin, type_i=type_i, type_j=type_j))
+            # Low-rank (bottleneck_dim) layers have linear_down/linear_up instead
+            # of a single full-width linear.
+            if layer.bottleneck_dim is not None:
+                time_fn(f"  EquivariantLinear down [{step_idx},{li}]",
+                        lambda l=layer: l.linear_down(A_cos, A_sin))
+                time_fn(f"  EquivariantLinear up [{step_idx},{li}]",
+                        lambda l=layer, c=layer.linear_down(A_cos, A_sin):
+                            l.linear_up(*(l.nonlin(*c) if l.nonlin is not None else c)))
+                lin_out = layer.linear_down(A_cos, A_sin)
+            else:
+                time_fn(f"  EquivariantLinear [{step_idx},{li}]",
+                        lambda l=layer: l.linear(A_cos, A_sin))
+                lin_out = layer.linear(A_cos, A_sin)
             if layer.use_nonlinearity:
-                A_cos_l, A_sin_l = layer.linear(A_cos, A_sin, type_i=type_i, type_j=type_j)
                 time_fn(f"  RealSpaceNonlinearity [{step_idx},{li}]",
-                        lambda l=layer, c=A_cos_l, s=A_sin_l:
-                            l.nonlin(c, s, type_i=type_i, type_j=type_j))
-            A_cos, A_sin = layer(A_cos, A_sin, type_i=type_i, type_j=type_j)
+                        lambda l=layer, c=lin_out: l.nonlin(*c))
+            A_cos, A_sin = layer(A_cos, A_sin)
 
-        # Message passing internals
+        # Message passing internals (message + score → weights → aggregate → receiver)
         n_e = len(edge_i)
-        lp1 = model.l_max + 1
-        Ac = A_cos.view(n_e, mp.n_base, lp1, mp.n_angular)
-        As = A_sin.view(n_e, mp.n_base, lp1, mp.n_angular)
+        n_atoms = len(types)
+        H = mp.n_heads
 
-        def _pack():
-            h = torch.zeros(n_e, mp.n_base, mp.n_sph, device=device, dtype=dtype)
-            for l in range(lp1):
-                m_out = min(l, mp.m_max)
-                h[:, :, l*l+l : l*l+l+m_out+1] = Ac[:, :, l, :m_out+1]
-                if m_out > 0:
-                    h[:, :, l*l+l-m_out : l*l+l] = As[:, :, l, 1:m_out+1].flip(-1)
-            return h
-        _, h_packed = time_fn("  MP pack cos/sin → n_sph", _pack)
+        def _trunk():
+            u_cos, u_sin = mp.msg_down(A_cos, A_sin)
+            u_cos, u_sin = mp.msg_nonlin(u_cos, u_sin)
+            return mp.msg_up(u_cos, u_sin)
+        _, (u_cos, u_sin) = time_fn("  MP fused message/score trunk", _trunk)
+        m_cos = u_cos[:, :mp.n_ch] + A_cos
+        m_sin = u_sin[:, :mp.n_ch] + A_sin
+        s = u_cos[:, mp.n_ch:mp.n_ch + mp.n_scores, 0]
 
-        f_d = radial_basis(dist_ij, mp.r_cut, mp.n_dist_basis, cutoff_type=mp.cutoff_type)
-        ti, tj = types[edge_i], types[edge_j]
-        w = torch.einsum('en,enc->ec', f_d, mp.W_msg[ti, tj])   # plain n_types²
-        D_block_main_T = D_block_main.transpose(-1, -2).contiguous()
-        time_fn("  MP bmm unrotate (h @ D^T, contiguous)",
+        _, h_packed = time_fn("  MP pack cos/sin → n_sph",
+                              lambda: mp._pack(m_cos, m_sin))
+
+        D_block_main_T = D_block_main.transpose(-1, -2)
+        time_fn("  MP bmm unrotate (h @ D^T)",
                 lambda: torch.bmm(h_packed, D_block_main_T))
-        h_global = torch.bmm(h_packed, D_block_main_T) * w.unsqueeze(-1)
+        h_global = torch.bmm(h_packed, D_block_main_T)
 
-        idx = edge_j[:, None, None].expand_as(h_global)
-        Delta = torch.zeros(len(types), mp.n_base, mp.n_sph,
-                            device=device, dtype=dtype).scatter_add(0, idx, h_global)
+        def _weights():
+            f_cut = mp.cutoff_fn(dist_ij, mp.r_cut)
+            if mp.aggregation == 'sum':
+                return s * f_cut[:, None]
+            ej_k = edge_j[:, None].expand(-1, H)
+            s_max = torch.full((n_atoms, H), float('-inf'), device=device, dtype=dtype
+                               ).scatter_reduce(0, ej_k, s.detach(), reduce='amax',
+                                                include_self=True)
+            num = torch.exp(s - s_max[edge_j]) * f_cut[:, None]
+            denom = torch.zeros(n_atoms, H, device=device, dtype=dtype).scatter_add(0, ej_k, num)
+            return num / (denom[edge_j] + mp.softmax_eps)
+        _, a = time_fn(f"  MP {mp.aggregation} weights", _weights)
+
+        hb = mp.n_base // H
+        contrib = h_global.reshape(n_e, H, hb, mp.n_sph) * a[:, :, None, None]
+        idx = edge_j[:, None, None, None].expand_as(contrib)
         time_fn("  MP scatter_add (aggregate to atoms)",
-                lambda: torch.zeros(len(types), mp.n_base, mp.n_sph,
-                                    device=device, dtype=dtype
-                                    ).scatter_add(0, idx, h_global))
+                lambda: torch.zeros(n_atoms, H, hb, mp.n_sph, device=device, dtype=dtype
+                                    ).scatter_add(0, idx, contrib))
+        Delta = torch.zeros(n_atoms, H, hb, mp.n_sph, device=device, dtype=dtype
+                            ).scatter_add(0, idx, contrib).reshape(n_atoms, mp.n_base, mp.n_sph)
 
         time_fn("  MP bmm rotate back (Delta @ D)",
                 lambda: torch.bmm(Delta[edge_i], D_block_main))
+        v_rot = torch.bmm(Delta[edge_i], D_block_main)
+        _, d = time_fn("  MP unpack n_sph → cos/sin", lambda: mp._unpack(v_rot, n_e))
+        time_fn("  MP receiver block", lambda: mp.receiver(*d))
 
         A_cos, A_sin = mp(A_cos, A_sin, r_hat, dist_ij, edge_i, edge_j,
-                          len(types), types[edge_i], types[edge_j],
-                          False, D_block=D_block_main)
+                          n_atoms, types[edge_i], types[edge_j],
+                          D_block=D_block_main)
 
 sep("Output")
 invariants = model._contract(A_cos, A_sin)
@@ -216,13 +240,13 @@ if model.n_max_d is not None:
     rij_basis = radial_basis(dist_ij, model.r_cut_edge, model.n_max_d,
                              cutoff_type=model.cutoff_type)
     time_fn("output MLP",
-            lambda: model.output_net(invariants, type_i, type_j))
-    mlp_out = model.output_net(invariants, type_i, type_j)
+            lambda: model.output_net(invariants))
+    mlp_out = model.output_net(invariants)
     time_fn("dot(MLP_out × rij_basis)",
             lambda: (mlp_out * rij_basis).sum(-1))
 else:
     time_fn("output MLP",
-            lambda: model.output_net(invariants, type_i, type_j))
+            lambda: model.output_net(invariants))
 
 # ── 3. Total forward ──────────────────────────────────────────────────────────
 sep("Totals")
