@@ -89,6 +89,13 @@ class ECENet(nn.Module):
         mp_n_heads:     number of attention heads; the value channels
                         (n_base = 2*embed_dim) split evenly across them
                         (default 1). Ignored (with a warning) when n_mp=1.
+        mp_msg_envelope: if True (default), the aggregated message decays with
+                        *absolute* distance. For mp_type='transformer' this
+                        multiplies the softmax weight by f_cut(r) a second time,
+                        undoing the normalizer's division of the absolute cutoff
+                        (without it, a lone neighbour near r_cut still gets weight
+                        ≈ 1). mp_type='sum' is already enveloped by construction,
+                        so the flag is a no-op there — and cannot be turned off.
         element_film:   if True, modulate the edge features once — right after
                         they are built and rotated into the bond frame, before
                         the layer stack — by an element(+distance)-conditioned
@@ -130,6 +137,7 @@ class ECENet(nn.Module):
         mp_type: str = 'transformer',
         mp_dim: int = None,
         mp_n_heads: int = 1,
+        mp_msg_envelope: bool = True,
         element_film: bool = False,
         film_embed_dim: int = 16,
         film_n_rbf: int = 0,
@@ -249,6 +257,13 @@ class ECENet(nn.Module):
             warnings.warn(
                 f"mp_n_heads={mp_n_heads} is ignored: message passing is off "
                 f"(n_mp=1).", stacklevel=2)
+        # The only surprising case: 'sum' is enveloped by construction (a = s·f_cut),
+        # so asking to turn the envelope OFF cannot be honoured.
+        if not mp_msg_envelope and mp_type == 'sum' and n_mp > 1:
+            warnings.warn(
+                "mp_msg_envelope=False has no effect with mp_type='sum': its "
+                "weight is s·f_cut, so the message is enveloped by construction.",
+                stacklevel=2)
         if n_mp > 1:
             flat = list(self.layers)
             self.layers = nn.ModuleList([
@@ -262,7 +277,7 @@ class ECENet(nn.Module):
                     r_cut=self.r_cut_edge, cutoff_type=self.cutoff_type,
                     m_max=self.m_max, mp_dim=mp_dim,
                     activation=activation, n_grid=n_grid, n_heads=mp_n_heads,
-                    aggregation=mp_type,
+                    aggregation=mp_type, msg_envelope=mp_msg_envelope,
                 )
                 for _ in range(n_mp - 1)
             ])
@@ -937,12 +952,21 @@ class ECENetTransformerMPLayer(nn.Module):
                  cutoff_type: str = 'cosine', m_max: int = None,
                  mp_dim: int = None,
                  activation: str = 'silu', n_grid: int = None, n_heads: int = 1,
-                 aggregation: str = 'transformer'):
+                 aggregation: str = 'transformer', msg_envelope: bool = True):
         super().__init__()
         if aggregation not in ('transformer', 'sum'):
             raise ValueError(
                 f"Unknown aggregation '{aggregation}' (expected 'transformer' or 'sum').")
         self.aggregation = aggregation
+        # msg_envelope: multiply the softmax weight by f_cut(r_e) as well. The
+        # weight already carries f_cut, but normalization divides the ABSOLUTE
+        # value back out — only the relative f_cut across a receiver's in-edges
+        # survives, so a lone near-cutoff neighbour still gets weight ~1. This
+        # restores absolute-distance decay of the message. f_cut is invariant, so
+        # equivariance is untouched. 'sum' has no normalizer and is therefore
+        # already enveloped (a = s·f_cut); folding f_cut in twice would give f_cut²,
+        # so the flag applies to the softmax path only.
+        self.msg_envelope = bool(msg_envelope) and aggregation == 'transformer'
         self.l_max     = l_max
         self.n_sph     = (l_max + 1) ** 2
         self.m_max     = m_max if m_max is not None else l_max
@@ -1050,6 +1074,12 @@ class ECENetTransformerMPLayer(nn.Module):
             num = torch.exp(s - s_max[edge_j]) * f_cut[:, None]   # (n_e, H)
             denom = torch.zeros(n_atoms, H, device=device, dtype=dtype).scatter_add(0, ej_k, num)
             a = num / (denom[edge_j] + self.softmax_eps)     # (n_e, H) softmax weights
+            if self.msg_envelope:
+                #    The normalizer just divided the absolute f_cut back out, so
+                #    put it back: contribution = a_e · f_cut_e · m_e. Folded into
+                #    the weight (cheaper than scaling the full-width message), so
+                #    the aggregate decays with absolute distance, not just relative.
+                a = a * f_cut[:, None]
 
         # 5. Weighted aggregation to receiver atoms. The value channels (n_base)
         #    split into H contiguous groups (full n_sph each); head h's weight gates

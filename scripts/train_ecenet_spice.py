@@ -231,6 +231,7 @@ def train_ecenet_spice(
     mp_type='transformer',
     mp_dim=None,
     mp_n_heads=1,
+    mp_msg_envelope=True,
     # FiLM gate
     element_film=False,
     film_embed_dim=16,
@@ -350,6 +351,7 @@ def train_ecenet_spice(
         mp_type=mp_type,
         mp_dim=mp_dim,
         mp_n_heads=mp_n_heads,
+        mp_msg_envelope=mp_msg_envelope,
         element_film=element_film, film_embed_dim=film_embed_dim,
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
@@ -436,6 +438,7 @@ def train_ecenet_spice(
                 n_mp=n_mp,
                 mp_type=mp_type, mp_dim=mp_dim,
                 mp_n_heads=mp_n_heads,
+                mp_msg_envelope=mp_msg_envelope,
                 element_film=element_film, film_embed_dim=film_embed_dim,
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,

@@ -138,6 +138,16 @@ train_ecenet(..., n_mp=2, mp_type='sum')
 Either way the smooth cutoff envelope keeps the energy continuous as an edge
 crosses `r_cut_edge`.
 
+`mp_msg_envelope` (on by default) makes the aggregated message decay with
+*absolute* distance. It matters only for `'transformer'`: the softmax normalizer
+divides the absolute `f_cut` back out, leaving only the relative cutoff across a
+receiver's in-edges — so without it a lone neighbour near `r_cut` still gets
+weight ≈ 1 and the message is essentially flat in distance. Multiplying `f_cut`
+back in fixes that (measured on a dimer, the weight then equals `f_cut` exactly,
+falling ~32× from 1.5 Å to 4.5 Å instead of staying at 1.000). `'sum'` is already
+enveloped by construction, so the flag is a no-op there — and setting it `False`
+warns rather than silently doing nothing.
+
 Message and scores share **one fused trunk**: a low-rank block (down →
 nonlinearity at `mp_dim` → up) whose up-projection emits `2*embed_dim*(l_max+1)`
 message channels plus one score channel per head, the score being that channel's

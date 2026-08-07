@@ -184,6 +184,70 @@ def test_fused_trunk_zero_init():
     print("  sum MP becomes active once the score channels learn")
 
 
+def test_msg_envelope_restores_absolute_decay():
+    """Without the envelope, the softmax normalizer divides the ABSOLUTE f_cut back
+    out: a lone neighbour near r_cut still gets weight ~1, so the message is flat
+    in distance. mp_msg_envelope (on by default) multiplies it back in, so the
+    weight tracks f_cut exactly. 'sum' is already enveloped and must not change."""
+    RC = 5.0
+
+    def weight(aggregation, envelope, r):
+        torch.manual_seed(0)
+        layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, r_cut=RC,
+                                         aggregation=aggregation,
+                                         msg_envelope=envelope).double()
+        _activate_scores(layer, std=0.5, bias=0.5)
+        g = torch.Generator().manual_seed(3)
+        A_cos = torch.randn(1, 48, 3, generator=g, dtype=DTYPE)
+        A_sin = torch.randn(1, 48, 3, generator=g, dtype=DTYPE)
+        A_sin[:, :, 0] = 0.0
+        a = _recompute_weights(layer, A_cos, A_sin, torch.tensor([r], dtype=DTYPE),
+                               torch.zeros(1, dtype=torch.long), n_atoms=2)
+        f_cut = layer.cutoff_fn(torch.tensor([r], dtype=DTYPE), RC).item()
+        return a.abs().max().item(), f_cut
+
+    for r in (1.5, 2.5, 3.5, 4.5):
+        on, f_cut = weight('transformer', True, r)
+        off, _ = weight('transformer', False, r)
+        # enveloped: a single in-edge's weight is exactly f_cut (softmax gives 1)
+        assert abs(on / f_cut - 1.0) < 1e-3, \
+            f"enveloped weight should equal f_cut at r={r}: {on:.6f} vs {f_cut:.6f}"
+        # unenveloped: ~1 regardless of distance — the flat behaviour
+        assert abs(off - 1.0) < 1e-3, f"unenveloped weight should be ~1 at r={r}: {off:.6f}"
+    # over 1.5 -> 4.5 Å the enveloped weight falls ~32x while the bare one is flat
+    on_near, _ = weight('transformer', True, 1.5)
+    on_far,  _ = weight('transformer', True, 4.5)
+    off_near, _ = weight('transformer', False, 1.5)
+    off_far,  _ = weight('transformer', False, 4.5)
+    assert on_far / on_near < 0.05, "enveloped weight should decay strongly toward r_cut"
+    assert off_far / off_near > 0.99, "unenveloped weight should be ~flat in r"
+    # 'sum' is enveloped by construction: the flag must not change it
+    for r in (1.5, 4.5):
+        assert weight('sum', True, r)[0] == weight('sum', False, r)[0], \
+            "mp_msg_envelope must not alter the sum aggregation"
+    print(f"  mp_msg_envelope: weight == f_cut (decays {on_far/on_near:.3f}x over 1.5→4.5 Å); "
+          f"off → flat ({off_far/off_near:.3f}x); sum unaffected")
+
+
+def test_msg_envelope_defaults_and_flag():
+    """On by default for 'transformer'; structurally already on (and not
+    disableable) for 'sum', which warns rather than silently ignoring."""
+    assert ECENet(**COMMON, n_mp=2).mp_layers[0].msg_envelope is True
+    assert ECENet(**COMMON, n_mp=2, mp_msg_envelope=False).mp_layers[0].msg_envelope is False
+    # 'sum' never sets the flag — its weight is s*f_cut, so f_cut twice would be f_cut²
+    assert ECENet(**COMMON, n_mp=2, mp_type='sum').mp_layers[0].msg_envelope is False
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        ECENet(**COMMON, n_mp=2, mp_type='sum', mp_msg_envelope=False)
+        assert any('mp_msg_envelope' in str(x.message) for x in w), \
+            "disabling an envelope that is structural should warn"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        ECENet(**COMMON, n_mp=2, mp_type='sum')
+        assert not any('envelope' in str(x.message) for x in w), "plain sum should be quiet"
+    print("  mp_msg_envelope: default on for transformer, structural for sum, warns if disabled there")
+
+
 def test_sum_is_extensive():
     """The sum aggregation has no normalizer, so adding identical in-edges scales
     a receiver's total weight linearly; the softmax normalizes it to 1 however
@@ -244,20 +308,34 @@ def _recompute_weights(layer, A_cos, A_sin, dist_ij, edge_j, n_atoms):
     f_cut = layer.cutoff_fn(dist_ij, layer.r_cut)
     if layer.aggregation == 'sum':
         return s * f_cut[:, None]
-    num = torch.exp(s) * f_cut[:, None]
+    # Mirror the layer's per-(receiver, head) max-subtraction. It is an exact
+    # softmax either way, but softmax_eps is compared against the max-subtracted
+    # normalizer, so omitting it changes the result once the normalizer nears eps.
     ej = edge_j[:, None].expand(-1, H)
+    s_max = torch.full((n_atoms, H), float('-inf'), dtype=A_cos.dtype).scatter_reduce(
+        0, ej, s.detach(), reduce='amax', include_self=True)
+    num = torch.exp(s - s_max[edge_j]) * f_cut[:, None]
     denom = torch.zeros(n_atoms, H, dtype=A_cos.dtype).scatter_add(0, ej, num)
-    return num / (denom[edge_j] + layer.softmax_eps)
+    a = num / (denom[edge_j] + layer.softmax_eps)
+    if layer.msg_envelope:
+        a = a * f_cut[:, None]
+    return a
 
 
 def test_softmax_weights_sum_to_one():
     """The per-(receiver, head) attention weights are a softmax: they sum to 1
     (up to the +eps normalizer floor). This is what makes the aggregation a
-    weighted average — intensive in coordination rather than growing with it."""
+    weighted average — intensive in coordination rather than growing with it.
+
+    Built with msg_envelope=False to isolate the normalizer: the envelope (on by
+    default) multiplies the weights by f_cut afterwards, so they then sum to the
+    f_cut-weighted average rather than to 1. That is deliberate — the sum-to-1
+    property being checked here is a property of the softmax, not of the layer's
+    final weights."""
     for H in (1, 2, 4):
         torch.manual_seed(3)
         layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
-                                         n_heads=H).double()
+                                         n_heads=H, msg_envelope=False).double()
         inp = _layer_inputs()
         a = _recompute_weights(layer, inp['A_cos'], inp['A_sin'], inp['dist_ij'],
                                inp['edge_j'], inp['n_atoms'])
@@ -325,6 +403,8 @@ if __name__ == "__main__":
     test_cutoff_continuity()
     test_forces_finite()
     test_fused_trunk_zero_init()
+    test_msg_envelope_restores_absolute_decay()
+    test_msg_envelope_defaults_and_flag()
     test_sum_is_extensive()
     test_softmax_weights_sum_to_one()
     test_multihead()
