@@ -719,6 +719,7 @@ def train_ecenet_mptrj(
     eval_batch_size=32,
     seed=42,
     dtype=torch.float64,
+    tf32=False,              # route float32 matmuls to TF32 tensor cores (Ampere+)
     device=None,
     cpu_data=False,           # store the precomputed batch tensors on CPU and
                               # transfer per-batch to GPU; required for the
@@ -739,6 +740,24 @@ def train_ecenet_mptrj(
         device = torch.device(f'cuda:{local_rank}') if torch.cuda.is_available() else torch.device('cpu')
     elif isinstance(device, str):
         device = torch.device(device)
+
+    # TF32: on Ampere+ the step is dominated by fp32 matmuls (forward and the
+    # force double-backward). Routing those to TF32 tensor cores is the cheapest
+    # large speedup, but TF32 keeps only ~10 mantissa bits — A/B the val
+    # force/energy MAE before trusting it. No effect under float64 (TF32 is a
+    # float32-only mode), so warn rather than silently do nothing.
+    if tf32:
+        if dtype == torch.float64:
+            if verbose:
+                print_flush("  [tf32] requested but dtype=float64 → no effect "
+                            "(TF32 is float32-only); use dtype=torch.float32")
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
+            if verbose:
+                print_flush("  [tf32] enabled: float32 matmuls → TF32 tensor cores "
+                            "(A/B the val MAE against a tf32=False run)")
 
     np.random.seed(seed)
     torch.manual_seed(seed + rank)

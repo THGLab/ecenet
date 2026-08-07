@@ -51,6 +51,48 @@ def print_flush(*args, **kwargs):
     sys.stdout.flush()
 
 
+def atom_budget_batches(all_idx, n_atoms, max_atoms_per_batch, max_batch_count,
+                        world_size, rank, seed):
+    """Pack ``all_idx`` into batches of at most ``max_atoms_per_batch`` atoms and
+    return the ones belonging to ``rank``.
+
+    Fixed batch_size means a batch of several large molecules costs far more than
+    a batch of small ones, and the largest batches decide whether the run OOMs.
+    Packing to a total-atom budget instead gives ~uniform memory and compute per
+    step, at a variable number of structures.
+
+    Under DDP every rank MUST run the same number of batches or the collective in
+    backward deadlocks, which a variable batch size makes non-trivial. The
+    assignment is therefore derived identically on every rank: sort by atom count,
+    pack, group the batches into rounds of ``world_size``, drop any partial final
+    round, shuffle the round order with a shared seed, and give rank r the r-th
+    batch of each round. Same data + same seed on every rank → same batch count.
+    Adjacent (similar-cost) batches land in the same round, so ranks stay
+    load-balanced too.
+    """
+    order = all_idx[np.argsort(n_atoms[all_idx], kind='stable')]
+    batches, cur, cur_atoms = [], [], 0
+    for idx in order:
+        a = int(n_atoms[idx])
+        if cur and (cur_atoms + a > max_atoms_per_batch
+                    or (max_batch_count and len(cur) >= max_batch_count)):
+            batches.append(np.array(cur))
+            cur, cur_atoms = [], 0
+        cur.append(int(idx))
+        cur_atoms += a
+    if cur:
+        batches.append(np.array(cur))
+    # whole rounds only, so every rank gets exactly n_rounds batches
+    n_rounds = len(batches) // world_size
+    if n_rounds == 0:
+        raise ValueError(
+            f"atom-budget batching produced {len(batches)} batches for "
+            f"world_size={world_size}: raise n_per_epoch or lower "
+            "max_atoms_per_batch.")
+    round_order = np.random.RandomState(seed).permutation(n_rounds)
+    return [batches[r * world_size + rank] for r in round_order]
+
+
 # ---------------------------------------------------------------------------
 # Fixed element → type mapping (10 elements in SPICE)
 # ---------------------------------------------------------------------------
@@ -263,6 +305,10 @@ def train_ecenet_spice(
     eval_batch_size=32,
     seed=42,
     dtype=torch.float64,
+    tf32=False,              # route float32 matmuls to TF32 tensor cores (Ampere+)
+    # Batching
+    max_atoms_per_batch=None,  # atom-budget batching: cap total atoms/batch (no OOM)
+    max_batch_count=None,      # optional cap on structures/batch in atom-budget mode
     device=None,
     checkpoint_path=None,
     verbose=True,
@@ -282,6 +328,24 @@ def train_ecenet_spice(
             device = torch.device('cpu')
     elif isinstance(device, str):
         device = torch.device(device)
+
+    # TF32: on Ampere+ the step is dominated by fp32 matmuls (forward and the
+    # force double-backward). Routing those to TF32 tensor cores is the cheapest
+    # large speedup, but TF32 keeps only ~10 mantissa bits — A/B the val
+    # force/energy MAE before trusting it. No effect under float64 (TF32 is a
+    # float32-only mode), so warn rather than silently do nothing.
+    if tf32:
+        if dtype == torch.float64:
+            if verbose:
+                print_flush("  [tf32] requested but dtype=float64 → no effect "
+                            "(TF32 is float32-only); use dtype=torch.float32")
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
+            if verbose:
+                print_flush("  [tf32] enabled: float32 matmuls → TF32 tensor cores "
+                            "(A/B the val MAE against a tf32=False run)")
 
     # Use same seed on all ranks for data splitting so every rank trains on
     # the same structures; rank-specific seed only for training stochasticity.
@@ -557,6 +621,20 @@ def train_ecenet_spice(
                     f"(batch={batch_size}, epoch_size={epoch_size:,}, world_size={world_size}, "
                     f"lr={lr}, E-weight={energy_weight}, F-weight={force_weight}, {loss_desc})")
 
+    # Atom-budget batching (see atom_budget_batches). Off unless requested.
+    n_atoms_train = np.array([p.shape[0] for p in pos_train], dtype=np.int64)
+    if max_atoms_per_batch is not None:
+        _largest = int(n_atoms_train.max())
+        if _largest > max_atoms_per_batch:
+            raise ValueError(
+                f"max_atoms_per_batch={max_atoms_per_batch} is smaller than the "
+                f"largest training structure ({_largest} atoms); it could never "
+                "be placed in a batch.")
+        if verbose:
+            print_flush(f"  Atom-budget batching: <={max_atoms_per_batch} atoms/batch"
+                        + (f", <={max_batch_count} structures" if max_batch_count else "")
+                        + f" (mean {n_atoms_train.mean():.1f} atoms/structure)")
+
     epochs_without_improvement = 0
     t_start = time.time()
 
@@ -585,11 +663,18 @@ def train_ecenet_spice(
         else:
             rng     = np.random.RandomState(seed + epoch)
             all_idx = rng.choice(n_train_actual, epoch_size, replace=(epoch_size > n_train_actual))
-        rank_idx = all_idx[rank * rank_epoch_size:(rank + 1) * rank_epoch_size]
-        n_batches = (len(rank_idx) + batch_size - 1) // batch_size
+        if max_atoms_per_batch is not None:
+            rank_batches = atom_budget_batches(
+                all_idx, n_atoms_train, max_atoms_per_batch, max_batch_count,
+                world_size, rank, seed + epoch)
+        else:
+            rank_idx = all_idx[rank * rank_epoch_size:(rank + 1) * rank_epoch_size]
+            n_b = (len(rank_idx) + batch_size - 1) // batch_size
+            rank_batches = [rank_idx[b * batch_size:(b + 1) * batch_size]
+                            for b in range(n_b)]
+        n_batches = max(1, len(rank_batches))
 
-        for b in range(n_batches):
-            batch_indices = rank_idx[b * batch_size:(b + 1) * batch_size]
+        for batch_indices in rank_batches:
             optimizer.zero_grad()
 
             pos_rg   = [pos_train[i].detach().clone().requires_grad_(True) for i in batch_indices]

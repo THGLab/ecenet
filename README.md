@@ -204,6 +204,31 @@ computes the same LR independently, with no state to keep in sync. The
 `multistep` curve is verified identical to `torch.optim.lr_scheduler.MultiStepLR`
 over a full run.
 
+### Batching and precision (SPICE / MPtrj trainers)
+
+`max_atoms_per_batch` (SPICE only) packs each batch to a total-atom budget
+instead of a fixed number of structures, so memory and compute per step are
+roughly uniform and a batch of several large molecules can no longer OOM:
+
+```python
+train_ecenet_spice(..., max_atoms_per_batch=250)   # ~batch_size * mean_atoms
+train_ecenet_spice(..., max_atoms_per_batch=250, max_batch_count=16)
+```
+
+Under DDP every rank must run the same *number* of batches or the collective in
+backward deadlocks, so the assignment is derived identically on every rank: sort
+by atom count, pack, group into rounds of `world_size`, drop any partial final
+round, shuffle the round order with a shared seed, and give rank r the r-th batch
+of each round. Adjacent (similar-cost) batches share a round, so ranks stay
+load-balanced — measured under 1% spread in total atoms at `world_size=8`.
+`max_batch_count` optionally caps structures per batch, which bounds the
+per-structure Python overhead when a batch is all tiny molecules.
+
+`tf32=True` (both trainers) routes float32 matmuls to TF32 tensor cores on
+Ampere+. TF32 keeps ~10 mantissa bits, so A/B the validation MAE before trusting
+it. It is a float32-only mode: under `dtype=torch.float64` it warns and changes
+nothing.
+
 Train on SPICE dataset (10 elements):
 
 ```python
@@ -247,6 +272,7 @@ The test suite is pure PyTorch and runs on CPU. Each file is runnable as a scrip
 python tests/test_ecenet.py                  # ECENet integration: SO(3) invariance, forces, MP
 python tests/test_bottleneck.py              # low-rank layers: identity at init, SO(3)
 python tests/test_element_film.py            # FiLM gate: identity at init, SO(3), per-m, shift
+python tests/test_spice_trainer.py            # SPICE trainer: atom-budget batching, DDP invariant
 python tests/test_transformer_mp.py          # attention MP: SO(3), cutoff continuity, sum vs softmax
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 ```
