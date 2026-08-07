@@ -159,7 +159,20 @@ class ECENetCalculator(Calculator):
             model = model.double()
         model = model.to(device)
 
-        model.load_state_dict(state, strict=False)
+        # strict=False tolerates buffers dropped by past refactors, but a real
+        # mismatch (missing/unexpected *parameters*) means the architecture
+        # rebuilt from hparams disagrees with the weights — surface it instead of
+        # silently running a partly random model.
+        incompat = model.load_state_dict(state, strict=False)
+        _missing = [k for k in incompat.missing_keys if k in dict(model.named_parameters())]
+        if _missing or incompat.unexpected_keys:
+            raise ValueError(
+                "Checkpoint weights do not match the architecture rebuilt from "
+                f"'hparams'. Missing parameters: {_missing[:5]}"
+                f"{'…' if len(_missing) > 5 else ''}; unexpected keys: "
+                f"{incompat.unexpected_keys[:5]}"
+                f"{'…' if len(incompat.unexpected_keys) > 5 else ''}."
+            )
         model.eval()
 
         # ── Self-describing metadata (no dataset-specific knowledge here) ─────

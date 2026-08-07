@@ -324,6 +324,28 @@ def test_legacy_edge_mp_checkpoint_raises():
         raise AssertionError("expected a ValueError for a legacy edge-MP checkpoint")
 
 
+def test_architecture_mismatch_raises():
+    """A checkpoint whose weights disagree with the architecture rebuilt from
+    'hparams' must raise rather than load a partly random model."""
+    hp = dict(n_types=3, n_mp=2, **_HPARAMS)
+    model = ECENet(**hp).double()
+    # drop a genuine MP parameter → the rebuilt model has no weights for it
+    dropped = 'mp_layers.0.msg_up.weights'
+    assert dropped in model.state_dict(), f"{dropped} is no longer a parameter"
+    state = {k: v for k, v in model.state_dict().items() if k != dropped}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'mismatch.mdl')
+        torch.save({'model': state, 'hparams': hp,
+                    'element_to_type': {'H': 0, 'C': 1, 'O': 2}}, path)
+        try:
+            ECENetCalculator.from_checkpoint(path)
+        except ValueError as e:
+            assert 'do not match' in str(e) and dropped in str(e), f"unhelpful message: {e}"
+            print(f"  architecture mismatch rejected: {str(e)[:60]}…")
+        else:
+            raise AssertionError("expected a ValueError for mismatched weights")
+
+
 if __name__ == '__main__':
     print("ECENetCalculator behaviour")
     test_energy_units_kcal_vs_ev_scaling()
@@ -340,4 +362,5 @@ if __name__ == '__main__':
     test_from_checkpoint_missing_mapping_raises()
     test_from_checkpoint_missing_hparams_raises()
     test_legacy_edge_mp_checkpoint_raises()
+    test_architecture_mismatch_raises()
     print("All tests passed.")
