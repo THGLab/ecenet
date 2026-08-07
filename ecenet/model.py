@@ -87,9 +87,6 @@ class ECENet(nn.Module):
         analytic_ace_basis: bool = True,
         output_hidden_dims: list = None,
         m_max: int = None,
-        edge_type_nonlin: bool = False,
-        edge_type_linear: bool = False,
-        edge_type_output: bool = False,
     ):
         super().__init__()
         self.n_types = n_types
@@ -109,9 +106,6 @@ class ECENet(nn.Module):
         self.n_sph = (l_max + 1) ** 2
         self.m_max = int(m_max) if m_max is not None else l_max
         self.n_angular = self.m_max + 1   # m = 0..m_max (layers only use up to m_max)
-        self.edge_type_nonlin = edge_type_nonlin
-        self.edge_type_linear = edge_type_linear
-        self.edge_type_output = edge_type_output
 
         # ── Joint (n_types, n_max) → embed_dim contraction per central atom type ──
         # W[type_i, t, n, c]: for central atom of type type_i, contract
@@ -130,8 +124,6 @@ class ECENet(nn.Module):
         self.n_features_per_m = 2 * embed_dim * (l_max + 1)
 
         # ── Equivariant layers: Linear → RealSpaceNonlinearity → residual ────
-        _n_types_for_layers = n_types if edge_type_nonlin else None
-        _n_types_linear = n_types if edge_type_linear else None
         # Message passing: the model is `n_mp` stages of `n_layers` equivariant
         # layers each, with one equivariant MP layer *between* consecutive stages
         # (n_mp-1 MP layers total, no trailing MP). n_mp == 1 is the plain model:
@@ -140,8 +132,7 @@ class ECENet(nn.Module):
         self.n_mp = n_mp
         self.layers = nn.ModuleList([
             ECENetLayer(self.n_features_per_m, self.m_max, activation=activation,
-                        use_nonlinearity=use_nonlinearity, n_grid=n_grid,
-                        n_types=_n_types_for_layers, n_types_linear=_n_types_linear)
+                        use_nonlinearity=use_nonlinearity, n_grid=n_grid)
             for _ in range(n_mp * n_layers)
         ])
         # n_mp >= 2: regroup the flat layers into `n_mp` stages and build the
@@ -170,8 +161,7 @@ class ECENet(nn.Module):
         mlp_dims = [in_dim] + list(hidden_dims) + [n_output_out]
         act = {'silu': nn.SiLU, 'tanh': nn.Tanh, 'relu': nn.ReLU,
                'gelu': nn.GELU}.get(activation, nn.SiLU)
-        self.output_net = TypeDepMLP(mlp_dims, activation=act(),
-                                     n_types=n_types if edge_type_output else None)
+        self.output_net = OutputMLP(mlp_dims, activation=act())
 
         # ── Per-type atomic energy baseline ──────────────────────────────
         self.atomic_energy = nn.Parameter(torch.zeros(n_types))
@@ -233,8 +223,7 @@ class ECENet(nn.Module):
         """Extract m=0 invariants: (n_edges, n_features_per_m, n_angular) → (n_edges, n_features_per_m)."""
         return A_cos[:, :, 0]
 
-    def _apply_output(self, invariants, dist_ij, type_i=None, type_j=None,
-                      type_idx=None):
+    def _apply_output(self, invariants, dist_ij):
         """output_net(inv) → per-edge energies.
 
         n_max_d=None: the readout emits a single number per edge, multiplied by
@@ -242,13 +231,12 @@ class ECENet(nn.Module):
         0 at r_cut_edge (continuous energy/forces) without an explicit radial
         basis — i.e. energy_edge = MLP(inv) · f(r_ij). The n_max_d>=1 path
         instead dots the MLP output with the (cutoff-enveloped) radial basis."""
-        out_kw = dict(type_i=type_i, type_j=type_j, type_idx=type_idx)
         if self.n_max_d is not None:
             rij_basis = radial_basis(dist_ij, self.r_cut_edge, self.n_max_d,
                                      cutoff_type=self.cutoff_type)
-            return (self.output_net(invariants, **out_kw) * rij_basis).sum(-1)
+            return (self.output_net(invariants) * rij_basis).sum(-1)
         env = get_cutoff_fn(self.cutoff_type)(dist_ij, self.r_cut_edge)   # (n_e,) smooth → 0 at r_cut
-        return self.output_net(invariants, **out_kw).squeeze(-1) * env
+        return self.output_net(invariants).squeeze(-1) * env
 
 
     def _run_equivariant_layers(self, A_cos, A_sin, **kwargs):
@@ -256,12 +244,10 @@ class ECENet(nn.Module):
         between consecutive stages when n_mp >= 2 (n_mp-1 MP layers, no trailing MP)."""
         type_i   = kwargs.get('type_i')
         type_j   = kwargs.get('type_j')
-        type_idx = kwargs.get('type_idx')
         if self.n_mp == 1:
             # Plain model: a flat list of equivariant layers, no message passing.
             for layer in self.layers:
-                A_cos, A_sin = layer(A_cos, A_sin, type_i=type_i, type_j=type_j,
-                                     type_idx=type_idx)
+                A_cos, A_sin = layer(A_cos, A_sin)
             return A_cos, A_sin
         # Message-passing path: stage, MP, stage, MP, ..., stage  (MP only between stages).
         r_hat   = kwargs.get('r_hat')
@@ -272,8 +258,7 @@ class ECENet(nn.Module):
         D_block = kwargs.get('D_block')
         for gi, stage in enumerate(self.layers):
             for layer in stage:
-                A_cos, A_sin = layer(A_cos, A_sin, type_i=type_i, type_j=type_j,
-                                     type_idx=type_idx)
+                A_cos, A_sin = layer(A_cos, A_sin)
             if gi < len(self.mp_layers):          # no MP after the final stage
                 A_cos, A_sin = self.mp_layers[gi](
                     A_cos, A_sin, r_hat, dist_ij, edge_i, edge_j,
@@ -322,8 +307,6 @@ class ECENet(nn.Module):
         A_emb = self._embed(A, types)
 
         # ── Step 3: Gather + Wigner rotation ──────────────────────────────
-        type_i = types[edge_i]
-        type_j = types[edge_j]
         A_src = A_emb[edge_i]   # (n_edges, embed_dim, n_sph)
         A_tgt = A_emb[edge_j]
         A_both = torch.cat([A_src, A_tgt], dim=1)   # (n_edges, 2*embed_dim, n_sph)
@@ -335,17 +318,15 @@ class ECENet(nn.Module):
 
         # ── Step 5: Equivariant layers ────────────────────────────────────
         ti, tj = types[edge_i], types[edge_j]
-        type_idx = (precompute_type_idx_2pass(ti, tj, self.n_types)
-                    if (self.edge_type_linear or self.edge_type_output) else None)
         A_cos, A_sin = self._run_equivariant_layers(
             A_cos, A_sin,
             r_hat=r_hat, edge_i=edge_i, edge_j=edge_j,
             dist_ij=dist_ij, n_atoms=len(types),
-            type_i=ti, type_j=tj, type_idx=type_idx, D_block=D_block)
+            type_i=ti, type_j=tj, D_block=D_block)
 
         # ── Step 6+7: m=0 invariants → output_net → dot(rij_basis) ──────────
         invariants = self._contract(A_cos, A_sin)   # (n_edges, n_features_per_m)
-        per_edge_energy = self._apply_output(invariants, dist_ij, type_i, type_j, type_idx=type_idx)
+        per_edge_energy = self._apply_output(invariants, dist_ij)
         return per_edge_energy.sum() + self.atomic_energy[types].sum()
 
     def forward_pbc(self, positions: torch.Tensor, types: torch.Tensor,
@@ -396,16 +377,14 @@ class ECENet(nn.Module):
         A_cos, A_sin = self.sph_to_angular(A_rot)
 
         ti, tj = types[edge_i], types[edge_j]
-        type_idx = (precompute_type_idx_2pass(ti, tj, self.n_types)
-                    if (self.edge_type_linear or self.edge_type_output) else None)
         A_cos, A_sin = self._run_equivariant_layers(
             A_cos, A_sin,
             r_hat=r_hat, edge_i=edge_i, edge_j=edge_j,
             dist_ij=dist_ij, n_atoms=len(types),
-            type_i=ti, type_j=tj, type_idx=type_idx, D_block=D_block)
+            type_i=ti, type_j=tj, D_block=D_block)
 
         invariants = self._contract(A_cos, A_sin)
-        per_edge_energy = self._apply_output(invariants, dist_ij, ti, tj, type_idx=type_idx)
+        per_edge_energy = self._apply_output(invariants, dist_ij)
         return per_edge_energy.sum() + self.atomic_energy[types].sum()
 
     def forward_batch_multi(self, positions_list, types_list):
@@ -491,17 +470,14 @@ class ECENet(nn.Module):
 
         A_cos, A_sin = self.sph_to_angular(A_rot)
 
-        type_idx = (precompute_type_idx_2pass(type_i, type_j, self.n_types)
-                    if (self.edge_type_linear or self.edge_type_output) else None)
         A_cos, A_sin = self._run_equivariant_layers(
             A_cos, A_sin,
             r_hat=r_hat, edge_i=edge_i_flat, edge_j=edge_j_flat,
             dist_ij=dist_ij, n_atoms=atom_offset,
-            type_i=type_i, type_j=type_j, type_idx=type_idx, D_block=D_block)
+            type_i=type_i, type_j=type_j, D_block=D_block)
 
         invariants = self._contract(A_cos, A_sin)
-        per_edge_energy = self._apply_output(invariants, dist_ij, type_i, type_j,
-                                              type_idx=type_idx)
+        per_edge_energy = self._apply_output(invariants, dist_ij)
 
         energies = energies + torch.zeros(B, dtype=dtype, device=device).scatter_add(
             0, struct_idx, per_edge_energy)
@@ -581,18 +557,15 @@ class ECENet(nn.Module):
         type_i_flat = type_i.repeat(B)
         type_j_flat = type_j.repeat(B)
 
-        type_idx = (precompute_type_idx_2pass(type_i_flat, type_j_flat, self.n_types)
-                    if (self.edge_type_linear or self.edge_type_output) else None)
         A_cos_flat, A_sin_flat = self._run_equivariant_layers(
             A_cos_flat, A_sin_flat,
             r_hat=r_hat_flat, edge_i=edge_i_flat, edge_j=edge_j_flat,
             dist_ij=dist_ij.reshape(B * n_edges), n_atoms=B * N,
-            type_i=type_i_flat, type_j=type_j_flat, type_idx=type_idx, D_block=D_block)
+            type_i=type_i_flat, type_j=type_j_flat, D_block=D_block)
 
         # ── Step 6+7: m=0 invariants → output_net → dot(rij_basis) ──────────
         invariants = self._contract(A_cos_flat, A_sin_flat)      # (B*n_edges, n_features_per_m)
-        per_edge_energy = self._apply_output(invariants, dist_ij.reshape(B * n_edges),
-                                             type_i_flat, type_j_flat, type_idx=type_idx)  # (B*n_edges,)
+        per_edge_energy = self._apply_output(invariants, dist_ij.reshape(B * n_edges))  # (B*n_edges,)
         energies = per_edge_energy.reshape(B, n_edges).sum(dim=1)        # (B,)
         energies = energies + self.atomic_energy[types].sum()
 
@@ -618,38 +591,26 @@ class ECENetLayer(nn.Module):
     """
 
     def __init__(self, n_features: int, m_max: int, activation: str = 'silu',
-                 use_nonlinearity: bool = True, n_grid: int = None,
-                 n_types: int = None,
-                 n_types_linear: int = None):
+                 use_nonlinearity: bool = True, n_grid: int = None):
         super().__init__()
         n_angular = m_max + 1
         # nonlin_features: dimension at which the nonlinearity operates
         nonlin_features = n_features
 
-        self.linear = EquivariantLinear(n_features, n_features, n_angular, m_max,
-                                        n_types=n_types_linear)
+        self.linear = EquivariantLinear(n_features, n_features, n_angular, m_max)
 
         self.nonlin = None
         if use_nonlinearity:
             self.nonlin = RealSpaceNonlinearity(nonlin_features, m_max, n_grid=n_grid,
-                                                activation=activation,
-                                                n_types=n_types)
+                                                activation=activation)
         self.use_nonlinearity = self.nonlin is not None
-        self.edge_type_nonlin = (
-            self.nonlin is not None
-            and isinstance(self.nonlin, RealSpaceNonlinearity)
-            and self.nonlin.edge_type_nonlin
-        )
-    def forward(self, A_cos, A_sin, type_i=None, type_j=None, type_idx=None):
+
+    def forward(self, A_cos, A_sin):
         A_cos_in, A_sin_in = A_cos, A_sin
 
-        A_cos, A_sin = self.linear(A_cos, A_sin, type_i=type_i, type_j=type_j,
-                                   type_idx=type_idx)
+        A_cos, A_sin = self.linear(A_cos, A_sin)
         if self.nonlin is not None:
-            if self.edge_type_nonlin:
-                A_cos, A_sin = self.nonlin(A_cos, A_sin, type_i=type_i, type_j=type_j)
-            else:
-                A_cos, A_sin = self.nonlin(A_cos, A_sin)
+            A_cos, A_sin = self.nonlin(A_cos, A_sin)
 
         return A_cos + A_cos_in, A_sin + A_sin_in
 
@@ -860,108 +821,35 @@ class SphToAngular(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Type-dependent output MLP
+# Output MLP
 # ---------------------------------------------------------------------------
 
 
-class TypeDepLinear(nn.Module):
-    """Linear layer with factorized per-type additive weight correction.
+class OutputMLP(nn.Module):
+    """Plain MLP readout over the per-edge invariants.
 
-    W[e] = weight + weights_src[type_i[e]] + weights_tgt[type_j[e]]
-
-    Shared weight is randomly initialised; corrections are zero-initialised
-    so training begins from the shared baseline.
+    Weights use fan-avg Gaussian init; the last layer is near-zero initialised
+    so per-edge energies start close to 0 and the atomic-energy baseline
+    dominates early training.
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True,
-                 n_types: int = None):
-        super().__init__()
-        std = (2.0 / (in_features + out_features)) ** 0.5
-        self.weight = nn.Parameter(torch.randn(out_features, in_features) * std)
-        self.bias   = nn.Parameter(torch.zeros(out_features)) if bias else None
-        self.edge_type = (n_types is not None)
-        if self.edge_type:
-            self.weights_src = nn.Parameter(torch.zeros(n_types, out_features, in_features))
-            self.weights_tgt = nn.Parameter(torch.zeros(n_types, out_features, in_features))
-
-    def forward(self, x, type_i=None, type_j=None, type_idx=None):
-        out = x @ self.weight.T
-        if self.edge_type and (type_idx is not None or type_i is not None):
-            n_t = self.weights_src.shape[0]
-            correction = x.new_zeros(x.shape[0], self.weight.shape[0])
-            if type_idx is not None and len(type_idx) == 4:
-                # 2-pass format
-                src_perm, src_sizes, tgt_perm, tgt_sizes = type_idx
-                offset = 0
-                for ti, sz in enumerate(src_sizes):
-                    if sz > 0:
-                        idx = src_perm[offset:offset + sz]
-                        correction = correction.index_add(0, idx, x[idx] @ self.weights_src[ti].T)
-                    offset += sz
-                offset = 0
-                for tj, sz in enumerate(tgt_sizes):
-                    if sz > 0:
-                        idx = tgt_perm[offset:offset + sz]
-                        correction = correction.index_add(0, idx, x[idx] @ self.weights_tgt[tj].T)
-                    offset += sz
-            else:
-                if type_idx is not None:
-                    pair_perm, pair_sizes = type_idx
-                else:
-                    pair_type  = type_i * n_t + type_j
-                    pair_perm  = pair_type.argsort(stable=True)
-                    pair_sizes = pair_type.bincount(minlength=n_t * n_t).tolist()
-                offset = 0
-                for pair, sz in enumerate(pair_sizes):
-                    if sz > 0:
-                        ti, tj = divmod(pair, n_t)
-                        W_corr = self.weights_src[ti] + self.weights_tgt[tj]
-                        idx = pair_perm[offset:offset + sz]
-                        correction = correction.index_add(0, idx, x[idx] @ W_corr.T)
-                    offset += sz
-            out = out + correction
-        if self.bias is not None:
-            out = out + self.bias
-        return out
-
-
-class TypeDepMLP(nn.Module):
-    """MLP whose linear layers support optional per-(type_i, type_j) weight corrections."""
-
-    def __init__(self, dims: list, activation: nn.Module, n_types: int = None,
-                 zero_init_last: bool = True):
+    def __init__(self, dims: list, activation: nn.Module, zero_init_last: bool = True):
         super().__init__()
         self.linears = nn.ModuleList([
-            TypeDepLinear(dims[i], dims[i + 1], n_types=n_types)
-            for i in range(len(dims) - 1)
+            nn.Linear(dims[i], dims[i + 1]) for i in range(len(dims) - 1)
         ])
+        for lin in self.linears:
+            std = (2.0 / (lin.in_features + lin.out_features)) ** 0.5
+            nn.init.normal_(lin.weight, std=std)
+            nn.init.zeros_(lin.bias)
         self.activation = activation
         if zero_init_last:
-            nn.init.zeros_(self.linears[-1].bias)
             nn.init.normal_(self.linears[-1].weight, std=0.01)
+            nn.init.zeros_(self.linears[-1].bias)
 
-    def forward(self, x, type_i=None, type_j=None, type_idx=None):
+    def forward(self, x):
         for i, linear in enumerate(self.linears):
-            x = linear(x, type_i=type_i, type_j=type_j, type_idx=type_idx)
+            x = linear(x)
             if i < len(self.linears) - 1:
                 x = self.activation(x)
         return x
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def precompute_type_idx_2pass(type_i, type_j, n_types):
-    """Precompute src/tgt type groups for 2-pass equivariant linear.
-
-    Returns (src_perm, src_sizes, tgt_perm, tgt_sizes) — 4-tuple.
-    Pass 1: loop over src types (n_types groups, ~n_edges/n_types each).
-    Pass 2: loop over tgt types (n_types groups, ~n_edges/n_types each).
-    """
-    src_perm  = type_i.argsort(stable=True)
-    src_sizes = type_i.bincount(minlength=n_types).tolist()
-    tgt_perm  = type_j.argsort(stable=True)
-    tgt_sizes = type_j.bincount(minlength=n_types).tolist()
-    return src_perm, src_sizes, tgt_perm, tgt_sizes

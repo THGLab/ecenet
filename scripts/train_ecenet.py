@@ -164,9 +164,6 @@ def train_ecenet(
     output_hidden_dims=None,
     analytic_ace_basis=True,
     m_max=None,
-    edge_type_nonlin=False,
-    edge_type_linear=False,
-    edge_type_output=False,
     # Message passing
     n_mp=1,
     n_dist_basis=8,
@@ -246,9 +243,6 @@ def train_ecenet(
         output_hidden_dims=output_hidden_dims,
         analytic_ace_basis=analytic_ace_basis,
         m_max=m_max,
-        edge_type_nonlin=edge_type_nonlin,
-        edge_type_linear=edge_type_linear,
-        edge_type_output=edge_type_output,
         n_mp=n_mp,
         n_dist_basis=n_dist_basis,
     )

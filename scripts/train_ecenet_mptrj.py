@@ -678,9 +678,6 @@ def train_ecenet_mptrj(
     use_nonlinearity=True,
     n_grid=None,
     output_hidden_dims=None,
-    edge_type_nonlin=False,
-    edge_type_linear=False,
-    edge_type_output=False,
     analytic_ace_basis=True,
     # Message passing
     n_mp=1,
@@ -883,8 +880,6 @@ def train_ecenet_mptrj(
         activation=activation, use_nonlinearity=use_nonlinearity, n_grid=n_grid,
         output_hidden_dims=output_hidden_dims,
         analytic_ace_basis=analytic_ace_basis,
-        edge_type_nonlin=edge_type_nonlin, edge_type_linear=edge_type_linear,
-        edge_type_output=edge_type_output,
         n_mp=n_mp, n_dist_basis=n_dist_basis,
     )
     if dtype == torch.float64:
@@ -958,8 +953,6 @@ def train_ecenet_mptrj(
                 activation=activation, use_nonlinearity=use_nonlinearity,
                 output_hidden_dims=output_hidden_dims,
                 analytic_ace_basis=analytic_ace_basis,
-                edge_type_nonlin=edge_type_nonlin, edge_type_linear=edge_type_linear,
-                edge_type_output=edge_type_output,
                 n_mp=n_mp, n_dist_basis=n_dist_basis,
             ),
             'element_to_type': elements.to_element_to_type(type_map),  # {symbol: type_idx}

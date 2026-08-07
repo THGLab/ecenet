@@ -47,7 +47,6 @@ CONFIGS = [
     ("base, no MP (n_mp=1)",     dict(), 1),
     ("base, MP (n_mp=2)",        dict(), 2),
     ("base, MP (n_mp=3)",        dict(), 3),
-    ("edge_type_linear (typed)", dict(edge_type_linear=True, edge_type_output=True), 1),
 ]
 
 
