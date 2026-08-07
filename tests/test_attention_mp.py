@@ -5,8 +5,8 @@ score-weighted over each receiver atom's incoming edges, aggregated in the
 global frame, then a per-edge receiver residual. Two aggregations share that
 structure and differ only in the weight:
 
-  'transformer' (default) — softmax over the receiver's in-edges (intensive)
-  'sum'                   — raw signed score × cutoff envelope (extensive)
+  'softmax' (default) — softmax over the receiver's in-edges (intensive)
+  'sum'               — raw signed score × cutoff envelope (extensive)
 
 Message and scores come from ONE fused trunk whose zero-init up-projection emits
 n_ch message channels plus one score channel per head.
@@ -15,7 +15,7 @@ Checks: SO(3) invariance (the key property), continuity across r_cut, softmax
 weights sum to 1 per (atom, head), fused-trunk zero-init, sum extensivity,
 finite forces, and multi-head splitting.
 
-Run:  python tests/test_transformer_mp.py
+Run:  python tests/test_attention_mp.py
 """
 
 import os
@@ -67,10 +67,10 @@ def _activate_scores(layer, std=0.5, bias=None):
             layer.msg_up.bias[-layer.n_scores:].fill_(bias)
 
 
-def test_default_is_transformer():
+def test_default_is_softmax():
     m = ECENet(**COMMON, n_mp=2).double()
     assert isinstance(m.mp_layers[0], ECENetTransformerMPLayer)
-    assert m.mp_layers[0].aggregation == 'transformer'
+    assert m.mp_layers[0].aggregation == 'softmax'
     m_s = ECENet(**COMMON, n_mp=2, mp_type='sum').double()
     assert m_s.mp_layers[0].aggregation == 'sum'
     # the removed 'edge' MP is rejected, with a message that says so
@@ -80,13 +80,13 @@ def test_default_is_transformer():
         assert 'edge' in str(e) and 'removed' in str(e)
     else:
         raise AssertionError("expected mp_type='edge' to be rejected")
-    print("  default mp_type='transformer'; 'sum' selects the weighted-sum aggregation; "
+    print("  default mp_type='softmax'; 'sum' selects the weighted-sum aggregation; "
           "'edge' is rejected")
 
 
 def test_so3_invariance():
     pos, types = random_structure(seed=2)
-    for mp_type in ('transformer', 'sum'):
+    for mp_type in ('softmax', 'sum'):
         for n_mp in (2, 3):
             m = ECENet(**COMMON, n_mp=n_mp, mp_type=mp_type).double()
             for L in m.mp_layers:     # scores are zero-init → activate them
@@ -103,7 +103,7 @@ def test_cutoff_continuity():
     RC = 5.0
     common = dict(n_types=N_TYPES, r_cut_edge=RC, r_cut_neighbor=4.0,
                   l_max=2, n_max=3, embed_dim=8, n_layers=1, n_max_d=4, n_mp=2)
-    for mp_type in ('transformer', 'sum'):
+    for mp_type in ('softmax', 'sum'):
         torch.manual_seed(1)
         m = ECENet(**common, mp_type=mp_type).double()
         for L in m.mp_layers:
@@ -126,7 +126,7 @@ def test_cutoff_continuity():
 
 def test_forces_finite():
     pos, types = random_structure(seed=3)
-    for mp_type in ('transformer', 'sum'):
+    for mp_type in ('softmax', 'sum'):
         m = ECENet(**COMMON, n_mp=2, mp_type=mp_type).double()
         for L in m.mp_layers:
             _activate_scores(L)
@@ -140,11 +140,11 @@ def test_forces_finite():
 def test_fused_trunk_zero_init():
     """The fused trunk's up-projection is zero-init, so the message residual and
     every score start at 0. For 'sum' that makes the whole MP layer an exact
-    no-op at init; for 'transformer' exp(0)=1 leaves attention uniform instead."""
+    no-op at init; for 'softmax' exp(0)=1 leaves attention uniform instead."""
     torch.manual_seed(11)
     inp = _layer_inputs()
 
-    for mp_type in ('sum', 'transformer'):
+    for mp_type in ('sum', 'softmax'):
         layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
                                          aggregation=mp_type).double()
         # one trunk, no separate message block or score head
@@ -163,7 +163,7 @@ def test_fused_trunk_zero_init():
             print("  sum: fused trunk zero-init → exact identity at init")
         else:
             # uniform attention still mixes messages, so this must NOT be a no-op
-            assert d > 1e-9, "transformer MP unexpectedly a no-op at init"
+            assert d > 1e-9, "softmax MP unexpectedly a no-op at init"
             w = _recompute_weights(layer, inp['A_cos'], inp['A_sin'], inp['dist_ij'],
                                    inp['edge_j'], inp['n_atoms'])
             # equal scores → weights are f_cut normalized per receiver, not equal in
@@ -242,7 +242,7 @@ def test_l_attention_so3_and_forces():
     """A per-l weight is still exactly equivariant (the Wigner-D block is
     l-diagonal), for both aggregations, and forces stay finite."""
     pos, types = random_structure(seed=2)
-    for mp_type in ('transformer', 'sum'):
+    for mp_type in ('softmax', 'sum'):
         m = ECENet(**COMMON, n_mp=2, mp_type=mp_type, mp_n_heads=2,
                    mp_l_attention=True).double()
         L = m.mp_layers[0]
@@ -292,18 +292,18 @@ def test_msg_envelope_restores_absolute_decay():
         return a.abs().max().item(), f_cut
 
     for r in (1.5, 2.5, 3.5, 4.5):
-        on, f_cut = weight('transformer', True, r)
-        off, _ = weight('transformer', False, r)
+        on, f_cut = weight('softmax', True, r)
+        off, _ = weight('softmax', False, r)
         # enveloped: a single in-edge's weight is exactly f_cut (softmax gives 1)
         assert abs(on / f_cut - 1.0) < 1e-3, \
             f"enveloped weight should equal f_cut at r={r}: {on:.6f} vs {f_cut:.6f}"
         # unenveloped: ~1 regardless of distance — the flat behaviour
         assert abs(off - 1.0) < 1e-3, f"unenveloped weight should be ~1 at r={r}: {off:.6f}"
     # over 1.5 -> 4.5 Å the enveloped weight falls ~32x while the bare one is flat
-    on_near, _ = weight('transformer', True, 1.5)
-    on_far,  _ = weight('transformer', True, 4.5)
-    off_near, _ = weight('transformer', False, 1.5)
-    off_far,  _ = weight('transformer', False, 4.5)
+    on_near, _ = weight('softmax', True, 1.5)
+    on_far,  _ = weight('softmax', True, 4.5)
+    off_near, _ = weight('softmax', False, 1.5)
+    off_far,  _ = weight('softmax', False, 4.5)
     assert on_far / on_near < 0.05, "enveloped weight should decay strongly toward r_cut"
     assert off_far / off_near > 0.99, "unenveloped weight should be ~flat in r"
     # 'sum' is enveloped by construction: the flag must not change it
@@ -315,7 +315,7 @@ def test_msg_envelope_restores_absolute_decay():
 
 
 def test_msg_envelope_defaults_and_flag():
-    """On by default for 'transformer'; structurally already on (and not
+    """On by default for 'softmax'; structurally already on (and not
     disableable) for 'sum', which warns rather than silently ignoring."""
     assert ECENet(**COMMON, n_mp=2).mp_layers[0].msg_envelope is True
     assert ECENet(**COMMON, n_mp=2, mp_msg_envelope=False).mp_layers[0].msg_envelope is False
@@ -354,7 +354,7 @@ def test_sum_is_extensive():
         return _recompute_weights(layer, A_cos, A_sin, dist_ij, edge_j,
                                   n_atoms=n_neigh + 1).sum().item()
 
-    for mp_type, expected in (('sum', 2.0), ('transformer', 1.0)):
+    for mp_type, expected in (('sum', 2.0), ('softmax', 1.0)):
         w3, w6 = total_weight(mp_type, 3), total_weight(mp_type, 6)
         ratio = w6 / w3
         assert abs(ratio - expected) < 1e-6, \
@@ -440,7 +440,7 @@ def test_multihead():
     outs = {}
     for H in (1, 2, 4):
         torch.manual_seed(7)
-        m = ECENet(**COMMON, n_mp=2, mp_type='transformer', mp_n_heads=H).double()
+        m = ECENet(**COMMON, n_mp=2, mp_type='softmax', mp_n_heads=H).double()
         L = m.mp_layers[0]
         assert L.n_heads == H and L.n_scores == H
         # the fused trunk widens by one score channel per head
@@ -449,7 +449,7 @@ def test_multihead():
         # active (non-identity) attention: perturb the score channels per edge
         _activate_scores(L)
         err = (m(pos, types) - m(pos @ rand_rotation().T, types)).abs().item()
-        assert err < 1e-9, f"multi-head transformer MP breaks SO(3) at n_heads={H}: {err:.2e}"
+        assert err < 1e-9, f"multi-head softmax MP breaks SO(3) at n_heads={H}: {err:.2e}"
         outs[H] = m(pos, types).item()
         print(f"  n_heads={H}: SO(3) {err:.1e}, fused trunk out={L.msg_up.out_features} "
               f"(= n_ch {L.n_ch} + {H} scores)")
@@ -458,12 +458,34 @@ def test_multihead():
 
     # n_base must divide evenly across heads
     try:
-        ECENet(**COMMON, n_mp=2, mp_type='transformer', mp_n_heads=3)
+        ECENet(**COMMON, n_mp=2, mp_type='softmax', mp_n_heads=3)
     except ValueError as e:
         assert 'divisible' in str(e)
         print(f"  indivisible n_heads raises: {str(e)[:60]}…")
     else:
         raise AssertionError("expected a ValueError for n_base % n_heads != 0")
+
+
+def test_transformer_is_a_deprecated_alias():
+    """mp_type was renamed 'transformer' -> 'softmax'. The old name still works —
+    it is stored in the hparams of checkpoints written before the rename — but it
+    warns and normalises."""
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        m = ECENet(**COMMON, n_mp=2, mp_type='transformer').double()
+        assert any('renamed' in str(x.message) for x in w), "expected a rename warning"
+    assert m.mp_type == 'softmax', f"alias should normalise, got {m.mp_type!r}"
+    assert m.mp_layers[0].aggregation == 'softmax'
+    # ...and produces exactly the same model as the new name
+    torch.manual_seed(3)
+    a = ECENet(**COMMON, n_mp=2, mp_type='softmax').double()
+    torch.manual_seed(3)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        b = ECENet(**COMMON, n_mp=2, mp_type='transformer').double()
+    pos, types = random_structure(seed=2)
+    assert a(pos, types).item() == b(pos, types).item(), "alias built a different model"
+    print("  mp_type='transformer' still accepted, warns, normalises to 'softmax'")
 
 
 def test_ignored_flags_warn():
@@ -483,8 +505,8 @@ def test_ignored_flags_warn():
 
 
 if __name__ == "__main__":
-    print("Attention message-passing tests (mp_type='transformer' / 'sum')")
-    test_default_is_transformer()
+    print("Attention message-passing tests (mp_type='softmax' / 'sum')")
+    test_default_is_softmax()
     test_so3_invariance()
     test_cutoff_continuity()
     test_forces_finite()
@@ -497,5 +519,6 @@ if __name__ == "__main__":
     test_sum_is_extensive()
     test_softmax_weights_sum_to_one()
     test_multihead()
+    test_transformer_is_a_deprecated_alias()
     test_ignored_flags_warn()
     print("All tests passed.")

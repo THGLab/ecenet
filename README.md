@@ -126,20 +126,20 @@ receiver atom in the common global frame, and passes the result through a
 per-edge weight is formed:
 
 ```python
-train_ecenet(..., n_mp=2, mp_type='transformer', mp_n_heads=4)   # default
+train_ecenet(..., n_mp=2, mp_type='softmax', mp_n_heads=4)   # default
 train_ecenet(..., n_mp=2, mp_type='sum')
 ```
 
 | `mp_type` | weight | behaviour |
 | --- | --- | --- |
-| `'transformer'` (default) | `exp(s)·f_cut / Σ_{e→j}(exp(s)·f_cut)` | softmax over the receiver's incoming edges — a weighted *average*, intensive in coordination |
+| `'softmax'` (default) | `exp(s)·f_cut / Σ_{e→j}(exp(s)·f_cut)` | softmax over the receiver's incoming edges — a weighted *average*, intensive in coordination |
 | `'sum'` | `s·f_cut` | raw signed score × cutoff envelope — *extensive* in coordination, and signed, so a neighbour can contribute negatively |
 
 Either way the smooth cutoff envelope keeps the energy continuous as an edge
 crosses `r_cut_edge`.
 
 `mp_msg_envelope` (on by default) makes the aggregated message decay with
-*absolute* distance. It matters only for `'transformer'`: the softmax normalizer
+*absolute* distance. It matters only for `'softmax'`: the softmax normalizer
 divides the absolute `f_cut` back out, leaving only the relative cutoff across a
 receiver's in-edges — so without it a lone neighbour near `r_cut` still gets
 weight ≈ 1 and the message is essentially flat in distance. Multiplying `f_cut`
@@ -154,7 +154,7 @@ message channels plus one score channel per head, the score being that channel's
 `m=0` (rotation-invariant) component. Sharing a trunk is cheaper than a separate
 message block and score head. The up-projection is zero-init, so at
 initialisation the message residual and every score are 0 — which makes `'sum'`
-an exact no-op and leaves `'transformer'` with uniform attention (`exp(0) = 1`).
+an exact no-op and leaves `'softmax'` with uniform attention (`exp(0) = 1`).
 
 `mp_dim` sets that trunk's bottleneck width (and the receiver's); `mp_n_heads`
 splits the value channels (`2*embed_dim`) into that many attention heads, so it
@@ -173,7 +173,7 @@ index.
 > **Note.** The older distance/type-weighted `mp_type='edge'` message passing has
 > been removed. Checkpoints trained with it (identifiable by `W_msg` weights) are
 > rejected with an explicit error rather than silently loading — retrain with
-> `'transformer'` or `'sum'`.
+> `'softmax'` or `'sum'`.
 
 ### Learning-rate schedule
 
@@ -292,7 +292,7 @@ python tests/test_ecenet.py                  # ECENet integration: SO(3) invaria
 python tests/test_bottleneck.py              # low-rank layers: identity at init, SO(3)
 python tests/test_element_film.py            # FiLM gate: identity at init, SO(3), per-m, shift
 python tests/test_spice_trainer.py            # SPICE trainer: atom-budget batching, DDP invariant
-python tests/test_transformer_mp.py          # attention MP: SO(3), cutoff continuity, sum vs softmax
+python tests/test_attention_mp.py            # attention MP: SO(3), cutoff continuity, sum vs softmax
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 ```
 

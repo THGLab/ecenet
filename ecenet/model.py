@@ -77,7 +77,7 @@ class ECENet(nn.Module):
                         — a fused message/score trunk and a receiver transform —
                         and differ only in the weight applied to each incoming
                         message:
-                          'transformer' (default): softmax over the receiver's
+                          'softmax' (default): softmax over the receiver's
                             incoming edges, so the aggregate is a weighted
                             *average* (intensive in coordination). Zero-init
                             scores make the attention uniform at init.
@@ -98,7 +98,7 @@ class ECENet(nn.Module):
                         legal, while splitting within an l / across m is not.
                         Widens the fused trunk to n_ch + n_heads*(l_max+1).
         mp_msg_envelope: if True (default), the aggregated message decays with
-                        *absolute* distance. For mp_type='transformer' this
+                        *absolute* distance. For mp_type='softmax' this
                         multiplies the softmax weight by f_cut(r) a second time,
                         undoing the normalizer's division of the absolute cutoff
                         (without it, a lone neighbour near r_cut still gets weight
@@ -142,7 +142,7 @@ class ECENet(nn.Module):
         output_hidden_dims: list = None,
         m_max: int = None,
         bottleneck_dim: int = None,
-        mp_type: str = 'transformer',
+        mp_type: str = 'softmax',
         mp_dim: int = None,
         mp_n_heads: int = 1,
         mp_msg_envelope: bool = True,
@@ -155,6 +155,13 @@ class ECENet(nn.Module):
         film_shift: bool = False,
     ):
         super().__init__()
+        if mp_type == 'transformer':
+            # Former name for 'softmax'. Accepted so scripts and checkpoints
+            # written under the old name keep working (mp_type is saved in hparams).
+            warnings.warn("mp_type='transformer' has been renamed to 'softmax'; "
+                          "the old name still works but will not be documented.",
+                          stacklevel=2)
+            mp_type = 'softmax'
         self.n_types = n_types
         self.r_cut_edge = r_cut_edge
         self.r_cut_neighbor = r_cut_neighbor
@@ -255,9 +262,9 @@ class ECENet(nn.Module):
         ])
         # n_mp >= 2: regroup the flat layers into `n_mp` stages and build the
         # `n_mp - 1` MP layers that sit between them.
-        if mp_type not in ('transformer', 'sum'):
+        if mp_type not in ('softmax', 'sum'):
             raise ValueError(
-                f"Unknown mp_type '{mp_type}' (expected 'transformer' or 'sum'). "
+                f"Unknown mp_type '{mp_type}' (expected 'softmax' or 'sum'). "
                 "The old distance/type-weighted 'edge' message passing has been removed.")
         # Warn rather than silently ignore: an MP-only knob left at a non-default
         # value with n_mp=1 does nothing, and a silent no-op looks like the
@@ -908,7 +915,7 @@ class ECENetTransformerMPLayer(nn.Module):
 
     ``aggregation`` selects how the per-edge weight is formed:
 
-    ``'transformer'`` — softmax over the receiver's incoming edges, with the
+    ``'softmax'`` — softmax over the receiver's incoming edges, with the
     smooth cutoff envelope folded in as a multiplicative log-bias,
 
         a_e = exp(s_e)·f_cut(r_ij) / (Σ_{e'→j} exp(s_e')·f_cut(r_e') + eps),
@@ -947,7 +954,7 @@ class ECENetTransformerMPLayer(nn.Module):
     score and message share a trunk there is no dedicated score head, which makes
     this cheaper than computing the two separately. The up-projection is zero-init,
     so at initialisation the message residual is 0 and every score is 0 — which for
-    ``'sum'`` means the layer is an exact identity, and for ``'transformer'`` means
+    ``'sum'`` means the layer is an exact identity, and for ``'softmax'`` means
     attention starts uniform (exp(0) = 1) over each receiver's in-edges.
 
     Equivariance: the trunk and receiver are EquivariantLinear +
@@ -966,12 +973,12 @@ class ECENetTransformerMPLayer(nn.Module):
                  cutoff_type: str = 'cosine', m_max: int = None,
                  mp_dim: int = None,
                  activation: str = 'silu', n_grid: int = None, n_heads: int = 1,
-                 aggregation: str = 'transformer', msg_envelope: bool = True,
+                 aggregation: str = 'softmax', msg_envelope: bool = True,
                  l_attention: bool = False):
         super().__init__()
-        if aggregation not in ('transformer', 'sum'):
+        if aggregation not in ('softmax', 'sum'):
             raise ValueError(
-                f"Unknown aggregation '{aggregation}' (expected 'transformer' or 'sum').")
+                f"Unknown aggregation '{aggregation}' (expected 'softmax' or 'sum').")
         self.aggregation = aggregation
         # msg_envelope: multiply the softmax weight by f_cut(r_e) as well. The
         # weight already carries f_cut, but normalization divides the ABSOLUTE
@@ -981,7 +988,7 @@ class ECENetTransformerMPLayer(nn.Module):
         # equivariance is untouched. 'sum' has no normalizer and is therefore
         # already enveloped (a = s·f_cut); folding f_cut in twice would give f_cut²,
         # so the flag applies to the softmax path only.
-        self.msg_envelope = bool(msg_envelope) and aggregation == 'transformer'
+        self.msg_envelope = bool(msg_envelope) and aggregation == 'softmax'
         self.l_max     = l_max
         self.n_sph     = (l_max + 1) ** 2
         self.m_max     = m_max if m_max is not None else l_max

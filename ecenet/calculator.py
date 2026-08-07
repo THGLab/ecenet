@@ -151,7 +151,7 @@ class ECENetCalculator(Calculator):
             raise ValueError(
                 "Checkpoint uses the removed mp_type='edge' message passing "
                 "(found 'W_msg' in the state dict). That layer no longer exists; "
-                "retrain the model with mp_type='transformer' or 'sum'."
+                "retrain the model with mp_type='softmax' or 'sum'."
             )
 
         # RealSpaceNonlinearity used to carry fixed pre_scale=1 / pre_shift=0

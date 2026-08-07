@@ -168,7 +168,7 @@ def train_ecenet(
     bottleneck_dim=None,
     # Message passing
     n_mp=1,
-    mp_type='transformer',
+    mp_type='softmax',
     mp_dim=None,
     mp_n_heads=1,
     mp_msg_envelope=True,
