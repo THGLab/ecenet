@@ -77,6 +77,14 @@ model, results = train_ecenet(molecule='ethanol', n_train=950,
                               n_mp=2)            # n_mp ≥ 2 turns on message passing
 ```
 
+Optional low-rank equivariant layers (off by default, available on every trainer
+as well as `ecenet.ECENet(...)`) — down → nonlinearity at `r` → up, with a
+zero-init up-projection, so each layer is the identity at initialisation:
+
+```python
+train_ecenet(..., bottleneck_dim=16)
+```
+
 Train on SPICE dataset (10 elements):
 
 ```python
@@ -118,6 +126,7 @@ The test suite is pure PyTorch and runs on CPU. Each file is runnable as a scrip
 
 ```bash
 python tests/test_ecenet.py                  # ECENet integration: SO(3) invariance, forces, MP
+python tests/test_bottleneck.py              # low-rank layers: identity at init, SO(3)
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 ```
 

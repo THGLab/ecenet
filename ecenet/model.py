@@ -66,6 +66,9 @@ class ECENet(nn.Module):
         n_grid:         θ-grid points for the realspace nonlinearity (default: 4*m_max+1)
         output_hidden_dims: hidden widths of the readout MLP (default: [64])
         analytic_ace_basis: use ACEBasisAnalytic (recommended for force training)
+        bottleneck_dim: if set, each equivariant layer becomes a low-rank block
+                        (down → nonlin at this width → up, zero-init up so the
+                        layer is identity at init); None → full-width layers
     """
 
     def __init__(
@@ -87,6 +90,7 @@ class ECENet(nn.Module):
         analytic_ace_basis: bool = True,
         output_hidden_dims: list = None,
         m_max: int = None,
+        bottleneck_dim: int = None,
     ):
         super().__init__()
         self.n_types = n_types
@@ -103,6 +107,7 @@ class ECENet(nn.Module):
         self.use_nonlinearity = use_nonlinearity
         self.n_grid = n_grid
         self.analytic_ace_basis = analytic_ace_basis
+        self.bottleneck_dim = bottleneck_dim
         self.n_sph = (l_max + 1) ** 2
         self.m_max = int(m_max) if m_max is not None else l_max
         self.n_angular = self.m_max + 1   # m = 0..m_max (layers only use up to m_max)
@@ -132,7 +137,8 @@ class ECENet(nn.Module):
         self.n_mp = n_mp
         self.layers = nn.ModuleList([
             ECENetLayer(self.n_features_per_m, self.m_max, activation=activation,
-                        use_nonlinearity=use_nonlinearity, n_grid=n_grid)
+                        use_nonlinearity=use_nonlinearity, n_grid=n_grid,
+                        bottleneck_dim=bottleneck_dim)
             for _ in range(n_mp * n_layers)
         ])
         # n_mp >= 2: regroup the flat layers into `n_mp` stages and build the
@@ -580,24 +586,40 @@ class ECENet(nn.Module):
 class ECENetLayer(nn.Module):
     """One equivariant layer: EquivariantLinear → nonlinearity.
 
-    linear(n_ch → n_ch) → nonlin(n_ch) → residual. The linear supports
-    type-dependent weights (n_types_linear) or template mixing.
+    Without bottleneck: linear(n_ch → n_ch) → nonlin(n_ch) → residual.
+    With bottleneck:    linear_down(n_ch → r) → nonlin(r) → linear_up(r → n_ch) → residual.
+
+    The bottleneck is a low-rank update: the nonlinearity runs at the (smaller)
+    bottleneck width r, and the up-projection is zero-init so the whole block is
+    identity at init (the residual carries the input through unchanged).
 
     Args:
         n_features:        number of feature channels (= n_features_per_m)
         m_max:             maximum angular frequency (= l_max)
         activation:        pointwise activation (used by the realspace nonlinearity)
         use_nonlinearity:  if False, skip nonlinearity entirely (linear-only layer)
+        bottleneck_dim:    if set, use the down → nonlin(r) → up bottleneck structure
+                           (low-rank); None → full-width linear → nonlin
     """
 
     def __init__(self, n_features: int, m_max: int, activation: str = 'silu',
-                 use_nonlinearity: bool = True, n_grid: int = None):
+                 use_nonlinearity: bool = True, n_grid: int = None,
+                 bottleneck_dim: int = None):
         super().__init__()
         n_angular = m_max + 1
-        # nonlin_features: dimension at which the nonlinearity operates
-        nonlin_features = n_features
+        self.bottleneck_dim = bottleneck_dim
+        # nonlin_features: dimension at which the nonlinearity operates — the
+        # bottleneck width r when bottlenecking, else the full feature width.
+        nonlin_features = bottleneck_dim if bottleneck_dim is not None else n_features
 
-        self.linear = EquivariantLinear(n_features, n_features, n_angular, m_max)
+        if bottleneck_dim is not None:
+            self.linear_down = EquivariantLinear(n_features, bottleneck_dim, n_angular, m_max)
+            self.linear_up   = EquivariantLinear(bottleneck_dim, n_features, n_angular, m_max)
+            # Zero-init the up-projection → bottleneck starts as identity via residual.
+            nn.init.zeros_(self.linear_up.weights)
+            nn.init.zeros_(self.linear_up.bias)
+        else:
+            self.linear = EquivariantLinear(n_features, n_features, n_angular, m_max)
 
         self.nonlin = None
         if use_nonlinearity:
@@ -608,9 +630,16 @@ class ECENetLayer(nn.Module):
     def forward(self, A_cos, A_sin):
         A_cos_in, A_sin_in = A_cos, A_sin
 
-        A_cos, A_sin = self.linear(A_cos, A_sin)
+        # (Down-)linear: project to the bottleneck width r, else stay full width.
+        if self.bottleneck_dim is not None:
+            A_cos, A_sin = self.linear_down(A_cos, A_sin)
+        else:
+            A_cos, A_sin = self.linear(A_cos, A_sin)
         if self.nonlin is not None:
             A_cos, A_sin = self.nonlin(A_cos, A_sin)
+        # Up-projection back to the full feature width.
+        if self.bottleneck_dim is not None:
+            A_cos, A_sin = self.linear_up(A_cos, A_sin)
 
         return A_cos + A_cos_in, A_sin + A_sin_in
 

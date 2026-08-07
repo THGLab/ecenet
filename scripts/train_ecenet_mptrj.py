@@ -679,6 +679,7 @@ def train_ecenet_mptrj(
     n_grid=None,
     output_hidden_dims=None,
     analytic_ace_basis=True,
+    bottleneck_dim=None,
     # Message passing
     n_mp=1,
     n_dist_basis=8,
@@ -880,6 +881,7 @@ def train_ecenet_mptrj(
         activation=activation, use_nonlinearity=use_nonlinearity, n_grid=n_grid,
         output_hidden_dims=output_hidden_dims,
         analytic_ace_basis=analytic_ace_basis,
+        bottleneck_dim=bottleneck_dim,
         n_mp=n_mp, n_dist_basis=n_dist_basis,
     )
     if dtype == torch.float64:
@@ -953,6 +955,7 @@ def train_ecenet_mptrj(
                 activation=activation, use_nonlinearity=use_nonlinearity,
                 output_hidden_dims=output_hidden_dims,
                 analytic_ace_basis=analytic_ace_basis,
+                bottleneck_dim=bottleneck_dim,
                 n_mp=n_mp, n_dist_basis=n_dist_basis,
             ),
             'element_to_type': elements.to_element_to_type(type_map),  # {symbol: type_idx}
