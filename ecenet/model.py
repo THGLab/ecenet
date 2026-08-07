@@ -291,7 +291,7 @@ class ECENet(nn.Module):
                 for g in range(n_mp)
             ])
             self.mp_layers = nn.ModuleList([
-                ECENetTransformerMPLayer(
+                ECENetAttentionMPLayer(
                     self.n_features_per_m, self.l_max, self.embed_dim,
                     n_types=n_types,
                     r_cut=self.r_cut_edge, cutoff_type=self.cutoff_type,
@@ -902,7 +902,7 @@ def _unpack_sph_to_angular(v_rot, n_base, l_max, m_max, n_angular, n_sph):
     return d_cos, d_sin
 
 
-class ECENetTransformerMPLayer(nn.Module):
+class ECENetAttentionMPLayer(nn.Module):
     """Attention-style message passing for ECENet.
 
     Per edge (i→j):

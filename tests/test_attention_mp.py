@@ -29,7 +29,7 @@ import warnings
 import torch
 
 from ecenet import ECENet
-from ecenet.model import ECENetTransformerMPLayer
+from ecenet.model import ECENetAttentionMPLayer
 
 torch.manual_seed(0)
 DTYPE = torch.float64
@@ -69,7 +69,7 @@ def _activate_scores(layer, std=0.5, bias=None):
 
 def test_default_is_softmax():
     m = ECENet(**COMMON, n_mp=2).double()
-    assert isinstance(m.mp_layers[0], ECENetTransformerMPLayer)
+    assert isinstance(m.mp_layers[0], ECENetAttentionMPLayer)
     assert m.mp_layers[0].aggregation == 'softmax'
     m_s = ECENet(**COMMON, n_mp=2, mp_type='sum').double()
     assert m_s.mp_layers[0].aggregation == 'sum'
@@ -145,7 +145,7 @@ def test_fused_trunk_zero_init():
     inp = _layer_inputs()
 
     for mp_type in ('sum', 'softmax'):
-        layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
+        layer = ECENetAttentionMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
                                          aggregation=mp_type).double()
         # one trunk, no separate message block or score head
         assert not hasattr(layer, 'message') and not hasattr(layer, 'score_w')
@@ -215,7 +215,7 @@ def test_l_attention_independent_per_l():
     """Each (head, l) runs its OWN softmax: weights sum to 1 for every (atom, head,
     l) slot, and genuinely differ across l — it is not one weight broadcast."""
     torch.manual_seed(5)
-    layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, n_heads=2,
+    layer = ECENetAttentionMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, n_heads=2,
                                      l_attention=True, msg_envelope=False).double()
     _activate_scores(layer, std=0.8)
     inp = _layer_inputs()
@@ -258,7 +258,7 @@ def test_l_attention_so3_and_forces():
         print(f"  l_attention ({mp_type}): SO(3) {err:.1e}, |F|max={f.abs().max():.3f}")
 
     # zero-init still makes 'sum' an exact identity, with the wider score block
-    layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, n_heads=2,
+    layer = ECENetAttentionMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, n_heads=2,
                                      aggregation='sum', l_attention=True).double()
     inp = _layer_inputs()
     oc, os_ = layer(inp['A_cos'], inp['A_sin'], inp['r_hat'], inp['dist_ij'],
@@ -278,7 +278,7 @@ def test_msg_envelope_restores_absolute_decay():
 
     def weight(aggregation, envelope, r):
         torch.manual_seed(0)
-        layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, r_cut=RC,
+        layer = ECENetAttentionMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, r_cut=RC,
                                          aggregation=aggregation,
                                          msg_envelope=envelope).double()
         _activate_scores(layer, std=0.5, bias=0.5)
@@ -340,7 +340,7 @@ def test_sum_is_extensive():
     same features → same score), so neighbour count is the only variable."""
     def total_weight(mp_type, n_neigh):
         torch.manual_seed(2)
-        layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
+        layer = ECENetAttentionMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
                                          aggregation=mp_type).double()
         _activate_scores(layer, std=0.3, bias=0.5)   # scores are zero-init
         # n_neigh edges, all into atom 0, all carrying identical features/distance
@@ -420,7 +420,7 @@ def test_softmax_weights_sum_to_one():
     final weights."""
     for H in (1, 2, 4):
         torch.manual_seed(3)
-        layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
+        layer = ECENetAttentionMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2,
                                          n_heads=H, msg_envelope=False).double()
         inp = _layer_inputs()
         a = _recompute_weights(layer, inp['A_cos'], inp['A_sin'], inp['dist_ij'],
