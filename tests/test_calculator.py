@@ -35,6 +35,7 @@ from ase import units as ase_units
 
 from ecenet import ECENet
 from ecenet.calculator import ECENetCalculator
+from ecenet.equivariant import RealSpaceNonlinearity
 
 torch.manual_seed(0)
 
@@ -357,6 +358,38 @@ def test_trainers_save_every_architecture_hparam():
           f"({len(required)} args)")
 
 
+def test_legacy_pre_scale_buffers_are_dropped():
+    """RealSpaceNonlinearity used to carry fixed pre_scale=1 / pre_shift=0 buffers
+    and apply them before the activation — an exact identity, never learnable.
+    They are gone, so a checkpoint that still has them must load and give the same
+    energy, not trip the unexpected-key check."""
+    model = _tiny_model(3)
+    state = dict(model.state_dict())
+    assert not any('pre_scale' in k for k in state), "buffers should no longer exist"
+    # forge a pre-removal checkpoint: identity buffers on every nonlinearity
+    n_added = 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, RealSpaceNonlinearity):
+            w = mod.n_features
+            state[f'{name}.pre_scale'] = torch.ones(w, 1, dtype=torch.float64)
+            state[f'{name}.pre_shift'] = torch.zeros(w, 1, dtype=torch.float64)
+            n_added += 2
+    assert n_added > 0, "no nonlinearities found to forge buffers on"
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'legacy_affine.mdl')
+        torch.save({'model': state, 'hparams': dict(n_types=3, n_mp=1, **_HPARAMS),
+                    'element_to_type': {'H': 0, 'C': 1, 'O': 2}}, path)
+        calc = ECENetCalculator.from_checkpoint(path)
+    e_legacy = _energy(calc, _mol())
+    e_direct = _energy(ECENetCalculator(model, element_to_type={'H': 0, 'C': 1, 'O': 2}),
+                       _mol())
+    assert e_legacy == e_direct, \
+        f"dropping the identity buffers changed the energy: {e_legacy} vs {e_direct}"
+    print(f"  legacy checkpoint with {n_added} pre_scale/pre_shift buffers loads, "
+          f"energy unchanged ({e_legacy:.6f} eV)")
+
+
 def test_architecture_mismatch_raises():
     """A checkpoint whose weights disagree with the architecture rebuilt from
     'hparams' must raise rather than load a partly random model."""
@@ -396,5 +429,6 @@ if __name__ == '__main__':
     test_from_checkpoint_missing_hparams_raises()
     test_legacy_edge_mp_checkpoint_raises()
     test_trainers_save_every_architecture_hparam()
+    test_legacy_pre_scale_buffers_are_dropped()
     test_architecture_mismatch_raises()
     print("All tests passed.")

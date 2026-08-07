@@ -154,6 +154,14 @@ class ECENetCalculator(Calculator):
                 "retrain the model with mp_type='transformer' or 'sum'."
             )
 
+        # RealSpaceNonlinearity used to carry fixed pre_scale=1 / pre_shift=0
+        # buffers and apply them before the activation — an exact identity, since
+        # they were never learnable. Both are gone, so drop them from older
+        # checkpoints: they are provably a no-op, and leaving them in would trip
+        # the unexpected-key check below.
+        state = {k: v for k, v in state.items()
+                 if not (k.endswith('.pre_scale') or k.endswith('.pre_shift'))}
+
         model = ECENet(**hp, n_mp=n_mp)
         if dtype == torch.float64:
             model = model.double()

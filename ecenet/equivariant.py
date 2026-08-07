@@ -96,11 +96,11 @@ class RealSpaceNonlinearity(nn.Module):
         self.register_buffer('cos_analysis', cos_synth.T * norm.unsqueeze(0))  # (n_grid, n_angular)
         self.register_buffer('sin_analysis', sin_synth.T * norm.unsqueeze(0))  # (n_grid, n_angular)
 
-        # No learnable affine on this nonlinearity: pure σ(f(θ)). Fixed
-        # buffers (scale=1, shift=0) keep the pre-activation step an identity.
-        nonlin_features = n_features
-        self.register_buffer('pre_scale', torch.ones(nonlin_features, 1))
-        self.register_buffer('pre_shift', torch.zeros(nonlin_features, 1))
+        # No pre-activation affine: this is pure σ(f(θ)). Earlier versions kept
+        # fixed scale=1 / shift=0 buffers and applied them in forward, which was
+        # an exact identity — two elementwise passes over the full (n_edges,
+        # n_features, n_grid) grid tensor for nothing. Removed; checkpoints that
+        # still carry the buffers load fine (see calculator.from_checkpoint).
 
         # Nonlinearity
         act_map = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh, 'gelu': nn.GELU}
@@ -116,9 +116,6 @@ class RealSpaceNonlinearity(nn.Module):
         """
         # Synthesis: Fourier coefficients → grid values
         f_grid = A_cos @ self.cos_synth + A_sin @ self.sin_synth
-
-        # Pre-activation affine transform
-        f_grid = self.pre_scale * f_grid + self.pre_shift
 
         # Apply nonlinearity
         f_grid = self.activation(f_grid)
