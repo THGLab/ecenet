@@ -56,6 +56,7 @@ import gc
 import gzip
 import itertools
 import json
+import math
 import time
 
 import numpy as np
@@ -698,7 +699,12 @@ def train_ecenet_mptrj(
     lr=1e-3,
     weight_decay=1e-5,
     grad_clip=None,
-    scheduler_patience=10,
+    scheduler_patience=10,      # 'plateau' only
+    lr_schedule='plateau',      # 'plateau' | 'cosine' | 'multistep'
+    warmup_epochs=0,            # cosine/multistep: linear LR ramp 0→lr
+    lr_min_factor=0.0,          # 'cosine' only: LR floor as a fraction of lr
+    lr_milestones=None,         # 'multistep': epochs at which lr *= lr_gamma
+    lr_gamma=0.1,               # 'multistep': decay factor at each milestone
     early_stopping_patience=None,
     # Training
     n_epochs=100,
@@ -931,8 +937,56 @@ def train_ecenet_mptrj(
 
     # ── Optimiser ─────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=scheduler_patience)
+    # LR schedule. 'plateau' (default): ReduceLROnPlateau on the val metric.
+    # 'cosine': linear warmup over warmup_epochs, then cosine decay to
+    # lr*lr_min_factor. 'multistep': the same warmup, then lr *= lr_gamma at each
+    # epoch in lr_milestones. The two open-loop schedules are pure functions of
+    # the epoch index, so they carry no state, resume exactly from start_epoch,
+    # and need nothing in the checkpoint — unlike torch's stateful MultiStepLR,
+    # which counts .step() calls and would replay from the initial LR on resume.
+    # Being a function of the epoch also means every DDP rank computes the same
+    # LR independently, with nothing to keep in sync.
+    if lr_schedule not in ('plateau', 'cosine', 'multistep'):
+        raise ValueError("lr_schedule must be 'plateau', 'cosine' or 'multistep', "
+                         f"got {lr_schedule!r}")
+    milestones = sorted(int(m) for m in (lr_milestones or []))
+    if lr_schedule == 'multistep' and not milestones:
+        raise ValueError("lr_schedule='multistep' requires lr_milestones "
+                         "(epochs at which to multiply the lr by lr_gamma).")
+    if lr_schedule == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=scheduler_patience)
+    else:
+        scheduler = None
+        if is_main:
+            if lr_schedule == 'multistep':
+                unreached = [m for m in milestones if m >= n_epochs]
+                if unreached:
+                    print_flush(f"  WARNING: milestones {unreached} are >= n_epochs="
+                                f"{n_epochs} and will never fire.")
+                steps = ', '.join(f"epoch {m}: lr→{lr * lr_gamma ** (i + 1):.2e}"
+                                  for i, m in enumerate(milestones) if m < n_epochs)
+                print_flush(f"  LR schedule: multistep (gamma={lr_gamma}) — {steps}")
+            else:
+                print_flush(f"  LR schedule: cosine (warmup={warmup_epochs}, "
+                            f"floor={lr * lr_min_factor:.2e})")
+            if warmup_epochs >= n_epochs:
+                print_flush(f"  WARNING: warmup_epochs={warmup_epochs} >= n_epochs="
+                            f"{n_epochs}; the decay phase never runs.")
+
+    def open_loop_lr(epoch):
+        """LR for a given (0-based) epoch under the cosine / multistep schedules."""
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            return lr * (epoch + 1) / warmup_epochs            # linear warmup → lr
+        if lr_schedule == 'multistep':
+            # Counted from the epoch index, not accumulated, so a resumed run
+            # lands on exactly the LR a fresh run would have at this epoch.
+            return lr * (lr_gamma ** sum(1 for m in milestones if epoch >= m))
+        # cosine: decay so the LAST epoch (n_epochs-1) reaches the floor exactly.
+        progress = (epoch - warmup_epochs) / max(1, n_epochs - 1 - warmup_epochs)
+        progress = min(max(progress, 0.0), 1.0)
+        lr_min = lr * lr_min_factor
+        return lr_min + 0.5 * (lr - lr_min) * (1.0 + math.cos(math.pi * progress))
 
     # ── Checkpoint restore ────────────────────────────────────────────────
     start_epoch = 0
@@ -943,7 +997,10 @@ def train_ecenet_mptrj(
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt['model'], strict=False)
         optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
+        # Open-loop schedules have no state (the LR is a function of the
+        # epoch), and saved state may come from a different schedule.
+        if scheduler is not None and ckpt.get('scheduler') is not None:
+            scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt['epoch'] + 1
         # Back-compat: older checkpoints stored 'best_val_force_mae'.
         best_val_weighted = ckpt.get('best_val_weighted',
@@ -961,7 +1018,7 @@ def train_ecenet_mptrj(
             'epoch': epoch,
             'model': raw_model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
+            'scheduler': scheduler.state_dict() if scheduler is not None else None,
             'best_val_weighted': best_val_weighted,
             'best_test': best_test,
             'best_state': best_state,
@@ -1123,6 +1180,11 @@ def train_ecenet_mptrj(
     t_start = time.time()
 
     for epoch in range(start_epoch, n_epochs):
+        # Open-loop schedules set this epoch's LR up front; 'plateau' instead
+        # adjusts it below, after the val step.
+        if scheduler is None:
+            for pg in optimizer.param_groups:
+                pg['lr'] = open_loop_lr(epoch)
         raw_model.train()
         epoch_loss = 0.0
 
@@ -1211,7 +1273,8 @@ def train_ecenet_mptrj(
                 val_weighted_tensor = torch.tensor(va_weighted, device=device)
             if is_ddp:
                 dist.broadcast(val_weighted_tensor, src=0)
-            scheduler.step(val_weighted_tensor.item())
+            if scheduler is not None:
+                scheduler.step(val_weighted_tensor.item())
 
             if is_main:
                 if va_weighted < best_val_weighted:

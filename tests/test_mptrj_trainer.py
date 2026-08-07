@@ -145,6 +145,68 @@ def test_loss_decreases():
     print(f"  loss {losses[0]:.3f} -> {losses[-1]:.3f}  OK\n")
 
 
+def test_lr_schedules():
+    """The open-loop LR schedules ('multistep' / 'cosine') are pure functions of
+    the epoch index. Checks the LR actually logged each epoch against the closed
+    form, and that multistep matches torch.optim.lr_scheduler.MultiStepLR exactly.
+    """
+
+    import train_ecenet_mptrj as T
+    structs = make_structures(16, seed=3)
+
+    def run(**kw):
+        lrs = []
+        orig = T.print_flush
+
+        def capture(*a, **k):
+            s = ' '.join(str(x) for x in a)
+            if 'Epoch' in s and 'lr=' in s:
+                lrs.append(float(s.split('lr=')[1].split('|')[0]))
+
+        T.print_flush = capture
+        try:
+            train_ecenet_mptrj(
+                train_structures=structs, n_val=3,
+                l_max=2, n_max=2, embed_dim=8, n_layers=1, n_max_d=4,
+                r_cut_edge=4.0, r_cut_neighbor=3.5, stress_weight=0.0,
+                n_epochs=8, batch_size=4, lr=1e-2, dtype=DTYPE, device=DEVICE,
+                seed=0, verbose=True, **kw)
+        finally:
+            T.print_flush = orig
+        return lrs
+
+    # multistep: lr * gamma^(milestones passed), from the epoch index
+    lrs = run(lr_schedule='multistep', lr_milestones=[3, 6], lr_gamma=0.5)
+    expect = [1e-2 * 0.5 ** sum(1 for m in (3, 6) if e >= m) for e in range(len(lrs))]
+    assert len(lrs) == 8, f"expected 8 epoch lines, got {len(lrs)}"
+    for e, (got, want) in enumerate(zip(lrs, expect)):
+        assert abs(got - want) < 1e-9 * max(want, 1e-12), \
+            f"multistep epoch {e}: logged lr {got:.3e}, expected {want:.3e}"
+
+    # ...and that closed form is exactly torch's MultiStepLR
+    p = torch.nn.Parameter(torch.zeros(1))
+    opt = torch.optim.SGD([p], lr=1e-2)
+    sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[3, 6], gamma=0.5)
+    for e in range(len(lrs)):
+        assert opt.param_groups[0]['lr'] == expect[e], \
+            f"epoch {e}: torch MultiStepLR {opt.param_groups[0]['lr']:.3e} != {expect[e]:.3e}"
+        opt.step()
+        sch.step()
+
+    # cosine with warmup: linear ramp, then decay reaching the floor on the last epoch
+    lrs_c = run(lr_schedule='cosine', warmup_epochs=2, lr_min_factor=0.1)
+    assert abs(lrs_c[0] - 1e-2 * 0.5) < 1e-12 and abs(lrs_c[1] - 1e-2) < 1e-12, \
+        f"warmup ramp wrong: {lrs_c[:2]}"
+    assert abs(lrs_c[-1] - 1e-3) < 1e-9, f"cosine should end at the floor: {lrs_c[-1]:.3e}"
+    assert all(b <= a + 1e-15 for a, b in zip(lrs_c[1:], lrs_c[2:])), \
+        f"cosine should decay monotonically after warmup: {lrs_c}"
+
+    # 'plateau' (default) is untouched: constant while the val metric improves
+    assert len(set(run())) == 1, "plateau should hold the LR over a short run"
+    print(f"  lr_schedule: multistep == torch.MultiStepLR ({lrs[0]:.1e}→{lrs[-1]:.1e}), "
+          f"cosine warmup+floor OK, plateau unchanged\n")
+
+
 def test_stress_and_force_fd():
     print("=== FD check: autograd stress/forces vs finite differences ===")
     structs = make_structures(1, seed=7, n_atoms_range=(6, 7))
@@ -309,5 +371,6 @@ if __name__ == '__main__':
     test_wigner_pole_gradient()
     test_stress_and_force_fd()
     test_loss_decreases()
+    test_lr_schedules()
     test_smoke_train()
     print("ALL TESTS PASSED")

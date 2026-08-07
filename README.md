@@ -175,6 +175,35 @@ index.
 > rejected with an explicit error rather than silently loading — retrain with
 > `'transformer'` or `'sum'`.
 
+### Learning-rate schedule
+
+All three trainers take `lr_schedule`, defaulting to `'plateau'`
+(`ReduceLROnPlateau` on the validation metric, as before):
+
+```python
+train_ecenet(..., lr_schedule='multistep',
+             lr_milestones=[80, 130, 170, 190], lr_gamma=0.5)
+
+train_ecenet(..., lr_schedule='cosine', warmup_epochs=5, lr_min_factor=0.01)
+```
+
+| option | applies to | effect |
+| --- | --- | --- |
+| `lr_milestones` | `multistep` | epochs at which the LR is multiplied by `lr_gamma` |
+| `lr_gamma` | `multistep` | decay factor at each milestone (default `0.1`) |
+| `warmup_epochs` | `multistep`, `cosine` | linear ramp `0 → lr` over the first N epochs |
+| `lr_min_factor` | `cosine` | LR floor as a fraction of `lr`, reached exactly on the last epoch |
+| `scheduler_patience` | `plateau` | unchanged |
+
+`multistep` and `cosine` are computed as **pure functions of the epoch index**
+rather than through torch's stateful schedulers. That has three consequences
+worth knowing: a resumed run lands on exactly the LR a fresh run would have at
+that epoch (torch's `MultiStepLR` counts `.step()` calls, so it would replay from
+the initial LR); nothing needs to go in the checkpoint; and every DDP rank
+computes the same LR independently, with no state to keep in sync. The
+`multistep` curve is verified identical to `torch.optim.lr_scheduler.MultiStepLR`
+over a full run.
+
 Train on SPICE dataset (10 elements):
 
 ```python
