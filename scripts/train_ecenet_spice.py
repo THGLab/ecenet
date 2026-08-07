@@ -53,7 +53,7 @@ def print_flush(*args, **kwargs):
 
 def size_aware_batches(all_idx, n_atoms, world_size, rank, epoch, seed,
                        batch_size=None, max_atoms_per_batch=None,
-                       max_batch_count=None, verbose=False):
+                       max_batch_count=None, bucket_sort=True, verbose=False):
     """Size-grouped, cross-rank-aligned batches for one epoch; returns ``rank``'s.
 
     Every rank holds the whole dataset, so this is a *global* length-grouped
@@ -75,8 +75,22 @@ def size_aware_batches(all_idx, n_atoms, world_size, rank, epoch, seed,
     a total-atom budget (``max_atoms_per_batch``, optionally capped at
     ``max_batch_count`` structures). The budget keeps memory and compute per step
     roughly uniform, so a batch of several large molecules cannot OOM the run.
+
+    ``bucket_sort`` trades DDP balance against batch diversity:
+
+    * True (default): sort by atom count first. Batches are size-homogeneous and
+      per-step cost is tightly aligned across ranks — but the sort undoes the
+      epoch's shuffle, so batches come out nearly identical every epoch and the
+      largest, rare-size structures are always grouped together. That costs
+      gradient diversity exactly where there is least data.
+    * False: greedy-pack the already-shuffled order. Batches are random and differ
+      every epoch. With an atom budget each batch still holds about
+      ``max_atoms_per_batch`` atoms, so per-rank cost stays bounded; only the
+      within-round spread loosens. Meaningful mainly with an atom budget — without
+      one this is just fixed-size batches plus the round alignment.
     """
-    order = all_idx[np.argsort(n_atoms[all_idx], kind='stable')]
+    order = (all_idx[np.argsort(n_atoms[all_idx], kind='stable')]
+             if bucket_sort else all_idx)
     if max_atoms_per_batch is not None:
         batches, cur, cur_atoms = [], [], 0
         for idx in order:
@@ -324,6 +338,8 @@ def train_ecenet_spice(
     tf32=False,              # route float32 matmuls to TF32 tensor cores (Ampere+)
     # Batching
     bucket=False,              # size-bucketed, cross-rank-aligned batching (DDP load balance)
+    bucket_sort=True,          # sort by atom count before packing; False → greedy on the
+                               # shuffled order (random, diverse batches; no size grouping)
     max_atoms_per_batch=None,  # atom-budget batching: cap total atoms/batch (no OOM); implies bucket
     max_batch_count=None,      # optional cap on structures/batch in atom-budget mode
     device=None,
@@ -653,7 +669,9 @@ def train_ecenet_spice(
         if verbose:
             print_flush(f"  Atom-budget batching: <={max_atoms_per_batch} atoms/batch"
                         + (f", <={max_batch_count} structures" if max_batch_count else "")
-                        + f" (mean {n_atoms_train.mean():.1f} atoms/structure)")
+                        + f" (mean {n_atoms_train.mean():.1f} atoms/structure), "
+                        + ("size-sorted" if bucket_sort else
+                           "greedy on the shuffled order (diverse batches)"))
 
     epochs_without_improvement = 0
     t_start = time.time()
@@ -687,7 +705,8 @@ def train_ecenet_spice(
             rank_batches = size_aware_batches(
                 all_idx, n_atoms_train, world_size, rank, epoch, seed,
                 batch_size=batch_size, max_atoms_per_batch=max_atoms_per_batch,
-                max_batch_count=max_batch_count, verbose=verbose)
+                max_batch_count=max_batch_count, bucket_sort=bucket_sort,
+                verbose=verbose)
         else:
             rank_idx = all_idx[rank * rank_epoch_size:(rank + 1) * rank_epoch_size]
             n_b = (len(rank_idx) + batch_size - 1) // batch_size

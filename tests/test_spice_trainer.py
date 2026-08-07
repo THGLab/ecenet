@@ -99,6 +99,77 @@ def test_bucket_groups_similar_sizes():
     print(f"  bucket: mean within-batch atom spread {spread_b:.1f} vs {spread_u:.1f} unsorted")
 
 
+def test_bucket_sort_controls_batch_diversity():
+    """Why bucket_sort=False exists. Sorting groups similar sizes, which tightens
+    DDP balance but makes the largest, rare-size structures co-occur with the SAME
+    neighbours every epoch — least data, least gradient diversity. Greedy-packing
+    the shuffled order mixes them freshly each epoch, and the atom budget still
+    bounds per-batch cost either way.
+
+    Note this is about *who shares a batch*, not literal batch identity: structures
+    of equal atom count are tie-broken by the epoch's shuffle, so even sorted
+    batches are not byte-identical across epochs.
+    """
+    rng = np.random.RandomState(0)
+    n_atoms = rng.randint(3, 60, size=3000).astype(np.int64)
+    BUDGET = 250
+    biggest = set(np.argsort(n_atoms)[-30:].tolist())
+
+    def epoch_batches(bucket_sort, epoch):
+        all_idx = np.random.RandomState(100 + epoch).permutation(3000)
+        return size_aware_batches(all_idx, n_atoms, 1, 0, epoch, 10,
+                                  max_atoms_per_batch=BUDGET, bucket_sort=bucket_sort)
+
+    def neighbours_of_biggest(batches):
+        out = set()
+        for b in batches:
+            if biggest & set(b.tolist()):
+                out |= set(b.tolist())
+        return out
+
+    results = {}
+    for bucket_sort in (True, False):
+        e0, e1 = epoch_batches(bucket_sort, 0), epoch_batches(bucket_sort, 1)
+        assert max(int(n_atoms[b].sum()) for b in e0) <= BUDGET, "budget exceeded"
+        spread = np.mean([n_atoms[b].max() - n_atoms[b].min() for b in e0])
+        p0, p1 = neighbours_of_biggest(e0), neighbours_of_biggest(e1)
+        jaccard = len(p0 & p1) / len(p0 | p1)
+        results[bucket_sort] = (spread, jaccard)
+        print(f"  bucket_sort={str(bucket_sort):5s}: within-batch atom spread "
+              f"{spread:5.1f}, the 30 largest keep {jaccard:.0%} of their "
+              f"batch-mates across epochs")
+
+    spread_on, jac_on = results[True]
+    spread_off, jac_off = results[False]
+    assert spread_on < 0.1 * spread_off, \
+        f"sorting should group sizes: {spread_on:.1f} vs {spread_off:.1f}"
+    assert jac_on > 0.5, \
+        f"sorted: the largest should keep their batch-mates, got {jac_on:.2f}"
+    assert jac_off < 0.3, \
+        f"unsorted: the largest should get fresh batch-mates, got {jac_off:.2f}"
+
+
+def test_bucket_sort_false_keeps_ddp_aligned():
+    """Diversity must not cost the DDP invariant: unsorted packing still gives
+    every rank the same batch count (only the per-rank load spread loosens)."""
+    rng = np.random.RandomState(0)
+    n_atoms = rng.randint(3, 60, size=4000).astype(np.int64)
+    for world_size in (2, 8):
+        all_idx = np.random.RandomState(5).permutation(4000)[:3000]
+        per_rank = [size_aware_batches(all_idx, n_atoms, world_size, r, 0, 10,
+                                       max_atoms_per_batch=250, bucket_sort=False)
+                    for r in range(world_size)]
+        counts = {len(b) for b in per_rank}
+        assert len(counts) == 1, f"unsorted packing desynced ranks: {counts}"
+        used = np.concatenate([np.concatenate(b) for b in per_rank])
+        assert len(used) == len(set(used.tolist())), "a structure was used twice"
+        totals = [int(n_atoms[np.concatenate(b)].sum()) for b in per_rank]
+        spread = (max(totals) - min(totals)) / max(totals)
+        assert spread < 0.20, f"unsorted load spread too large at ws={world_size}: {spread:.1%}"
+        print(f"  bucket_sort=False world_size={world_size}: {counts.pop()} batches on "
+              f"every rank, rank load spread {spread:.1%}")
+
+
 def test_atom_budget_respects_max_batch_count():
     n_atoms = np.full(500, 4, dtype=np.int64)          # tiny molecules
     idx = np.arange(500)
@@ -136,7 +207,9 @@ def test_trainer_runs_with_atom_budget():
         _, base = train_ecenet_spice(batch_size=4, **common)
         _, budg = train_ecenet_spice(batch_size=4, max_atoms_per_batch=60, **common)
         _, buck = train_ecenet_spice(batch_size=4, bucket=True, **common)
-        for r in (base, budg, buck):
+        _, nosort = train_ecenet_spice(batch_size=4, max_atoms_per_batch=60,
+                                       bucket_sort=False, **common)
+        for r in (base, budg, buck, nosort):
             assert np.isfinite(r['test_force_mae']), f"non-finite force MAE: {r}"
 
         # a budget below the largest structure can never be satisfied
@@ -171,6 +244,8 @@ def test_tf32_is_a_noop_under_float64():
 if __name__ == '__main__':
     test_ddp_invariant_both_modes()
     test_bucket_groups_similar_sizes()
+    test_bucket_sort_controls_batch_diversity()
+    test_bucket_sort_false_keeps_ddp_aligned()
     test_atom_budget_respects_max_batch_count()
     test_degenerate_epoch_keeps_ranks_aligned()
     test_trainer_runs_with_atom_budget()

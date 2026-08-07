@@ -223,6 +223,16 @@ molecules can no longer OOM; `max_batch_count` optionally caps structures per
 batch, bounding the per-structure Python overhead when a batch is all tiny
 molecules.
 
+`bucket_sort=True` (the default) sorts by atom count before packing.
+`bucket_sort=False` greedy-packs the already-shuffled order instead, trading a
+little DDP balance for batch diversity: with sorting, the largest, rare-size
+structures keep the *same* batch-mates every epoch (measured: they retain 84% of
+their batch-mates across epochs, vs 10% unsorted), which costs gradient diversity
+exactly where there is least data. The atom budget still bounds per-batch cost
+either way, so the per-rank load spread at `world_size=8` only loosens from 0.9%
+to 2.4%. Mainly meaningful together with `max_atoms_per_batch` — without a budget,
+unsorted packing is just fixed-size batches plus the round alignment.
+
 Both share the cross-rank alignment, which is what makes them useful under DDP.
 Every rank must run the same *number* of batches or the collective in backward
 deadlocks, so the assignment is derived identically on every rank rather than
