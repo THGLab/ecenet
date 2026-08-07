@@ -184,6 +184,91 @@ def test_fused_trunk_zero_init():
     print("  sum MP becomes active once the score channels learn")
 
 
+def test_l_attention_shapes_and_map():
+    """l_attention widens the fused trunk to one score per (head, l), and l_of_s
+    maps every spherical index to its degree — constant within each l-block, which
+    is exactly what makes a per-l weight equivariant."""
+    l_max = COMMON['l_max']
+    for H in (1, 2):
+        off = ECENet(**COMMON, n_mp=2, mp_n_heads=H).mp_layers[0]
+        on = ECENet(**COMMON, n_mp=2, mp_n_heads=H, mp_l_attention=True).mp_layers[0]
+        assert off.n_scores_per_head == 1 and off.n_scores == H
+        assert on.n_scores_per_head == l_max + 1 and on.n_scores == H * (l_max + 1)
+        assert on.msg_up.out_features == on.n_ch + H * (l_max + 1)
+        # l_of_s: degree of each spherical index, l-major contiguous blocks
+        expected = torch.cat([torch.full((2 * l + 1,), l, dtype=torch.long)
+                              for l in range(l_max + 1)])
+        assert torch.equal(on.l_of_s, expected), f"bad l_of_s: {on.l_of_s.tolist()}"
+        assert torch.equal(off.l_of_s, torch.zeros(off.n_sph, dtype=torch.long))
+        # every m of a given l shares one slot — no split within an l
+        for l in range(l_max + 1):
+            block = on.l_of_s[l * l:(l + 1) ** 2]
+            assert (block == l).all(), f"l={l} block is not uniform: {block.tolist()}"
+    # the buffer is derived from l_max, so it must not be in the checkpoint
+    sd = ECENet(**COMMON, n_mp=2, mp_l_attention=True).state_dict()
+    assert not any('l_of_s' in k for k in sd), "l_of_s should be non-persistent"
+    print(f"  l_attention: n_scores {H}→{H * (l_max + 1)}, l_of_s={expected.tolist()}, "
+          f"uniform within each l-block, non-persistent")
+
+
+def test_l_attention_independent_per_l():
+    """Each (head, l) runs its OWN softmax: weights sum to 1 for every (atom, head,
+    l) slot, and genuinely differ across l — it is not one weight broadcast."""
+    torch.manual_seed(5)
+    layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, n_heads=2,
+                                     l_attention=True, msg_envelope=False).double()
+    _activate_scores(layer, std=0.8)
+    inp = _layer_inputs()
+    a = _recompute_weights(layer, inp['A_cos'], inp['A_sin'], inp['dist_ij'],
+                           inp['edge_j'], inp['n_atoms'])          # (n_e, K)
+    K = layer.n_scores
+    assert a.shape[1] == K == 2 * (layer.l_max + 1)
+    ej = inp['edge_j'][:, None].expand(-1, K)
+    sums = torch.zeros(inp['n_atoms'], K, dtype=DTYPE).scatter_add(0, ej, a)
+    # Each slot sums to denom/(denom+softmax_eps), so the only deviation from 1 is
+    # the eps floor: it can undershoot but never overshoot, and only by ~eps/denom.
+    err = (sums - 1.0).abs().max().item()
+    assert (sums <= 1.0 + 1e-12).all(), "a softmax slot summed to more than 1"
+    assert err < 1e-4, f"per-(head, l) softmax does not sum to 1: off by {err:.2e}"
+    # slots must differ: reshape to (n_e, H, l_max+1) and compare across l
+    a_hl = a.reshape(-1, layer.n_heads, layer.n_scores_per_head)
+    spread = (a_hl.max(dim=2).values - a_hl.min(dim=2).values).max().item()
+    assert spread > 1e-3, f"weights are effectively identical across l ({spread:.2e})"
+    print(f"  l_attention: {K} independent softmaxes, each sums to 1 (dev {err:.1e}), "
+          f"weights differ across l by up to {spread:.3f}")
+
+
+def test_l_attention_so3_and_forces():
+    """A per-l weight is still exactly equivariant (the Wigner-D block is
+    l-diagonal), for both aggregations, and forces stay finite."""
+    pos, types = random_structure(seed=2)
+    for mp_type in ('transformer', 'sum'):
+        m = ECENet(**COMMON, n_mp=2, mp_type=mp_type, mp_n_heads=2,
+                   mp_l_attention=True).double()
+        L = m.mp_layers[0]
+        e_init = m(pos, types)
+        _activate_scores(L, std=0.5)
+        e0 = m(pos, types)
+        err = (e0 - m(pos @ rand_rotation().T, types)).abs().item()
+        assert err < 1e-9, f"{mp_type} l_attention breaks SO(3): {err:.2e}"
+        assert (e0 - e_init).abs().item() > 1e-9, f"{mp_type} l_attention had no effect"
+        p = pos.clone().requires_grad_(True)
+        f = -torch.autograd.grad(m(p, types), p, create_graph=True)[0]
+        assert torch.isfinite(f).all() and f.shape == pos.shape
+        print(f"  l_attention ({mp_type}): SO(3) {err:.1e}, |F|max={f.abs().max():.3f}")
+
+    # zero-init still makes 'sum' an exact identity, with the wider score block
+    layer = ECENetTransformerMPLayer(48, 2, 8, n_types=N_TYPES, m_max=2, n_heads=2,
+                                     aggregation='sum', l_attention=True).double()
+    inp = _layer_inputs()
+    oc, os_ = layer(inp['A_cos'], inp['A_sin'], inp['r_hat'], inp['dist_ij'],
+                    inp['edge_i'], inp['edge_j'], inp['n_atoms'],
+                    inp['type_i'], inp['type_j'])
+    d = max((oc - inp['A_cos']).abs().max().item(), (os_ - inp['A_sin']).abs().max().item())
+    assert d == 0.0, f"sum + l_attention is not identity at init: {d:.2e}"
+    print("  l_attention: sum still an exact identity at init")
+
+
 def test_msg_envelope_restores_absolute_decay():
     """Without the envelope, the softmax normalizer divides the ABSOLUTE f_cut back
     out: a lone neighbour near r_cut still gets weight ~1, so the message is flat
@@ -299,8 +384,9 @@ def _layer_inputs(n_atoms=6, n_ch=48, m_max=2, seed=5):
 
 def _recompute_weights(layer, A_cos, A_sin, dist_ij, edge_j, n_atoms):
     """The layer's per-edge weights, recomputed from its own fused trunk —
-    independently of the forward's max-subtraction path. (n_e, n_heads)."""
-    H = layer.n_heads
+    independently of the forward's max-subtraction path. (n_e, n_scores): one
+    slot per head, or per (head, l) with l_attention."""
+    H = layer.n_scores
     u_cos, u_sin = layer.msg_down(A_cos, A_sin)
     u_cos, u_sin = layer.msg_nonlin(u_cos, u_sin)
     u_cos, u_sin = layer.msg_up(u_cos, u_sin)
@@ -403,6 +489,9 @@ if __name__ == "__main__":
     test_cutoff_continuity()
     test_forces_finite()
     test_fused_trunk_zero_init()
+    test_l_attention_shapes_and_map()
+    test_l_attention_independent_per_l()
+    test_l_attention_so3_and_forces()
     test_msg_envelope_restores_absolute_decay()
     test_msg_envelope_defaults_and_flag()
     test_sum_is_extensive()

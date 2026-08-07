@@ -89,6 +89,14 @@ class ECENet(nn.Module):
         mp_n_heads:     number of attention heads; the value channels
                         (n_base = 2*embed_dim) split evenly across them
                         (default 1). Ignored (with a warning) when n_mp=1.
+        mp_l_attention: if True, each head emits one score PER degree l and
+                        weights a receiver's in-edges independently per (head, l),
+                        so a neighbour can matter for l=1 and not for l=2. The
+                        score stays an invariant scalar applied uniformly across
+                        that l's m-block, which is what keeps it equivariant —
+                        the Wigner-D block is l-diagonal, so splitting across l is
+                        legal, while splitting within an l / across m is not.
+                        Widens the fused trunk to n_ch + n_heads*(l_max+1).
         mp_msg_envelope: if True (default), the aggregated message decays with
                         *absolute* distance. For mp_type='transformer' this
                         multiplies the softmax weight by f_cut(r) a second time,
@@ -138,6 +146,7 @@ class ECENet(nn.Module):
         mp_dim: int = None,
         mp_n_heads: int = 1,
         mp_msg_envelope: bool = True,
+        mp_l_attention: bool = False,
         element_film: bool = False,
         film_embed_dim: int = 16,
         film_n_rbf: int = 0,
@@ -253,6 +262,10 @@ class ECENet(nn.Module):
         # Warn rather than silently ignore: an MP-only knob left at a non-default
         # value with n_mp=1 does nothing, and a silent no-op looks like the
         # setting was applied.
+        if mp_l_attention and n_mp == 1:
+            warnings.warn(
+                "mp_l_attention=True is ignored: message passing is off (n_mp=1).",
+                stacklevel=2)
         if mp_n_heads != 1 and n_mp == 1:
             warnings.warn(
                 f"mp_n_heads={mp_n_heads} is ignored: message passing is off "
@@ -278,6 +291,7 @@ class ECENet(nn.Module):
                     m_max=self.m_max, mp_dim=mp_dim,
                     activation=activation, n_grid=n_grid, n_heads=mp_n_heads,
                     aggregation=mp_type, msg_envelope=mp_msg_envelope,
+                    l_attention=mp_l_attention,
                 )
                 for _ in range(n_mp - 1)
             ])
@@ -952,7 +966,8 @@ class ECENetTransformerMPLayer(nn.Module):
                  cutoff_type: str = 'cosine', m_max: int = None,
                  mp_dim: int = None,
                  activation: str = 'silu', n_grid: int = None, n_heads: int = 1,
-                 aggregation: str = 'transformer', msg_envelope: bool = True):
+                 aggregation: str = 'transformer', msg_envelope: bool = True,
+                 l_attention: bool = False):
         super().__init__()
         if aggregation not in ('transformer', 'sum'):
             raise ValueError(
@@ -983,7 +998,26 @@ class ECENetTransformerMPLayer(nn.Module):
                 f"{aggregation} MP: n_base (=2·embed_dim={self.n_base}) must be "
                 f"divisible by n_heads ({n_heads}) to split the value across heads.")
         self.n_heads = n_heads
-        self.n_scores = n_heads          # one invariant score per head
+        # Per-l attention: with l_attention, each head emits one score PER degree l
+        # (l=0..l_max) and weights the receiver's in-edges INDEPENDENTLY per (head, l)
+        # — so a neighbour can be weighted differently for l=1 than for l=2. The
+        # score is still an invariant scalar per l, applied uniformly across that
+        # l's m-block (l_of_s expands per-(head,l) → per-(head,m)), so equivariance
+        # holds: splitting across l is legal because the Wigner-D block is
+        # l-diagonal; splitting *within* an l / across m is NOT. Without it, one
+        # score per head weights all l uniformly (the default).
+        self.l_attention = bool(l_attention)
+        self.n_scores_per_head = (l_max + 1) if self.l_attention else 1
+        self.n_scores = n_heads * self.n_scores_per_head
+        # Map each spherical index s=(l,m) → its per-head score slot: its degree l
+        # when l_attention (l-major order, contiguous [l², (l+1)²) blocks), else 0
+        # (one shared score per head). Non-persistent: derived from l_max only.
+        if self.l_attention:
+            l_of_s = torch.cat([torch.full((2 * l + 1,), l, dtype=torch.long)
+                                for l in range(l_max + 1)])
+        else:
+            l_of_s = torch.zeros(self.n_sph, dtype=torch.long)
+        self.register_buffer('l_of_s', l_of_s, persistent=False)
         # +eps floor on the per-node softmax normalizer: keeps it finite (no 0/0 →
         # NaN when a node's last edge reaches r_cut and every num → 0 together).
         self.softmax_eps = 1e-6
@@ -1049,7 +1083,8 @@ class ECENetTransformerMPLayer(nn.Module):
         #    cutoff f_cut enters multiplicatively so a departing edge's weight
         #    vanishes continuously as it crosses r_cut, and every factor is an
         #    invariant scalar, so SO(3)-equivariance is preserved.
-        H = self.n_heads
+        # K = one slot per head, or per (head, l) with l_attention.
+        H, K = self.n_heads, self.n_scores
         f_cut = self.cutoff_fn(dist_ij, self.r_cut)          # (n_e,) smooth → 0 at r_cut
         if self.aggregation == 'sum':
             #    a_e^k = s_e^k·f_cut_e — a plain signed weighted sum. No normalizer,
@@ -1067,13 +1102,13 @@ class ECENetTransformerMPLayer(nn.Module):
             #    (detached, so this stays an exact softmax — invariant to the
             #    constant per-node shift). Receivers with no incoming edge keep
             #    -inf but are never gathered (every edge has a receiver in edge_j).
-            ej_k = edge_j[:, None].expand(-1, H)             # (n_e, H)
-            s_max = torch.full((n_atoms, H), float('-inf'), device=device, dtype=dtype
+            ej_k = edge_j[:, None].expand(-1, K)             # (n_e, K)
+            s_max = torch.full((n_atoms, K), float('-inf'), device=device, dtype=dtype
                                ).scatter_reduce(0, ej_k, s.detach(), reduce='amax',
                                                 include_self=True)
-            num = torch.exp(s - s_max[edge_j]) * f_cut[:, None]   # (n_e, H)
-            denom = torch.zeros(n_atoms, H, device=device, dtype=dtype).scatter_add(0, ej_k, num)
-            a = num / (denom[edge_j] + self.softmax_eps)     # (n_e, H) softmax weights
+            num = torch.exp(s - s_max[edge_j]) * f_cut[:, None]   # (n_e, K)
+            denom = torch.zeros(n_atoms, K, device=device, dtype=dtype).scatter_add(0, ej_k, num)
+            a = num / (denom[edge_j] + self.softmax_eps)     # (n_e, K) per-slot weights
             if self.msg_envelope:
                 #    The normalizer just divided the absolute f_cut back out, so
                 #    put it back: contribution = a_e · f_cut_e · m_e. Folded into
@@ -1085,8 +1120,13 @@ class ECENetTransformerMPLayer(nn.Module):
         #    split into H contiguous groups (full n_sph each); head h's weight gates
         #    head h's value slice, uniformly across all m (equivariant). Heads then
         #    concat back to n_base.
+        #    The per-(head, l) weight is expanded to per-(head, spherical index) via
+        #    l_of_s — uniform across each l's m-block, which is what keeps it
+        #    equivariant. With l_attention off, l_of_s is all-zero, so this is the
+        #    single per-head weight broadcast over every m (identical to before).
         hb = self.n_base // H
-        contrib = h_global.reshape(n_e, H, hb, self.n_sph) * a[:, :, None, None]
+        a_full = a.reshape(n_e, H, self.n_scores_per_head)[:, :, self.l_of_s]  # (n_e, H, n_sph)
+        contrib = h_global.reshape(n_e, H, hb, self.n_sph) * a_full[:, :, None, :]
         idx = edge_j[:, None, None, None].expand_as(contrib)
         Delta = torch.zeros(n_atoms, H, hb, self.n_sph, device=device, dtype=dtype
                             ).scatter_add(0, idx, contrib).reshape(n_atoms, self.n_base, self.n_sph)

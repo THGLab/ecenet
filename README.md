@@ -160,6 +160,16 @@ an exact no-op and leaves `'transformer'` with uniform attention (`exp(0) = 1`).
 splits the value channels (`2*embed_dim`) into that many attention heads, so it
 must divide them evenly.
 
+`mp_l_attention` gives each head one score **per degree `l`** instead of one
+overall, so a neighbour can be weighted differently for `l=1` than for `l=2`.
+Each `(head, l)` then runs its own independent softmax over the receiver's
+in-edges, and the fused trunk widens to `n_ch + n_heads*(l_max+1)`. This stays
+equivariant because the Wigner-D block is `l`-diagonal: an invariant scalar
+applied uniformly across one `l`'s whole `m`-block commutes with the rotation.
+Splitting *within* an `l`, across `m`, would not — which is why the weight is
+expanded through a fixed `l_of_s` map rather than being free per spherical
+index.
+
 > **Note.** The older distance/type-weighted `mp_type='edge'` message passing has
 > been removed. Checkpoints trained with it (identifiable by `W_msg` weights) are
 > rejected with an explicit error rather than silently loading — retrain with
