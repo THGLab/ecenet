@@ -521,6 +521,21 @@ class ECENet(nn.Module):
                          ).scatter_add(0, edge_j[:, None, None].expand_as(h_l1), h_l1)
         return l0, l1
 
+    # ── Fused-kernel toggles (opt-in) ──────────────────────────────────────
+
+    def set_activation_fused(self, enabled: bool = True):
+        """Toggle the fused recompute-in-backward path on all RealSpaceNonlinearity
+        modules (equivariant layers + MP). Drops the (n_e,F,n_grid) grid transient
+        from the saved-for-backward set — a memory win for forces/MD, numerically
+        equivalent (Triton on CUDA+silu, else PyTorch recompute). No-op for
+        non-fusible configs. Inference-oriented (single backward); leave off for
+        double-backward force-loss training. Returns self.
+        """
+        for mod in self.modules():
+            if hasattr(mod, 'fused') and hasattr(mod, 'cos_synth'):
+                mod.fused = enabled
+        return self
+
     # ── Forward ────────────────────────────────────────────────────────────
 
     def forward(self, positions: torch.Tensor, types: torch.Tensor,

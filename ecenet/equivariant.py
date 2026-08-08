@@ -18,6 +18,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from ecenet.realspace_kernel import RealSpaceFused, is_fusible
+
 
 class EquivariantLinear(nn.Module):
     """Block-diagonal linear layer preserving equivariance.
@@ -96,6 +98,10 @@ class RealSpaceNonlinearity(nn.Module):
         act_map = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh, 'gelu': nn.GELU}
         self.activation = act_map[activation]()
 
+        # Opt-in fused path (recompute-in-backward; Triton on CUDA). Set via
+        # ECENet.set_activation_fused. Off by default. See ecenet/realspace_kernel.
+        self.fused = False
+
     def _build_bases(self):
         """Fill the DFT synthesis/analysis buffers, computing them in float64 and
         casting into whatever dtype the buffers currently hold.
@@ -152,6 +158,16 @@ class RealSpaceNonlinearity(nn.Module):
         Returns:
             A_cos_out, A_sin_out: (n_edges, n_features, n_angular)
         """
+        # Fused path: recompute the grid tensor in the backward instead of saving
+        # it (drops the ~3x (n_e,F,n_grid) transient from the saved-for-backward
+        # set). Only when grad is on (the win is the backward) and the config is
+        # the common one. Inference/forces — not double-backward (force-loss
+        # training keeps the path below).
+        if self.fused and is_fusible(self) and torch.is_grad_enabled():
+            return RealSpaceFused.apply(
+                A_cos, A_sin, self.cos_synth, self.sin_synth,
+                self.cos_analysis, self.sin_analysis, self.activation)
+
         # Synthesis: Fourier coefficients → grid values
         f_grid = A_cos @ self.cos_synth + A_sin @ self.sin_synth
 
