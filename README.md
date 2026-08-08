@@ -56,7 +56,10 @@ pip install -e .
 On a GPU machine, install the torch wheel that matches your CUDA version first
 (see <https://pytorch.org/get-started/locally/>), then `pip install -e .`.
 
-ECENet is pure PyTorch — no compiled/custom CUDA extensions to build.
+ECENet is pure PyTorch — no compiled/custom CUDA extensions to build. The
+optional fused kernels (below) use Triton, which ships with CUDA builds of
+PyTorch and is JIT-compiled at runtime; without Triton or a GPU the same code
+paths run as pure-PyTorch fallbacks.
 
 **Tested with:** Python 3.11 + CUDA PyTorch (cluster) and Python 3.14 + PyTorch
 2.10 CPU (local); NumPy 2.4, ASE 3.28. The dependency floors in `pyproject.toml`
@@ -217,6 +220,28 @@ ported; they will build on this interface.
 > (academic use unrestricted). This repository's own license covers only the
 > code in this repository and grants no rights to either.
 
+### Fused kernels (optional)
+
+Two opt-in fused paths trade nothing numerically for memory (and, with Triton
+on CUDA, HBM traffic). Both are runtime toggles on the model, off by default:
+
+```python
+model.set_edge_frame_fused(True)      # gather→Wigner-rotate→reshape as one op,
+                                      # + the MP layers' pack/unrotate (e2n=True)
+model.set_activation_fused(True)      # nonlinearity grid recomputed in backward
+```
+
+`set_edge_frame_fused` re-gathers in the backward instead of saving the
+`(n_edges, 2C, n_sph)` intermediates; its backward is built from differentiable
+ops, so it is safe for double-backward force-loss training.
+`set_activation_fused` drops the `(n_edges, F, n_grid)` grid transient from the
+saved-for-backward set; it is single-backward oriented — leave it off for
+force-loss training. On CUDA + float32 both dispatch to Triton kernels
+(`ecenet/edge_frame_kernel.py`, `ecenet/realspace_kernel.py`); elsewhere they
+run equivalent pure-PyTorch fallbacks. Verified bit-identical (CPU) /
+fp32-accurate (kernels) in `tests/test_edge_frame_kernel.py` and
+`tests/test_realspace_kernel.py`.
+
 ### Learning-rate schedule
 
 All three trainers take `lr_schedule`, defaulting to `'plateau'`
@@ -336,6 +361,8 @@ python tests/test_element_film.py            # FiLM gate: identity at init, SO(3
 python tests/test_spice_trainer.py            # SPICE trainer: atom-budget batching, DDP invariant
 python tests/test_attention_mp.py            # attention MP: SO(3), cutoff continuity, sum vs softmax
 python tests/test_les.py                     # LES: l0/l1 read-out SO(3) + batch/PBC consistency; wrapper lazy import
+python tests/test_edge_frame_kernel.py       # fused edge-frame/e2n: gradchecks, model on/off equality (Triton legs need CUDA)
+python tests/test_realspace_kernel.py        # fused nonlinearity: backward equivalence, DFT precision (Triton legs need CUDA)
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 ```
 
