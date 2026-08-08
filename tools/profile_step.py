@@ -156,30 +156,41 @@ A_cos, A_sin = model.sph_to_angular(A_rot)
 type_i = types[edge_i]
 type_j = types[edge_j]
 
-# Equivariant layers + message passing
-if hasattr(model, 'layers') and hasattr(model, 'mp_layers'):
-    for step_idx, (layer_group, mp) in enumerate(
-            zip(model.layers, model.mp_layers)):
-        sep(f"MP step {step_idx+1}")
-        for li, layer in enumerate(layer_group):
-            # Low-rank (bottleneck_dim) layers have linear_down/linear_up instead
-            # of a single full-width linear.
-            if layer.bottleneck_dim is not None:
-                time_fn(f"  EquivariantLinear down [{step_idx},{li}]",
-                        lambda l=layer: l.linear_down(A_cos, A_sin))
-                time_fn(f"  EquivariantLinear up [{step_idx},{li}]",
-                        lambda l=layer, c=layer.linear_down(A_cos, A_sin):
-                            l.linear_up(*(l.nonlin(*c) if l.nonlin is not None else c)))
-                lin_out = layer.linear_down(A_cos, A_sin)
-            else:
-                time_fn(f"  EquivariantLinear [{step_idx},{li}]",
-                        lambda l=layer: l.linear(A_cos, A_sin))
-                lin_out = layer.linear(A_cos, A_sin)
-            if layer.use_nonlinearity:
-                time_fn(f"  RealSpaceNonlinearity [{step_idx},{li}]",
-                        lambda l=layer, c=lin_out: l.nonlin(*c))
-            A_cos, A_sin = layer(A_cos, A_sin)
+# Equivariant layers + message passing.
+# n_mp >= 2: model.layers is a list of stages with an MP layer between
+# consecutive stages (n_mp-1 MP layers, none after the final stage).
+# n_mp = 1: model.layers is a flat list of layers and mp_layers does not exist.
+mp_layers = list(getattr(model, 'mp_layers', []))
+stages = list(model.layers) if mp_layers else [list(model.layers)]
 
+for gi, layer_group in enumerate(stages):
+    sep(f"Layer stage {gi+1}/{len(stages)}")
+    for li, layer in enumerate(layer_group):
+        # Low-rank (bottleneck_dim) layers have linear_down/linear_up instead
+        # of a single full-width linear; the nonlinearity runs at the
+        # bottleneck width, between the two.
+        if layer.bottleneck_dim is not None:
+            time_fn(f"  EquivariantLinear down [{gi},{li}]",
+                    lambda l=layer: l.linear_down(A_cos, A_sin))
+            lin_out = layer.linear_down(A_cos, A_sin)
+            if layer.use_nonlinearity:
+                time_fn(f"  RealSpaceNonlinearity [{gi},{li}]",
+                        lambda l=layer, c=lin_out: l.nonlin(*c))
+            nl_out = layer.nonlin(*lin_out) if layer.use_nonlinearity else lin_out
+            time_fn(f"  EquivariantLinear up [{gi},{li}]",
+                    lambda l=layer, c=nl_out: l.linear_up(*c))
+        else:
+            time_fn(f"  EquivariantLinear [{gi},{li}]",
+                    lambda l=layer: l.linear(A_cos, A_sin))
+            lin_out = layer.linear(A_cos, A_sin)
+            if layer.use_nonlinearity:
+                time_fn(f"  RealSpaceNonlinearity [{gi},{li}]",
+                        lambda l=layer, c=lin_out: l.nonlin(*c))
+        A_cos, A_sin = layer(A_cos, A_sin)
+
+    if gi < len(mp_layers):
+        mp = mp_layers[gi]
+        sep(f"MP layer {gi+1} ({mp.aggregation})")
         # Message passing internals (message + score → weights → aggregate → receiver)
         n_e = len(edge_i)
         n_atoms = len(types)
