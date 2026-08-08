@@ -1383,6 +1383,20 @@ class SphToAngular(nn.Module):
         self.register_buffer('cos_valid', cos_valid)
         self.register_buffer('sin_valid', sin_valid)
 
+        # Fold the (l_max+1)× channel-repeat into the SH gather so the forward
+        # never materialises A_exp (a tensor (l_max+1)× the size of A_rot, plus
+        # its grad buffer in backward). Expanded channel c reads base channel
+        # c // (l_max+1); index into A_rot flattened over (base_channel, n_sph).
+        # Non-persistent (deterministic from hparams), so existing checkpoints
+        # keep loading under from_checkpoint's strict key check — a deliberate
+        # divergence from dev, where these are persistent.
+        n_sph = (l_max + 1) ** 2
+        ch_src = torch.arange(self.n_ch) // (l_max + 1)          # (n_ch,)
+        cos_flat = ch_src[:, None] * n_sph + cos_idx             # (n_ch, n_angular)
+        sin_flat = ch_src[:, None] * n_sph + sin_idx
+        self.register_buffer('cos_flat_idx', cos_flat.reshape(-1), persistent=False)
+        self.register_buffer('sin_flat_idx', sin_flat.reshape(-1), persistent=False)
+
     def forward(self, A_rot):
         """
         Args:
@@ -1391,11 +1405,14 @@ class SphToAngular(nn.Module):
             A_cos, A_sin: (n_edges, 2*embed_dim*(l_max+1), l_max+1)
         """
         n_edges = A_rot.shape[0]
-        # Repeat each embed channel l_max+1 times to align with (embed, l) layout
-        A_exp = A_rot.repeat_interleave(self.l_max + 1, dim=1)  # (n_edges, n_ch, n_sph)
-        # Gather cos (+m) and sin (−m) components
-        A_cos = A_exp.gather(2, self.cos_idx[None].expand(n_edges, -1, -1)) * self.cos_valid
-        A_sin = A_exp.gather(2, self.sin_idx[None].expand(n_edges, -1, -1)) * self.sin_valid
+        # Gather +m (cos) and −m (sin) components straight from A_rot. The flat
+        # indices already encode the (embed, l) channel repeat, so there is no
+        # (l_max+1)×-larger A_exp intermediate (and no grad buffer for it).
+        A_flat = A_rot.reshape(n_edges, -1)        # (n_edges, n_ch_base * n_sph)
+        A_cos = (A_flat.index_select(1, self.cos_flat_idx)
+                 .view(n_edges, self.n_ch, self.n_angular)) * self.cos_valid
+        A_sin = (A_flat.index_select(1, self.sin_flat_idx)
+                 .view(n_edges, self.n_ch, self.n_angular)) * self.sin_valid
         return A_cos, A_sin
 
 
