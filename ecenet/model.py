@@ -690,9 +690,10 @@ class ECENet(nn.Module):
                             return_embeddings=False, l0_only=False):
         """Batch forward for variable-size, variable-composition structures.
 
-        Topology is built per-structure in a cheap Python loop; the expensive
-        ops (Wigner rotation, equivariant layers, output MLP) run once on the
-        full flat edge set.
+        Only topology (edge/neighbour indices) is built per-structure in a
+        cheap Python loop; the expensive ops (ACE basis, embed, Wigner
+        rotation, equivariant layers, output MLP) run once on the concatenated
+        atom/edge set.
 
         Args:
             positions_list:  list of B tensors, each (N_b, 3)
@@ -709,49 +710,52 @@ class ECENet(nn.Module):
         device = positions_list[0].device
         dtype  = positions_list[0].dtype
 
-        A_src_list, A_tgt_list = [], []
-        r_hat_list, dist_ij_list = [], []
-        type_i_list, type_j_list = [], []
         edge_i_list, edge_j_list = [], []   # flat atom indices with offsets (for MP)
+        nb_src_list, nb_dst_list = [], []   # flat ACE neighbour indices (offset)
         struct_ids = []
         atomic_e_list = []
         atom_offset = 0
 
+        # ── Per-structure topology only (cheap: distance matrix + nonzero) ──
+        # The expensive ops (ACE basis, embed, Wigner rotation, layers) run once
+        # on the concatenated atom/edge set below. Keeping only edge/neighbour
+        # index construction in this Python loop means it launches no ACE /
+        # spherical-harmonic kernels per structure — so a batch of many tiny
+        # molecules no longer pays O(#structures) kernel-launch overhead (the
+        # cause of the DDP straggler on the rank that draws the small-molecule
+        # batches). Neighbour indices carry a running atom offset and never cross
+        # structures, so the single batched basis is block-diagonal == per-frame.
         for b, (pos, types) in enumerate(zip(positions_list, types_list)):
             N_b = pos.shape[0]
-            diff = pos.unsqueeze(0) - pos.unsqueeze(1)              # (N_b, N_b, 3)
-            dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)      # (N_b, N_b)
-
-            ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+            # Topology (edge/neighbour indices) is non-differentiable; build it
+            # under no_grad so dist_mat's sub/sqrt don't spawn dead nodes into
+            # the force double-backward graph (the energy's distances are
+            # recomputed below from the concatenated positions). atomic_e
+            # (param-grad) stays OUTSIDE the no_grad.
+            with torch.no_grad():
+                diff = pos.unsqueeze(0) - pos.unsqueeze(1)              # (N_b, N_b, 3)
+                dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)      # (N_b, N_b)
+                ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
 
             atomic_e_list.append(self.atomic_energy[types].sum())
             if len(ei) == 0:
                 atom_offset += N_b
                 continue
 
-            nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+            with torch.no_grad():
+                nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor)
+                                  & (dist_mat > 1e-10)).nonzero(as_tuple=True)
 
-            diff_ij = pos[ej] - pos[ei]
-            dist_ij = torch.sqrt((diff_ij ** 2).sum(-1) + 1e-30)
-            r_hat   = diff_ij / dist_ij.unsqueeze(-1)
-
-            A = self._compute_ace_basis(pos.unsqueeze(0), nb_src, nb_dst, types).squeeze(0)
-            A_emb = self._embed(A, types)   # (N_b, embed_dim, n_sph)
-
-            A_src_list.append(A_emb[ei])
-            A_tgt_list.append(A_emb[ej])
-            r_hat_list.append(r_hat)
-            dist_ij_list.append(dist_ij)
-            type_i_list.append(types[ei])
-            type_j_list.append(types[ej])
             edge_i_list.append(ei + atom_offset)
             edge_j_list.append(ej + atom_offset)
+            nb_src_list.append(nb_src + atom_offset)
+            nb_dst_list.append(nb_dst + atom_offset)
             struct_ids.append(torch.full((len(ei),), b, dtype=torch.long, device=device))
             atom_offset += N_b
 
         energies = torch.stack(atomic_e_list)   # (B,)
 
-        total_edges = sum(len(x) for x in r_hat_list)
+        total_edges = sum(len(x) for x in edge_i_list)
         if total_edges == 0:
             if return_embeddings:
                 n_ch = 2 * self.embed_dim
@@ -764,16 +768,36 @@ class ECENet(nn.Module):
                 return energies, l0_list, l1_list
             return energies
 
-        # Merge flat edge arrays
-        A_src      = torch.cat(A_src_list)
-        A_tgt      = torch.cat(A_tgt_list)
-        r_hat      = torch.cat(r_hat_list)
-        dist_ij    = torch.cat(dist_ij_list)
-        type_i     = torch.cat(type_i_list)
-        type_j     = torch.cat(type_j_list)
+        # Merge flat edge / neighbour arrays
         edge_i_flat = torch.cat(edge_i_list)
         edge_j_flat = torch.cat(edge_j_list)
+        nb_src_flat = torch.cat(nb_src_list)
+        nb_dst_flat = torch.cat(nb_dst_list)
         struct_idx  = torch.cat(struct_ids)
+
+        # ── ACE basis + embed once on the whole concatenated atom set ──
+        # The basis of a central atom depends only on its own neighbour list
+        # (scattered by nb_src), and indices never cross structures, so a single
+        # batched call reproduces the per-structure result exactly while
+        # collapsing O(#structures) ACE/embed launches to one. Atoms in
+        # zero-edge structures appear in no neighbour list → zero basis, unused.
+        pos_all   = torch.cat(positions_list, dim=0)        # (N_total, 3)
+        types_all = torch.cat(types_list, dim=0)            # (N_total,)
+
+        A = self._compute_ace_basis(pos_all.unsqueeze(0), nb_src_flat, nb_dst_flat,
+                                    types_all).squeeze(0)
+        A_emb = self._embed(A, types_all)                   # (N_total, embed_dim, n_sph)
+
+        # Per-edge features gathered from the per-atom embed; geometry computed
+        # flat from the concatenated positions (gradients flow to the per-frame
+        # leaves through the cat → forces are unchanged).
+        A_src = A_emb[edge_i_flat]
+        A_tgt = A_emb[edge_j_flat]
+        diff_ij = pos_all[edge_j_flat] - pos_all[edge_i_flat]
+        dist_ij = torch.sqrt((diff_ij ** 2).sum(-1) + 1e-30)
+        r_hat   = diff_ij / dist_ij.unsqueeze(-1)
+        type_i  = types_all[edge_i_flat]
+        type_j  = types_all[edge_j_flat]
 
         A_both  = torch.cat([A_src, A_tgt], dim=1)
         D_block = build_D_block(r_hat, self.l_max)
