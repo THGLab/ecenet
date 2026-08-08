@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 
 from ecenet.ace_basis import ACEBasisAnalytic
+from ecenet.edge_frame_kernel import edge_frame_fused, edge_frame_fused_single, pack_unrotate_fused
 from ecenet.equivariant import EquivariantLinear, RealSpaceNonlinearity
 from ecenet.film import ElementFiLM
 from ecenet.radial import find_edges, get_cutoff_fn, radial_basis
@@ -523,6 +524,36 @@ class ECENet(nn.Module):
 
     # ── Fused-kernel toggles (opt-in) ──────────────────────────────────────
 
+    def set_edge_frame_fused(self, enabled: bool = True, e2n: bool = True):
+        """Toggle the fused gather→rotate→reshape path (edge_frame_kernel) on
+        forward steps 3-4 AND the MP layers' rotate-back+unpack (their steps
+        5-6, single-source variant) where the layer has that pattern. The fused
+        autograd.Function re-gathers in the backward instead of saving the
+        (n_edges, R, n_sph) intermediates, and its backward is composed of
+        differentiable ops — so unlike set_activation_fused it is safe for
+        double-backward force-loss training. Numerically identical to the
+        unfused ops (see tests/test_edge_frame_kernel.py). Returns self.
+        """
+        self._edge_frame_fused = enabled
+        for layer in getattr(self, 'mp_layers', []):
+            layer.edge_frame_fused = enabled
+            layer.edge_frame_fused_e2n = e2n
+        return self
+
+    def _edge_frame(self, A_emb, edge_i, edge_j, r_hat):
+        """Steps 3-4: gather endpoint features, rotate into the bond frame,
+        reshape to (A_cos, A_sin). Returns (A_cos, A_sin, D_block); D_block is
+        built here so callers can reuse it (MP layers, node aggregation)."""
+        D_block = build_D_block(r_hat, self.l_max)
+        if getattr(self, '_edge_frame_fused', False):
+            A_cos, A_sin = edge_frame_fused(A_emb, edge_i, edge_j, D_block,
+                                            self.sph_to_angular)
+        else:
+            A_both = torch.cat([A_emb[edge_i], A_emb[edge_j]], dim=1)
+            A_rot = wigner_rotate(A_both, D_block)
+            A_cos, A_sin = self.sph_to_angular(A_rot)
+        return A_cos, A_sin, D_block
+
     def set_activation_fused(self, enabled: bool = True):
         """Toggle the fused recompute-in-backward path on all RealSpaceNonlinearity
         modules (equivariant layers + MP). Drops the (n_e,F,n_grid) grid transient
@@ -593,15 +624,8 @@ class ECENet(nn.Module):
         # ── Step 2: Joint contraction → (N, embed_dim, n_sph) ────────────
         A_emb = self._embed(A, types)
 
-        # ── Step 3: Gather + Wigner rotation ──────────────────────────────
-        A_src = A_emb[edge_i]   # (n_edges, embed_dim, n_sph)
-        A_tgt = A_emb[edge_j]
-        A_both = torch.cat([A_src, A_tgt], dim=1)   # (n_edges, 2*embed_dim, n_sph)
-        D_block = build_D_block(r_hat, self.l_max)
-        A_rot = wigner_rotate(A_both, D_block)  # (n_edges, 2*embed_dim, n_sph)
-
-        # ── Step 4: Reshape to A_cos / A_sin ──────────────────────────────
-        A_cos, A_sin = self.sph_to_angular(A_rot)
+        # ── Steps 3+4: Gather + Wigner rotation + reshape to A_cos / A_sin ─
+        A_cos, A_sin, D_block = self._edge_frame(A_emb, edge_i, edge_j, r_hat)
 
         # ── Step 5: Equivariant layers ────────────────────────────────────
         ti, tj = types[edge_i], types[edge_j]
@@ -674,13 +698,7 @@ class ECENet(nn.Module):
         # ── Steps 2–7: identical to forward() ─────────────────────────────
         A_emb = self._embed(A, types)
 
-        A_src  = A_emb[edge_i]
-        A_tgt  = A_emb[edge_j]
-        A_both = torch.cat([A_src, A_tgt], dim=1)
-        D_block = build_D_block(r_hat, self.l_max)
-        A_rot  = wigner_rotate(A_both, D_block)
-
-        A_cos, A_sin = self.sph_to_angular(A_rot)
+        A_cos, A_sin, D_block = self._edge_frame(A_emb, edge_i, edge_j, r_hat)
 
         ti, tj = types[edge_i], types[edge_j]
         A_cos, A_sin = self._run_equivariant_layers(
@@ -803,22 +821,16 @@ class ECENet(nn.Module):
                                     types_all).squeeze(0)
         A_emb = self._embed(A, types_all)                   # (N_total, embed_dim, n_sph)
 
-        # Per-edge features gathered from the per-atom embed; geometry computed
-        # flat from the concatenated positions (gradients flow to the per-frame
-        # leaves through the cat → forces are unchanged).
-        A_src = A_emb[edge_i_flat]
-        A_tgt = A_emb[edge_j_flat]
+        # Per-edge geometry computed flat from the concatenated positions
+        # (gradients flow to the per-frame leaves through the cat → forces are
+        # unchanged); features gathered from the per-atom embed in _edge_frame.
         diff_ij = pos_all[edge_j_flat] - pos_all[edge_i_flat]
         dist_ij = torch.sqrt((diff_ij ** 2).sum(-1) + 1e-30)
         r_hat   = diff_ij / dist_ij.unsqueeze(-1)
         type_i  = types_all[edge_i_flat]
         type_j  = types_all[edge_j_flat]
 
-        A_both  = torch.cat([A_src, A_tgt], dim=1)
-        D_block = build_D_block(r_hat, self.l_max)
-        A_rot  = wigner_rotate(A_both, D_block)
-
-        A_cos, A_sin = self.sph_to_angular(A_rot)
+        A_cos, A_sin, D_block = self._edge_frame(A_emb, edge_i_flat, edge_j_flat, r_hat)
 
         A_cos, A_sin = self._run_equivariant_layers(
             A_cos, A_sin,
@@ -1276,8 +1288,16 @@ class ECENetAttentionMPLayer(nn.Module):
         s = u_cos[:, self.n_ch:self.n_ch + self.n_scores, 0]   # (n_e, n_heads)
 
         # 3. Pack message → SH, unrotate to the common global frame.
-        h = self._pack(m_cos, m_sin)
-        h_global = torch.bmm(h, D_block.transpose(-1, -2))  # transposed view, no copy
+        # Fused variant collapses the two into one op (the packed h never
+        # materializes); the weighting below acts on h_global either way — the
+        # gate is applied in the node frame, so 'sum'/'softmax'/l_attention all
+        # compose with the fusion unchanged.
+        if getattr(self, 'edge_frame_fused_e2n', False):
+            h_global = pack_unrotate_fused(m_cos, m_sin, D_block,
+                                           self.l_max, self.m_max)
+        else:
+            h = self._pack(m_cos, m_sin)
+            h_global = torch.bmm(h, D_block.transpose(-1, -2))  # transposed view, no copy
 
         # 4. Per-edge weights, formed INDEPENDENTLY per head. Either way the smooth
         #    cutoff f_cut enters multiplicatively so a departing edge's weight
@@ -1332,8 +1352,12 @@ class ECENetAttentionMPLayer(nn.Module):
                             ).scatter_add(0, idx, contrib).reshape(n_atoms, self.n_base, self.n_sph)
 
         # 6. Gather to edges (source atom), rotate back to the edge frame.
-        v_rot = torch.bmm(Delta[edge_i], D_block)            # (n_e, n_base, n_sph)
-        d_cos, d_sin = self._unpack(v_rot, n_e)
+        if getattr(self, 'edge_frame_fused', False):
+            d_cos, d_sin = edge_frame_fused_single(
+                Delta, edge_i, D_block, self.l_max, self.m_max)
+        else:
+            v_rot = torch.bmm(Delta[edge_i], D_block)        # (n_e, n_base, n_sph)
+            d_cos, d_sin = self._unpack(v_rot, n_e)
 
         # 7. Receiver: low-rank residual (equivariant, edge frame).
         r_cos, r_sin = self.receiver(d_cos, d_sin)
