@@ -32,7 +32,8 @@ from ecenet.calculator import ECENetCalculator
 def run_md_box(checkpoint, box, cell=None, frame_idx=-1, seed=0,
                temperature=300, timestep=0.5, friction=0.01, n_steps=20000,
                log_every=100, output='traj.xyz', log='md.log', device=None,
-               float32=False, log_timings=False):
+               float32=False, log_timings=False,
+               fuse_nonlin=False, edge_frame_fused=False):
     """Run NVT Langevin MD from a pre-built periodic box.
 
     Importable entry point (see main() for the equivalent CLI). Writes a
@@ -63,6 +64,17 @@ def run_md_box(checkpoint, box, cell=None, frame_idx=-1, seed=0,
         checkpoint, device=device, dtype=dtype,
         log_timings=log_timings)
     atoms.calc = calc
+
+    # Fused kernels (opt-in). MD is forces-only (single backward), so both are
+    # safe here; edge_frame_fused enables the MP pack/unrotate fusion with it
+    # (the separate e2n knob is a profiling concern — see tools/profile_step.py).
+    if fuse_nonlin:
+        calc.model.set_activation_fused(True)
+        n_set = sum(1 for m in calc.model.modules() if getattr(m, 'fused', False))
+        print(f"[fuse_nonlin] fused RealSpaceNonlinearity on {n_set} module(s)")
+    if edge_frame_fused:
+        calc.model.set_edge_frame_fused(True, e2n=True)
+        print("[edge_frame_fused] fused gather+rotate+reshape (+MP pack/unrotate)")
 
     # Quick sanity check
     e = atoms.get_potential_energy()
@@ -148,6 +160,10 @@ def main():
     parser.add_argument('--float32',      action='store_true')
     parser.add_argument('--log_timings',  action='store_true',
                         help='Print NL/fwd/bwd timings for each step')
+    parser.add_argument('--fuse_nonlin',  action='store_true',
+                        help='Fused RealSpaceNonlinearity (Triton on CUDA+silu)')
+    parser.add_argument('--edge_frame_fused', action='store_true',
+                        help='Fused edge-frame + MP pack/unrotate (Triton on CUDA+fp32)')
     args = parser.parse_args()
     run_md_box(**vars(args))
 

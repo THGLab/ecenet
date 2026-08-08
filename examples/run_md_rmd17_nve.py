@@ -61,7 +61,8 @@ def run_md_rmd17_nve(checkpoint, molecule='aspirin', data_dir=None,
                      frame_idx=None, seed=0, temperature=300,
                      timestep=0.5, n_steps=10000, log_every=100,
                      output='traj.xyz', log='md.log', device=None,
-                     float32=False, energy_units=None):
+                     float32=False, energy_units=None,
+                     fuse_nonlin=False, edge_frame_fused=False):
     """Run NVE VelocityVerlet MD from an rMD17/MD22 starting frame.
 
     Importable entry point (see main() for the equivalent CLI). Writes a
@@ -81,6 +82,17 @@ def run_md_rmd17_nve(checkpoint, molecule='aspirin', data_dir=None,
         checkpoint, device=device, dtype=dtype,
         energy_units=energy_units)
     atoms.calc = calc
+
+    # Fused kernels (opt-in). MD is forces-only (single backward), so both are
+    # safe here; edge_frame_fused enables the MP pack/unrotate fusion with it
+    # (the separate e2n knob is a profiling concern — see tools/profile_step.py).
+    if fuse_nonlin:
+        calc.model.set_activation_fused(True)
+        n_set = sum(1 for m in calc.model.modules() if getattr(m, 'fused', False))
+        print(f"[fuse_nonlin] fused RealSpaceNonlinearity on {n_set} module(s)")
+    if edge_frame_fused:
+        calc.model.set_edge_frame_fused(True, e2n=True)
+        print("[edge_frame_fused] fused gather+rotate+reshape (+MP pack/unrotate)")
 
     # Quick sanity check
     e = atoms.get_potential_energy()
@@ -170,6 +182,10 @@ def main():
                         help='Override unit conversion (auto-detected from checkpoint '
                              'if not set). Use kcal/mol for train_ecenet.py models, '
                              'eV for train_ecenet_spice.py models.')
+    parser.add_argument('--fuse_nonlin',  action='store_true',
+                        help='Fused RealSpaceNonlinearity (Triton on CUDA+silu)')
+    parser.add_argument('--edge_frame_fused', action='store_true',
+                        help='Fused edge-frame + MP pack/unrotate (Triton on CUDA+fp32)')
     args = parser.parse_args()
     run_md_rmd17_nve(**vars(args))
 
