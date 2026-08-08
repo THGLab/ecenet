@@ -62,13 +62,24 @@ def run_md_rmd17_langevin(checkpoint, molecule='aspirin', data_dir=None,
                           timestep=0.5, friction=0.01, n_steps=10000,
                           log_every=100, output='traj.xyz', log='md.log',
                           device=None, float32=False, energy_units=None,
-                          fuse_nonlin=False, edge_frame_fused=False):
+                          fuse_nonlin=False, edge_frame_fused=False, tf32=False):
     """Run NVT Langevin MD from an rMD17/MD22 starting frame.
 
     Importable entry point (see main() for the equivalent CLI). Writes a
     trajectory to `output` and a step log to `log`; returns the final Atoms.
     """
     dtype = torch.float32 if float32 else torch.float64
+
+    if tf32:
+        if dtype == torch.float64:
+            print("[tf32] requested but dtype=float64 → no effect (TF32 is "
+                  "float32-only); add --float32 to use it")
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
+            print("[tf32] enabled: float32 matmuls → TF32 tensor cores "
+                  "(A/B energies/forces against a tf32=False run)")
 
     # ── Load starting frame ────────────────────────────────────────────────
     atoms = load_starting_frame(molecule, data_dir, frame_idx, seed)
@@ -189,6 +200,10 @@ def main():
                         help='Fused RealSpaceNonlinearity (Triton on CUDA+silu)')
     parser.add_argument('--edge_frame_fused', action='store_true',
                         help='Fused edge-frame + MP pack/unrotate (Triton on CUDA+fp32)')
+    parser.add_argument('--tf32', action='store_true',
+                        help='Route float32 matmuls to TF32 tensor cores (Ampere+); '
+                             'no effect without --float32. The fused Triton kernels '
+                             'stay IEEE regardless.')
     args = parser.parse_args()
     run_md_rmd17_langevin(**vars(args))
 
