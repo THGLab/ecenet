@@ -16,6 +16,7 @@ ecenet/
   model.py         ECENet — the model (message passing when n_mp >= 2)
   equivariant.py   EquivariantLinear, RealSpaceNonlinearity
   film.py          ElementFiLM — element(+distance)-conditioned edge gate
+  les.py           LESLongRange — optional long-range add-on (wraps the `les` package)
   ace_basis.py     analytic ACE basis + Wigner-rotation autograd functions
   spherical.py     real spherical harmonics, Clebsch–Gordan, Wigner-D (recursion + rotation)
   radial.py        radial bases, cutoff envelopes, edge/neighbour lists
@@ -175,6 +176,47 @@ index.
 > rejected with an explicit error rather than silently loading — retrain with
 > `'softmax'` or `'sum'`.
 
+### Long-range electrostatics (LES, optional)
+
+ECENet's message passing sees only atoms within `r_cut_edge`. The optional
+**LES** add-on (Latent Ewald Summation) closes that gap: a head predicts a
+scalar latent charge per atom from the model's invariant `l0` embedding, and
+the long-range energy is the smeared-Coulomb interaction between those charges
+(reciprocal-space Ewald for periodic systems), summed into the total energy on
+one shared autograd graph so forces and stress need no extra code.
+
+The implementation is **not vendored** — `ecenet.les.LESLongRange` wraps the
+inventors' reference package, installed separately (pinned; it is not on PyPI):
+
+```bash
+pip install -e ".[les]"     # or directly:
+pip install "les @ git+https://github.com/ChengUCB/les@c8063fad18e3d59cb4d783e0ed5a1efea8d55b8d"
+```
+
+`LESLongRange()(l0, positions, cell=None, batch=None)` returns the long-range
+energy; the upstream package's own head maps `l0` to latent charges, so the
+wrapper's state dict is exactly the upstream module's. The model exposes `l0`
+on every forward variant — `l0_only=True` skips the `l=1` work (`l0` is
+rotation-invariant, so it needs no frame change; a charge is a scalar, so the
+head never sees `l1`):
+
+```python
+lr = ecenet.LESLongRange()
+E_sr, l0 = model(pos, types, return_embeddings=True, l0_only=True)
+E = E_sr + lr(l0, pos).sum()      # one autograd graph → forces via autograd
+```
+
+The batched paths (`forward_batch`, `forward_batch_multi`) return `l0` as a
+per-structure list. The joint trainer and the calculator wiring are not yet
+ported; they will build on this interface.
+
+> **IP / licensing.** The `les` package is CC BY-NC 4.0 (**non-commercial**);
+> it is an optional dependency and none of its code is included in this
+> repository — installing it means accepting its terms. The Latent Ewald
+> Summation algorithm additionally has a UC Berkeley provisional patent
+> (academic use unrestricted). This repository's own license covers only the
+> code in this repository and grants no rights to either.
+
 ### Learning-rate schedule
 
 All three trainers take `lr_schedule`, defaulting to `'plateau'`
@@ -293,6 +335,7 @@ python tests/test_bottleneck.py              # low-rank layers: identity at init
 python tests/test_element_film.py            # FiLM gate: identity at init, SO(3), per-m, shift
 python tests/test_spice_trainer.py            # SPICE trainer: atom-budget batching, DDP invariant
 python tests/test_attention_mp.py            # attention MP: SO(3), cutoff continuity, sum vs softmax
+python tests/test_les.py                     # LES: l0/l1 read-out SO(3) + batch/PBC consistency; wrapper lazy import
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 ```
 
