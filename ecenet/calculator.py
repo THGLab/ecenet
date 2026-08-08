@@ -81,7 +81,8 @@ class ECENetCalculator(Calculator):
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, dtype=None,
                         energy_reference=None, element_to_type=None,
-                        energy_units=None, log_timings=False):
+                        energy_units=None, log_timings=False,
+                        ignore_les=False):
         """Load model and hparams directly from a checkpoint file.
 
         The checkpoint is expected to be self-describing: the training scripts
@@ -116,6 +117,21 @@ class ECENetCalculator(Calculator):
             device = torch.device(device)
 
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        # Checkpoints trained jointly with LES (train_ecenet_xyz use_les=True)
+        # carry a top-level 'les' dict. This calculator computes only the
+        # short-range energy, so loading one here would silently drop the
+        # long-range term the weights were trained against — refuse instead
+        # (same philosophy as the W_msg rejection below). ignore_les=True
+        # loads the short-range part deliberately.
+        if 'les' in ckpt and not ignore_les:
+            raise ValueError(
+                "Checkpoint was trained jointly with LES long-range "
+                "electrostatics; ECENetCalculator computes only the "
+                "short-range energy and would silently drop the E_lr term. "
+                "An LES-aware calculator is not yet available. Pass "
+                "ignore_les=True to load the short-range part anyway."
+            )
 
         hp = ckpt.get('hparams')
         if hp is None:

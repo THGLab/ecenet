@@ -23,8 +23,9 @@ unrestricted). ECENet's own license covers only the code in this repository.
 Integration status: the model exposes the per-atom embeddings —
 ``forward(..., return_embeddings=True[, l0_only=True])``, with the same flags
 on ``forward_pbc`` / ``forward_batch`` / ``forward_batch_multi`` (the batched
-paths return per-structure lists). The joint trainer and the calculator wiring
-are not yet ported.
+paths return per-structure lists). Joint training is available for small
+datasets via ``scripts/train_ecenet_xyz.py`` (``use_les=True``); the LES-aware
+calculator and joint training in the DDP trainers are not yet ported.
 
     lr = LESLongRange()
     E_sr, l0 = model(pos, types, return_embeddings=True, l0_only=True)

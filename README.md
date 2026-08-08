@@ -27,6 +27,7 @@ scripts/               training / data entry points (run from the repo root)
   train_ecenet.py        rMD17 / MD22 single-molecule training
   train_ecenet_spice.py  SPICE multi-molecule training (10 elements, DDP)
   train_ecenet_mptrj.py  MPtrj training (periodic crystals, ~89 elements, stress)
+  train_ecenet_xyz.py    small ASE/extxyz datasets (single-process; optional joint LES)
   prepare_mptrj.py       tensorise raw MPtrj JSON → .pt shards
   eval_spice.py          evaluate a SPICE checkpoint on the test set
 
@@ -210,8 +211,30 @@ E = E_sr + lr(l0, pos).sum()      # one autograd graph → forces via autograd
 ```
 
 The batched paths (`forward_batch`, `forward_batch_multi`) return `l0` as a
-per-structure list. The joint trainer and the calculator wiring are not yet
-ported; they will build on this interface.
+per-structure list.
+
+**Joint training** is available for small datasets:
+`scripts/train_ecenet_xyz.py` is a single-process, in-memory trainer for any
+ASE-readable file (extxyz etc.) that minimises `E = E_sr + E_lr` on one
+autograd graph when `use_les=True` — forces come from the same graph, and
+stress strain-transforms the cell alongside positions and shifts so the
+Ewald part is covered too:
+
+```python
+from scripts.train_ecenet_xyz import train_ecenet_xyz
+model, les_module, results = train_ecenet_xyz(
+    train_path='data/train-H2O_RPBE-D3.xyz',
+    test_path='data/test-H2O_RPBE-D3.xyz',
+    use_les=True, n_epochs=200)
+```
+
+Upstream builds its charge head lazily on the first forward, so the trainer
+materialises it with one throwaway forward before creating the optimiser or
+restoring a checkpoint. LES checkpoints carry a top-level `les` dict;
+`ECENetCalculator.from_checkpoint` **refuses** them rather than silently
+dropping the long-range term (`ignore_les=True` loads the short-range part
+deliberately). An LES-aware calculator and joint training in the DDP trainers
+are not yet ported.
 
 > **IP / licensing.** The `les` package is CC BY-NC 4.0 (**non-commercial**);
 > it is an optional dependency and none of its code is included in this
@@ -364,6 +387,7 @@ python tests/test_les.py                     # LES: l0/l1 read-out SO(3) + batch
 python tests/test_edge_frame_kernel.py       # fused edge-frame/e2n: gradchecks, model on/off equality (Triton legs need CUDA)
 python tests/test_realspace_kernel.py        # fused nonlinearity: backward equivalence, DFT precision (Triton legs need CUDA)
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
+python tests/test_xyz_trainer.py             # small-dataset trainer: smoke, LES resume, force-FD through E_lr
 ```
 
 ## License
