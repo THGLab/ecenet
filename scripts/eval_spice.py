@@ -241,11 +241,13 @@ def main():
     legacy_used_mp = bool(hp.get('use_message_passing'))
     for k in ['use_message_passing', 'n_mp_steps', 'n_layers_per_mp', 'n_final_layers']:
         hp.pop(k, None)
+    allow_partial_load = False
     if n_mp is None:
         if legacy_used_mp:
             print("WARNING: legacy message-passing checkpoint — the MP architecture "
                   "changed (n_mp stages); MP/final-layer weights will not load, "
                   "evaluating with n_mp=1 (no MP). Re-save hparams with 'n_mp' to load MP.")
+            allow_partial_load = True
         n_mp = 1
 
     model = ECENet(**hp, n_mp=n_mp)
@@ -258,7 +260,19 @@ def main():
     # load just the short-range model.
     if isinstance(state, dict) and 'model' in state and 'lr_module' in state:
         state = state['model']
-    model.load_state_dict(state, strict=False)
+    # Legacy identity-only buffers, dropped exactly as from_checkpoint does.
+    state = {k: v for k, v in state.items()
+             if not k.endswith(('.pre_scale', '.pre_shift'))}
+    # A silent partial load evaluates a half-random model and prints meaningless
+    # MAEs (the footgun from_checkpoint rejects) — fail loudly instead, except
+    # on the announced legacy-MP path above.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if (missing or unexpected) and not allow_partial_load:
+        src = 'checkpoint hparams' if ckpt.get('hparams') else 'CLI arguments'
+        raise RuntimeError(
+            f"Checkpoint weights do not match the model built from {src}: "
+            f"{len(missing)} missing / {len(unexpected)} unexpected keys "
+            f"(e.g. {(list(missing) + list(unexpected))[:3]}).")
     model.eval()
     epoch = ckpt.get('epoch', '?')
     print(f"\nLoaded checkpoint (epoch {epoch}, "
