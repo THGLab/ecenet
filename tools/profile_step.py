@@ -28,6 +28,16 @@ parser.add_argument('--tf32',       action='store_true',
                          'unless --float32 (TF32 is a float32-only mode).')
 parser.add_argument('--n_warmup',   type=int, default=3)
 parser.add_argument('--n_time',     type=int, default=10)
+parser.add_argument('--fuse_nonlin', action='store_true',
+                    help='Enable the fused recompute-in-backward RealSpaceNonlinearity '
+                         '(set_activation_fused; Triton on CUDA+silu, else PyTorch).')
+parser.add_argument('--edge_frame_fused', action='store_true',
+                    help='Enable the fused gather+Wigner-rotate+reshape edge-frame op '
+                         '(set_edge_frame_fused; Triton on CUDA+float32, else eager '
+                         'recompute-in-backward).')
+parser.add_argument('--edge_frame_e2n', action='store_true',
+                    help="With --edge_frame_fused: ALSO fuse the MP layers' "
+                         'pack+unrotate (their step 3).')
 args = parser.parse_args()
 
 dtype  = torch.float32 if args.float32 else torch.float64
@@ -44,6 +54,18 @@ atoms.set_pbc(True)
 calc   = ECENetCalculator.from_checkpoint(args.checkpoint, dtype=dtype)
 model  = calc.model
 device = calc.device
+
+if args.fuse_nonlin:
+    model.set_activation_fused(True)
+    n_set = sum(1 for m in model.modules() if getattr(m, 'fused', False))
+    print(f"[fuse_nonlin] fused RealSpaceNonlinearity on {n_set} module(s)")
+
+if args.edge_frame_fused:
+    from ecenet.edge_frame_kernel import _HAS_TRITON as _ef_triton
+    model.set_edge_frame_fused(True, e2n=args.edge_frame_e2n)
+    path = ('Triton' if (_ef_triton and device.type == 'cuda') else 'eager recompute')
+    e2n = 'on' if args.edge_frame_e2n else 'off'
+    print(f"[edge_frame_fused] fused gather+rotate+reshape ({path}, e2n {e2n})")
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
