@@ -575,11 +575,16 @@ def train_ecenet_xyz(
             if verbose:
                 lr_now = optimizer.param_groups[0]['lr']
                 ssfx = f" S={va_s:.4f}" if use_stress else ""
+                # Test metrics are frozen at the last val improvement (mirrors
+                # the MPtrj trainer); omitted when there is no test set.
+                btsfx = f" S={best_test[2]:.4f}" if use_stress else ""
+                bt = (f" [test E={best_test[0]:.4f} F={best_test[1]:.4f}{btsfx}]"
+                      if test_data else "")
                 print_flush(
                     f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | "
                     f"train E={tr_e:.4f} F={tr_f:.4f} | val E={va_e:.4f} F={va_f:.4f}{ssfx} | "
                     f"lr={lr_now:.1e} | {time.time()-t_start:.0f}s | "
-                    f"best val [weighted]={best_val_weighted:.4f}")
+                    f"best val [weighted]={best_val_weighted:.4f}{bt}")
             if (early_stopping_patience is not None
                     and epochs_without_improvement >= early_stopping_patience):
                 if verbose:
