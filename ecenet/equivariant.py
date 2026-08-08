@@ -78,23 +78,13 @@ class RealSpaceNonlinearity(nn.Module):
         n_grid = int(n_grid)
         self.n_grid = n_grid
 
-        # Uniform grid on [0, 2π)
-        theta = torch.linspace(0, 2 * np.pi, n_grid + 1)[:-1]
-
-        # Synthesis matrix: Fourier → grid
-        # f(θ_k) = Σ_d [A_cos[m]*cos(m*θ_k) + A_sin[m]*sin(m*θ_k)]
-        cos_synth = torch.stack([torch.cos(m * theta) for m in range(m_max + 1)], dim=0)
-        sin_synth = torch.stack([torch.sin(m * theta) for m in range(m_max + 1)], dim=0)
-        self.register_buffer('cos_synth', cos_synth)  # (n_angular, n_grid)
-        self.register_buffer('sin_synth', sin_synth)  # (n_angular, n_grid)
-
-        # Analysis matrix: grid → Fourier
-        # A_cos[m] = norm[m] * Σ_k f(θ_k) * cos(m*θ_k)
-        # norm[0] = 1/N, norm[m>0] = 2/N
-        norm = torch.ones(m_max + 1) * (2.0 / n_grid)
-        norm[0] = 1.0 / n_grid
-        self.register_buffer('cos_analysis', cos_synth.T * norm.unsqueeze(0))  # (n_grid, n_angular)
-        self.register_buffer('sin_analysis', sin_synth.T * norm.unsqueeze(0))  # (n_grid, n_angular)
+        # DFT synthesis/analysis buffers — filled by _build_bases(), which always
+        # computes them in float64 and casts down. See _build_bases for why.
+        self.register_buffer('cos_synth', torch.empty(m_max + 1, n_grid))     # (n_angular, n_grid)
+        self.register_buffer('sin_synth', torch.empty(m_max + 1, n_grid))
+        self.register_buffer('cos_analysis', torch.empty(n_grid, m_max + 1))  # (n_grid, n_angular)
+        self.register_buffer('sin_analysis', torch.empty(n_grid, m_max + 1))
+        self._build_bases()
 
         # No pre-activation affine: this is pure σ(f(θ)). Earlier versions kept
         # fixed scale=1 / shift=0 buffers and applied them in forward, which was
@@ -105,6 +95,54 @@ class RealSpaceNonlinearity(nn.Module):
         # Nonlinearity
         act_map = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh, 'gelu': nn.GELU}
         self.activation = act_map[activation]()
+
+    def _build_bases(self):
+        """Fill the DFT synthesis/analysis buffers, computing them in float64 and
+        casting into whatever dtype the buffers currently hold.
+
+        These are exact deterministic constants (a uniform-grid DFT pair), and the
+        layer's equivariance rests on the analysis quadrature being faithful: the
+        pointwise activation commutes with the bond-frame rotation θ → θ-φ only if
+        synthesis→analysis round-trips a bandlimited function accurately.
+
+        They used to be built at the *default* dtype — torch.linspace with no dtype
+        is float32 — so a later .double() left the buffers float64-typed but
+        float32-*accurate*. That capped the round-trip, and with it the model's
+        rotational consistency, at ~1e-7 no matter the working precision. Hence:
+        always compute in float64, then cast. Rebuilt on every dtype/device change
+        (_apply) and after load_state_dict, so a checkpoint's stored copy can never
+        reintroduce that rounding.
+        """
+        dev = self.cos_synth.device
+        f64 = torch.float64
+        # Uniform grid on [0, 2π)
+        theta = torch.linspace(0, 2 * np.pi, self.n_grid + 1, dtype=f64, device=dev)[:-1]
+        m = torch.arange(self.n_angular, dtype=f64, device=dev).unsqueeze(1)  # (n_ang, 1)
+
+        # Synthesis: f(θ_k) = Σ_m A_cos[m]·cos(m·θ_k) + A_sin[m]·sin(m·θ_k)
+        cos_synth = torch.cos(m * theta)
+        sin_synth = torch.sin(m * theta)
+
+        # Analysis: A_cos[m] = norm[m]·Σ_k f(θ_k)·cos(m·θ_k);  norm[0]=1/N, norm[m>0]=2/N
+        norm = torch.full((self.n_angular,), 2.0 / self.n_grid, dtype=f64, device=dev)
+        norm[0] = 1.0 / self.n_grid
+
+        dt = self.cos_synth.dtype
+        self.cos_synth.copy_(cos_synth.to(dt))
+        self.sin_synth.copy_(sin_synth.to(dt))
+        self.cos_analysis.copy_((cos_synth.T * norm.unsqueeze(0)).to(dt))
+        self.sin_analysis.copy_((sin_synth.T * norm.unsqueeze(0)).to(dt))
+
+    def _apply(self, *args, **kwargs):
+        # .to(dtype)/.double()/.cuda() cast the buffers in place; recompute them at
+        # full precision afterwards rather than inheriting the old dtype's rounding.
+        out = super()._apply(*args, **kwargs)
+        out._build_bases()
+        return out
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        self._build_bases()  # constants — never take them from a checkpoint
 
     def forward(self, A_cos, A_sin):
         """
