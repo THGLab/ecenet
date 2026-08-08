@@ -214,20 +214,29 @@ for gi, layer_group in enumerate(stages):
         h_global = torch.bmm(h_packed, D_block_main_T)
 
         def _weights():
+            # Mirrors ECENetAttentionMPLayer.forward step 4. K = one score slot
+            # per head, or per (head, l) with mp_l_attention.
+            K = mp.n_scores
             f_cut = mp.cutoff_fn(dist_ij, mp.r_cut)
             if mp.aggregation == 'sum':
                 return s * f_cut[:, None]
-            ej_k = edge_j[:, None].expand(-1, H)
-            s_max = torch.full((n_atoms, H), float('-inf'), device=device, dtype=dtype
+            ej_k = edge_j[:, None].expand(-1, K)
+            s_max = torch.full((n_atoms, K), float('-inf'), device=device, dtype=dtype
                                ).scatter_reduce(0, ej_k, s.detach(), reduce='amax',
                                                 include_self=True)
             num = torch.exp(s - s_max[edge_j]) * f_cut[:, None]
-            denom = torch.zeros(n_atoms, H, device=device, dtype=dtype).scatter_add(0, ej_k, num)
-            return num / (denom[edge_j] + mp.softmax_eps)
+            denom = torch.zeros(n_atoms, K, device=device, dtype=dtype).scatter_add(0, ej_k, num)
+            a = num / (denom[edge_j] + mp.softmax_eps)
+            if mp.msg_envelope:
+                a = a * f_cut[:, None]
+            return a
         _, a = time_fn(f"  MP {mp.aggregation} weights", _weights)
 
         hb = mp.n_base // H
-        contrib = h_global.reshape(n_e, H, hb, mp.n_sph) * a[:, :, None, None]
+        # Per-(head, l) weights expand to per-(head, spherical index) via l_of_s
+        # (all-zero when l_attention is off → the single per-head weight, as before).
+        a_full = a.reshape(n_e, H, mp.n_scores_per_head)[:, :, mp.l_of_s]
+        contrib = h_global.reshape(n_e, H, hb, mp.n_sph) * a_full[:, :, None, :]
         idx = edge_j[:, None, None, None].expand_as(contrib)
         time_fn("  MP scatter_add (aggregate to atoms)",
                 lambda: torch.zeros(n_atoms, H, hb, mp.n_sph, device=device, dtype=dtype
