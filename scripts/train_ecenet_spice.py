@@ -356,6 +356,8 @@ def train_ecenet_spice(
     force_weight=1.0,
     loss='mse',
     huber_delta=0.01,
+    eval_metric='mae',       # 'mae' | 'rmse' — reported metrics AND the best-val
+                             # selection (the training loss itself is unchanged)
     eval_every=1,
     eval_batch_size=32,
     seed=42,
@@ -378,6 +380,8 @@ def train_ecenet_spice(
     is_ddp = world_size > 1
     is_main = (rank == 0)
     verbose = verbose and is_main
+    if eval_metric not in ('mae', 'rmse'):
+        raise ValueError(f"eval_metric must be 'mae' or 'rmse', got {eval_metric!r}")
 
     if device is None:
         if torch.cuda.is_available():
@@ -685,14 +689,25 @@ def train_ecenet_spice(
         print_flush("  Checkpoint saved.")
 
     # ── Evaluation (rank 0 only) ──────────────────────────────────────────
+    # eval_metric='mae': mean |err|. 'rmse': sqrt(mean err²) — same accumulation
+    # with |err| swapped for err², and a sqrt at the end.
+    def _err(diff):
+        return (diff ** 2 if eval_metric == 'rmse' else diff.abs())
+
+    def _final(total, count):
+        if not count:
+            return float('nan')
+        m = total / count
+        return math.sqrt(m) if eval_metric == 'rmse' else m
+
     def evaluate(pos_list, frc_list, eng_target, typ_list, max_samples=None):
         eval_fwd.eval()          # toggles the model AND the LES head
         indices = list(range(len(pos_list)))
         if max_samples is not None and max_samples < len(indices):
             indices = list(np.random.choice(indices, max_samples, replace=False))
 
-        energy_abs = 0.0
-        force_abs  = 0.0
+        energy_acc = 0.0
+        force_acc  = 0.0
         force_count = 0
 
         for start in range(0, len(indices), eval_batch_size):
@@ -713,13 +728,12 @@ def train_ecenet_spice(
 
             for k, i in enumerate(batch):
                 n = pos_list[i].shape[0]
-                energy_abs  += (eng_b[k] - eng_target[i]).abs().item() / n
-                force_abs   += (-grads[k] - frc_list[i]).abs().sum().item()
+                energy_acc  += _err((eng_b[k] - eng_target[i]) / n).item()
+                force_acc   += _err(-grads[k] - frc_list[i]).sum().item()
                 force_count += frc_list[i].numel()
 
         eval_fwd.train()
-        n = len(indices)
-        return energy_abs / n, force_abs / force_count
+        return _final(energy_acc, len(indices)), _final(force_acc, force_count)
 
     # ── Training loop ─────────────────────────────────────────────────────
     n_train_actual = len(pos_train)
@@ -935,16 +949,16 @@ def train_ecenet_spice(
         test_e_mae,  test_f_mae  = evaluate(pos_test,  frc_test,  eng_test,  typ_test)
         total_time = time.time() - t_start
 
-        print_flush("\nFinal Results (MAE):")
+        print_flush(f"\nFinal Results ({eval_metric.upper()}):")
         print_flush(f"  Train: E={train_e_mae:.4f} eV/atom, F={train_f_mae:.4f} eV/Å")
         print_flush(f"  Val:   E={val_e_mae:.4f} eV/atom, F={val_f_mae:.4f} eV/Å")
         print_flush(f"  Test:  E={test_e_mae:.4f} eV/atom, F={test_f_mae:.4f} eV/Å")
         print_flush(f"Total time: {total_time:.1f}s")
 
         results = {
-            'train_energy_mae': train_e_mae, 'train_force_mae': train_f_mae,
-            'val_energy_mae':   val_e_mae,   'val_force_mae':   val_f_mae,
-            'test_energy_mae':  test_e_mae,  'test_force_mae':  test_f_mae,
+            f'train_energy_{eval_metric}': train_e_mae, f'train_force_{eval_metric}': train_f_mae,
+            f'val_energy_{eval_metric}':   val_e_mae,   f'val_force_{eval_metric}':   val_f_mae,
+            f'test_energy_{eval_metric}':  test_e_mae,  f'test_force_{eval_metric}':  test_f_mae,
             'n_params': n_params, 'time': total_time,
             'les_module': les_module,   # None unless use_les
         }

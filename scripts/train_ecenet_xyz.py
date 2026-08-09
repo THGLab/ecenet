@@ -174,6 +174,8 @@ def train_ecenet_xyz(
     stress_conv=1.0,          # ASE info['stress'] is already eV/Å³
     loss='mse',
     huber_delta=0.01,
+    eval_metric='mae',        # 'mae' | 'rmse' — reported metrics AND the best-val
+                              # selection (the training loss itself is unchanged)
     eval_every=1,
     eval_batch_size=16,
     seed=42,
@@ -184,6 +186,8 @@ def train_ecenet_xyz(
     verbose=True,
 ):
     use_stress = stress_weight > 0
+    if eval_metric not in ('mae', 'rmse'):
+        raise ValueError(f"eval_metric must be 'mae' or 'rmse', got {eval_metric!r}")
 
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -476,30 +480,39 @@ def train_ecenet_xyz(
             les_module.train(train)
 
     # ── Evaluation ────────────────────────────────────────────────────────
+    # eval_metric='mae': mean |err|. 'rmse': sqrt(mean err²) — same accumulation
+    # with the per-element |err| swapped for err², and a sqrt at the end.
+    def _err(diff):
+        return (diff ** 2 if eval_metric == 'rmse' else diff.abs())
+
+    def _final(total, count):
+        if not count:
+            return float('nan')
+        m = total / count
+        return math.sqrt(m) if eval_metric == 'rmse' else m
+
     def evaluate(data, max_samples=None):
         _train_mode(False)
         if max_samples is not None and max_samples < len(data):
             idx = np.random.choice(len(data), max_samples, replace=False)
             data = [data[int(i)] for i in idx]
-        e_abs = f_abs = s_abs = 0.0
+        e_acc = f_acc = s_acc = 0.0
         f_count = s_count = n = 0
         for start in range(0, len(data), eval_batch_size):
             batch = data[start:start + eval_batch_size]
             with torch.enable_grad():
                 energies, forces_list, stress_list = predict(batch, create_graph=False)
             for k, d in enumerate(batch):
-                e_abs += (energies[k] - d['energy']).abs().item() / d['n_atoms']
+                e_acc += _err((energies[k] - d['energy']) / d['n_atoms']).item()
                 if forces_list is not None:
-                    f_abs += (forces_list[k] - d['forces']).abs().sum().item()
+                    f_acc += _err(forces_list[k] - d['forces']).sum().item()
                     f_count += d['forces'].numel()
                 if stress_list is not None and d['stress'] is not None:
-                    s_abs += (stress_list[k] - d['stress']).abs().sum().item()
+                    s_acc += _err(stress_list[k] - d['stress']).sum().item()
                     s_count += d['stress'].numel()
             n += len(batch)
         _train_mode(True)
-        f_mae = f_abs / f_count if f_count else float('nan')
-        s_mae = s_abs / s_count if s_count else float('nan')
-        return (e_abs / n if n else float('nan')), f_mae, s_mae
+        return _final(e_acc, n), _final(f_acc, f_count), _final(s_acc, s_count)
 
     # ── Training loop ─────────────────────────────────────────────────────
     if verbose:
@@ -603,15 +616,16 @@ def train_ecenet_xyz(
     va = evaluate(val_data)
     te = evaluate(test_data) if test_data else (float('nan'),) * 3
     if verbose:
-        print_flush("\nFinal Results (MAE):")
+        print_flush(f"\nFinal Results ({eval_metric.upper()}):")
         print_flush(f"  Train: E={tr[0]:.4f} eV/atom F={tr[1]:.4f} eV/Å S={tr[2]:.4e} eV/Å³")
         print_flush(f"  Val:   E={va[0]:.4f} eV/atom F={va[1]:.4f} eV/Å S={va[2]:.4e} eV/Å³")
         print_flush(f"  Test:  E={te[0]:.4f} eV/atom F={te[1]:.4f} eV/Å S={te[2]:.4e} eV/Å³")
         print_flush(f"Total time: {time.time()-t_start:.1f}s")
+    m = eval_metric
     results = {
-        'train_energy_mae': tr[0], 'train_force_mae': tr[1], 'train_stress_mae': tr[2],
-        'val_energy_mae': va[0], 'val_force_mae': va[1], 'val_stress_mae': va[2],
-        'test_energy_mae': te[0], 'test_force_mae': te[1], 'test_stress_mae': te[2],
+        f'train_energy_{m}': tr[0], f'train_force_{m}': tr[1], f'train_stress_{m}': tr[2],
+        f'val_energy_{m}': va[0], f'val_force_{m}': va[1], f'val_stress_{m}': va[2],
+        f'test_energy_{m}': te[0], f'test_force_{m}': te[1], f'test_stress_{m}': te[2],
         'n_params': n_params, 'n_types': n_types, 'type_map': type_map,
     }
     return model, les_module, results
