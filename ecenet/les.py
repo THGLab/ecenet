@@ -95,7 +95,9 @@ class LESLongRange(nn.Module):
 
         l0        (N, C)   per-atom invariant descriptor (any flattenable shape)
         positions (N, 3)   in Å, on the same autograd graph as the SR energy
-        cell      (B, 3, 3) or (3, 3); None → zero cell (non-periodic)
+        cell      (B, 3, 3) or (3, 3); None → isolated / non-periodic (same
+                  physics as a zero cell, but skips upstream's per-structure
+                  degenerate-cell det check — pass None whenever possible)
         batch     (N,) structure index per atom; None → single structure
 
         Returns the per-structure long-range energy in eV (with
@@ -104,10 +106,14 @@ class LESLongRange(nn.Module):
         if batch is None:
             batch = torch.zeros(positions.shape[0], dtype=torch.long,
                                 device=positions.device)
-        n_struct = int(batch.max().item()) + 1
-        if cell is None:
-            cell = torch.zeros(n_struct, 3, 3, dtype=positions.dtype,
-                               device=positions.device)
+        # cell=None is passed straight through: upstream short-circuits its
+        # per-structure degenerate-cell check at `box_now is None`, whereas a
+        # fabricated zero cell forces a det() per structure per call — a
+        # cuSOLVER call (or a GPU→CPU sync) times batch size, every training
+        # step. Physically identical: zero cell and no cell both mean the
+        # isolated (direct-sum) path.
+        if cell is not None:
+            cell = cell.view(-1, 3, 3)
         # Scope the default dtype to the input's so upstream's lazily built
         # charge MLP (and any default-dtype internals) match float64 inputs.
         prev_dtype = torch.get_default_dtype()
@@ -116,7 +122,7 @@ class LESLongRange(nn.Module):
             result = self.les(
                 desc=l0.reshape(l0.shape[0], -1),
                 positions=positions,
-                cell=cell.view(-1, 3, 3),
+                cell=cell,
                 batch=batch,
                 compute_energy=True,
             )
