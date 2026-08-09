@@ -213,14 +213,26 @@ class ECENet(nn.Module):
         #   and l1 messages, so equivariance is untouched. Zero-init score →
         #   uniform attention at init; on a lone in-edge the weight reduces to
         #   f_cut(r), giving the read-out absolute-distance decay.
-        if les_readout not in ('sum', 'softmax'):
-            raise ValueError("les_readout must be 'sum' or 'softmax', "
+        # 'edge': Allegro-LES-style per-edge charge decomposition — a linear
+        #   scalar head on each edge's invariants, scatter-summed per atom, so
+        #   l0 has width 1 and IS the latent charge (the LES wrapper must be
+        #   called with l0_is_charge=True; upstream's atomwise head is
+        #   bypassed). Standard init, deliberately NOT zero-init: the LES
+        #   energy is quadratic in the charges, so q ≡ 0 is a gradient-free
+        #   saddle a zero-init head could never leave. Smoothness at r_cut is
+        #   inherited from the edge features' own radial envelope, as in
+        #   Allegro-LES's EdgewiseReduce.
+        if les_readout not in ('sum', 'softmax', 'edge'):
+            raise ValueError("les_readout must be 'sum', 'softmax' or 'edge', "
                              f"got {les_readout!r}")
         self.les_readout = les_readout
+        self._l0_dim = 1 if les_readout == 'edge' else 2 * embed_dim
         if les_readout == 'softmax':
             self.les_score = nn.Linear(2 * embed_dim, 1)
             nn.init.zeros_(self.les_score.weight)
             nn.init.zeros_(self.les_score.bias)
+        elif les_readout == 'edge':
+            self.les_edge_charge = nn.Linear(2 * embed_dim, 1, bias=False)
 
         # ── Element(+distance)-conditioned FiLM gate (optional) ───────────────
         # A small MLP on [embed(type_i), embed(type_j), φ(r_ij)] → a scale γ on
@@ -535,7 +547,13 @@ class ECENet(nn.Module):
         h_l0 = h_sum[:, :, 0]                                       # (E, 2*embed_dim)
 
         a = None
-        if self.les_readout == 'softmax':
+        if self.les_readout == 'edge':
+            # Per-edge charge decomposition (Allegro-LES style): a scalar per
+            # edge from its invariants, summed at the receiver. The result is
+            # already the latent charge — width 1, no downstream head. The
+            # weight applies to l0 only; l1 keeps the plain unweighted sum.
+            h_l0 = self.les_edge_charge(h_l0)                        # (E, 1)
+        elif self.les_readout == 'softmax':
             # Same shape as the MP layers' softmax path (one score slot):
             #   a_e = exp(s_e)·f_cut_e / (Σ_{e'→j} exp(s_e')·f_cut_e' + eps) · f_cut_e
             # The trailing f_cut is the envelope multiplied back in — the
@@ -557,7 +575,7 @@ class ECENet(nn.Module):
             a = num / (denom[edge_j] + 1e-6) * f_cut                 # (E,)
             h_l0 = a[:, None] * h_l0
 
-        l0 = torch.zeros(n_atoms, n_base, device=device, dtype=dtype
+        l0 = torch.zeros(n_atoms, h_l0.shape[1], device=device, dtype=dtype
                          ).scatter_add(0, edge_j[:, None].expand_as(h_l0), h_l0)
 
         if not with_l1:
@@ -648,7 +666,7 @@ class ECENet(nn.Module):
             energy = torch.zeros(1, device=device, dtype=dtype).squeeze()
             if return_embeddings:
                 N = len(types)
-                l0 = torch.zeros(N, 2 * self.embed_dim, device=device, dtype=dtype)
+                l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
                 if l0_only:
                     return energy, l0
                 l1 = torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype)
@@ -729,7 +747,7 @@ class ECENet(nn.Module):
             energy = torch.zeros(1, device=device, dtype=dtype).squeeze()
             if return_embeddings:
                 N = len(types)
-                l0 = torch.zeros(N, 2 * self.embed_dim, device=device, dtype=dtype)
+                l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
                 if l0_only:
                     return energy, l0
                 l1 = torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype)
@@ -846,7 +864,7 @@ class ECENet(nn.Module):
         if total_edges == 0:
             if return_embeddings:
                 n_ch = 2 * self.embed_dim
-                l0_list = [torch.zeros(p.shape[0], n_ch, dtype=dtype, device=device)
+                l0_list = [torch.zeros(p.shape[0], self._l0_dim, dtype=dtype, device=device)
                            for p in positions_list]
                 if l0_only:
                     return energies, l0_list

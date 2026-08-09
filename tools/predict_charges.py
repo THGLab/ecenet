@@ -94,14 +94,18 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
         atoms.get_positions(), cell_np, periodic,
         hp['r_cut_edge'], hp['r_cut_neighbor'], device, dtype)
 
+    # les_readout='edge': l0 IS the charge; the LES module holds no state.
+    is_charge = hp.get('les_readout', 'sum') == 'edge'
     with torch.no_grad():
         _, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
                                   return_embeddings=True, l0_only=True)
-        les_module(l0, pos, cell=cell)          # materialise the lazy head...
+        les_module(l0, pos, cell=cell,
+                   l0_is_charge=is_charge)      # materialise the lazy head...
         les_module = les_module.to(device=device, dtype=dtype)
         les_module.load_state_dict(les_state)   # ...then load the trained one
         les_module.eval()
-        e_lr, q = les_module(l0, pos, cell=cell, return_charges=True)
+        e_lr, q = les_module(l0, pos, cell=cell, return_charges=True,
+                             l0_is_charge=is_charge)
 
     out = {
         'symbols': np.array(symbols),

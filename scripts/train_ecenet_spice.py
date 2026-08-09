@@ -52,6 +52,9 @@ class _MultiForwardWrapper(nn.Module):
         super().__init__()
         self.model = model
         self.les = les_module
+        # les_readout='edge': l0 IS the latent charge; upstream's atomwise
+        # head is bypassed (the LES module then holds no parameters).
+        self.les_is_charge = getattr(model, 'les_readout', 'sum') == 'edge'
 
     def forward(self, positions_list, types_list):
         if self.les is None:
@@ -64,7 +67,8 @@ class _MultiForwardWrapper(nn.Module):
             torch.full((p.shape[0],), b, dtype=torch.long, device=p.device)
             for b, p in enumerate(positions_list)])
         return e_sr + self.les(l0, pos, batch=batch,
-                               n_struct=len(positions_list))  # (B,)
+                               n_struct=len(positions_list),
+                               l0_is_charge=self.les_is_charge)  # (B,)
 
 
 def print_flush(*args, **kwargs):
@@ -498,14 +502,15 @@ def train_ecenet_spice(
 
     raw_model = model   # unwrapped reference for eval + checkpointing
 
-    if is_ddp and les_readout == 'softmax' and not use_les:
-        # les_score would never enter the forward graph (nothing calls
-        # return_embeddings during training), and a parameter that never
-        # receives a gradient breaks DDP's find_unused_parameters=False
-        # collective. Refuse loudly rather than hang/error mid-epoch.
-        raise ValueError("les_readout='softmax' without use_les=True is not "
-                         "supported under DDP: the les_score parameter would "
-                         "be unused in every forward.")
+    if is_ddp and les_readout != 'sum' and not use_les:
+        # The read-out's parameters (les_score / les_edge_charge) would never
+        # enter the forward graph (nothing calls return_embeddings during
+        # training), and a parameter that never receives a gradient breaks
+        # DDP's find_unused_parameters=False collective. Refuse loudly rather
+        # than hang/error mid-epoch.
+        raise ValueError(f"les_readout={les_readout!r} without use_les=True "
+                         "is not supported under DDP: its read-out parameters "
+                         "would be unused in every forward.")
 
     # ── LES long-range module (optional) ──────────────────────────────────
     # Upstream builds its charge head lazily on the first forward (it infers
@@ -521,7 +526,8 @@ def train_ecenet_spice(
             _, l0_list = model.forward_batch_multi(
                 [pos_train[0]], [typ_train[0]],
                 return_embeddings=True, l0_only=True)
-            les_module(l0_list[0], pos_train[0])
+            les_module(l0_list[0], pos_train[0],
+                       l0_is_charge=(les_readout == 'edge'))
         les_module = les_module.to(device=device, dtype=dtype)
 
     all_params = list(model.parameters())

@@ -226,6 +226,68 @@ def test_softmax_readout_variants_consistent():
     print("  softmax read-out consistent across forward variants (incl. zero-edge)")
 
 
+def test_edge_readout_model():
+    """les_readout='edge': l0 has width 1, is SO(3)-invariant, consistent
+    across forward variants, and zero for zero-edge structures."""
+    m = make_model(seed=0, les_readout='edge')
+    pos, types = random_structure()
+    Q = rand_rotation()
+    _, l0_a = m(pos, types, return_embeddings=True, l0_only=True)
+    _, l0_b = m(pos @ Q.T, types, return_embeddings=True, l0_only=True)
+    assert l0_a.shape == (len(types), 1), f"edge l0 shape: {tuple(l0_a.shape)}"
+    d0 = (l0_a - l0_b).abs().max()
+    assert d0 < TOL, f"edge read-out charge not invariant: {d0:.3e}"
+    assert l0_a.abs().max() > 0, "edge read-out is identically zero " \
+        "(zero-init would be a gradient-free saddle — must be standard init)"
+
+    structs = [random_structure(n, seed=s) for n, s in [(5, 1), (1, 2), (7, 3)]]
+    energies, l0_list = m.forward_batch_multi(
+        [p for p, _ in structs], [t for _, t in structs],
+        return_embeddings=True, l0_only=True)
+    for b, (pos_b, types_b) in enumerate(structs):
+        _, l0_ref = m(pos_b, types_b, return_embeddings=True, l0_only=True)
+        dl = (l0_list[b] - l0_ref).abs().max()
+        assert dl < TOL, f"structure {b}: dl0={dl:.3e}"
+    assert l0_list[1].shape == (1, 1) and l0_list[1].abs().max() == 0.0
+    print(f"  edge read-out: width-1 invariant charge ({d0:.1e}), "
+          "variants consistent, zero-edge → q=0")
+
+
+def test_edge_readout_les_energy():
+    """l0_is_charge=True: isolated fast path and upstream's latent_charges
+    path agree, and the LES module holds no parameters (head bypassed)."""
+    if not HAVE_LES:
+        print("  skipped (`les` not installed)")
+        return
+    torch.manual_seed(4)
+    lr = LESLongRange().double()
+    g = torch.Generator().manual_seed(11)
+    sizes = [4, 6]
+    pos = torch.randn(sum(sizes), 3, generator=g, dtype=DTYPE) * 2.0
+    q_in = torch.randn(sum(sizes), 1, generator=g, dtype=DTYPE) * 0.3
+    batch = torch.cat([torch.full((n,), b, dtype=torch.long)
+                       for b, n in enumerate(sizes)])
+
+    p_a = pos.clone().requires_grad_(True)
+    e_fast, q_out = lr(q_in, p_a, batch=batch, n_struct=2,
+                       return_charges=True, l0_is_charge=True)
+    f_a = torch.autograd.grad(e_fast.sum(), p_a)[0]
+    assert (q_out - q_in.reshape(-1)).abs().max() == 0.0, \
+        "l0_is_charge must return the input charges untouched"
+    assert len(list(lr.parameters())) == 0, \
+        "LES module should hold no parameters when the head is bypassed"
+
+    p_b = pos.clone().requires_grad_(True)
+    res = lr.les(latent_charges=q_in.reshape(-1), positions=p_b, cell=None,
+                 batch=batch, compute_energy=True)
+    f_b = torch.autograd.grad(res["E_lr"].sum(), p_b)[0]
+    de = (e_fast - res["E_lr"].reshape(e_fast.shape)).abs().max()
+    df = (f_a - f_b).abs().max()
+    assert de < 1e-10 and df < 1e-10, f"mismatch: dE={de:.3e}, dF={df:.3e}"
+    print(f"  l0_is_charge: fast path == upstream latent_charges "
+          f"(dE={de:.1e}, dF={df:.1e}), module parameter-free")
+
+
 def test_les_readout_validation():
     try:
         ECENet(**COMMON, les_readout='mean')
@@ -369,6 +431,8 @@ if __name__ == "__main__":
     test_softmax_readout_so3()
     test_softmax_readout_dimer_weight()
     test_softmax_readout_variants_consistent()
+    test_edge_readout_model()
+    test_edge_readout_les_energy()
     test_les_readout_validation()
     test_lazy_import()
     test_missing_dep_error()

@@ -93,10 +93,16 @@ class LESLongRange(nn.Module):
                 cell: torch.Tensor | None = None,
                 batch: torch.Tensor | None = None,
                 return_charges: bool = False,
-                n_struct: int | None = None):
+                n_struct: int | None = None,
+                l0_is_charge: bool = False):
         """Long-range energy for one structure or a packed batch.
 
-        l0        (N, C)   per-atom invariant descriptor (any flattenable shape)
+        l0        (N, C)   per-atom invariant descriptor (any flattenable
+                  shape) — or, with ``l0_is_charge=True``, the latent charge
+                  itself ((N,) or (N, 1); a model built with
+                  ``les_readout='edge'`` emits this), in which case
+                  upstream's atomwise head is bypassed entirely and this
+                  module holds no parameters.
         positions (N, 3)   in Å, on the same autograd graph as the SR energy
         cell      (B, 3, 3) or (3, 3); None → isolated / non-periodic, served
                   by the vectorized batched path below (verified equal to
@@ -115,26 +121,38 @@ class LESLongRange(nn.Module):
                 n_struct = 1
         if cell is None:
             return self._isolated_batched(l0, positions, batch, n_struct,
-                                          return_charges)
+                                          return_charges, l0_is_charge)
         # Scope the default dtype to the input's so upstream's lazily built
         # charge MLP (and any default-dtype internals) match float64 inputs.
         prev_dtype = torch.get_default_dtype()
         torch.set_default_dtype(positions.dtype)
         try:
-            result = self.les(
-                desc=l0.reshape(l0.shape[0], -1),
-                positions=positions,
-                cell=cell.view(-1, 3, 3),
-                batch=batch,
-                compute_energy=True,
-            )
+            if l0_is_charge:
+                result = self.les(
+                    latent_charges=l0.reshape(-1),
+                    positions=positions,
+                    cell=cell.view(-1, 3, 3),
+                    batch=batch,
+                    compute_energy=True,
+                )
+            else:
+                result = self.les(
+                    desc=l0.reshape(l0.shape[0], -1),
+                    positions=positions,
+                    cell=cell.view(-1, 3, 3),
+                    batch=batch,
+                    compute_energy=True,
+                )
         finally:
             torch.set_default_dtype(prev_dtype)
         if return_charges:
-            return result["E_lr"], result["latent_charges"]
+            charges = (l0.reshape(-1) if l0_is_charge
+                       else result["latent_charges"])
+            return result["E_lr"], charges
         return result["E_lr"]
 
-    def _isolated_batched(self, l0, positions, batch, n_struct, return_charges):
+    def _isolated_batched(self, l0, positions, batch, n_struct, return_charges,
+                          l0_is_charge=False):
         """Isolated (non-periodic) long-range energy, vectorized over the batch.
 
         Upstream's ``Les.forward`` loops over structures in Python — masked
@@ -159,12 +177,15 @@ class LESLongRange(nn.Module):
         """
         from les.module.ewald import make_kernels
 
-        prev_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(positions.dtype)
-        try:
-            q = self.les.atomwise(l0.reshape(l0.shape[0], -1), batch)
-        finally:
-            torch.set_default_dtype(prev_dtype)
+        if l0_is_charge:
+            q = l0.reshape(-1)          # les_readout='edge': l0 IS the charge
+        else:
+            prev_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(positions.dtype)
+            try:
+                q = self.les.atomwise(l0.reshape(l0.shape[0], -1), batch)
+            finally:
+                torch.set_default_dtype(prev_dtype)
         charges = q
         if q.dim() == 1:
             q = q.unsqueeze(1)
