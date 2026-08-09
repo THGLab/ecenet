@@ -122,7 +122,7 @@ def train_ecenet_xyz(
     # Long-range (LES)
     use_les=False,
     les_arguments=None,      # extra kwargs for upstream les.Les (see ecenet/les.py)
-    les_readout='sum',       # (l0,l1) read-out: 'sum' | 'softmax' (attention + envelope)
+    les_readout='sum',       # (l0,l1) read-out: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     # Geometry
     r_cut_edge=5.0,
     r_cut_neighbor=4.0,
@@ -299,7 +299,7 @@ def train_ecenet_xyz(
         les_module = LESLongRange(les_arguments)
         # les_readout='edge': the model's l0 IS the latent charge; upstream's
         # atomwise head is bypassed and the LES module holds no parameters.
-        les_is_charge = (les_readout == 'edge')
+        les_is_charge = les_readout in ('edge', 'edge_basis')
         d0 = train_data[0]
         with torch.no_grad():
             _, l0 = model.forward_pbc(

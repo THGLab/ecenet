@@ -95,7 +95,7 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
         hp['r_cut_edge'], hp['r_cut_neighbor'], device, dtype)
 
     # les_readout='edge': l0 IS the charge; the LES module holds no state.
-    is_charge = hp.get('les_readout', 'sum') == 'edge'
+    is_charge = hp.get('les_readout', 'sum') in ('edge', 'edge_basis')
     with torch.no_grad():
         _, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
                                   return_embeddings=True, l0_only=True)

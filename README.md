@@ -237,6 +237,7 @@ aggregated from the final edge invariants (available on all trainers and
 | `'sum'` (default) | parameter-free scatter-sum over the atom's in-edges — extensive in coordination |
 | `'softmax'` | attention: a zero-init linear score on each edge's invariants, segment-softmax over the receiver's in-edges with `f_cut` as a multiplicative log-bias, envelope multiplied back in (exactly the MP layers' softmax + `mp_msg_envelope` recipe) — intensive, and decaying with absolute distance |
 | `'edge'` | Allegro-LES-style per-edge charge decomposition: a linear scalar head on each edge's invariants, scatter-summed per atom — the width-1 `l0` **is** the latent charge, so upstream's atomwise head is bypassed (the wrapper is called with `l0_is_charge=True`; standard init, since a zero-init charge head would sit on the quadratic energy's gradient-free saddle) |
+| `'edge_basis'` | `'edge'` with the per-edge **energy** readout's trick: the head emits `n_max_d` channels dotted with the cutoff-enveloped radial basis of the bond length (exactly mirroring the energy head), so each bond's charge contribution has a learnable distance profile and vanishes exactly at `r_cut` |
 
 The softmax weight is an invariant scalar shared by the `l0` and `l1`
 messages, so SO(3) behaviour is untouched (verified in `tests/test_les.py`,

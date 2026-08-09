@@ -54,7 +54,7 @@ class _MultiForwardWrapper(nn.Module):
         self.les = les_module
         # les_readout='edge': l0 IS the latent charge; upstream's atomwise
         # head is bypassed (the LES module then holds no parameters).
-        self.les_is_charge = getattr(model, 'les_readout', 'sum') == 'edge'
+        self.les_is_charge = getattr(model, 'les_readout', 'sum') in ('edge', 'edge_basis')
 
     def forward(self, positions_list, types_list):
         if self.les is None:
@@ -527,7 +527,7 @@ def train_ecenet_spice(
                 [pos_train[0]], [typ_train[0]],
                 return_embeddings=True, l0_only=True)
             les_module(l0_list[0], pos_train[0],
-                       l0_is_charge=(les_readout == 'edge'))
+                       l0_is_charge=(les_readout in ('edge', 'edge_basis')))
         les_module = les_module.to(device=device, dtype=dtype)
 
     all_params = list(model.parameters())

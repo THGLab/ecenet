@@ -227,30 +227,45 @@ def test_softmax_readout_variants_consistent():
 
 
 def test_edge_readout_model():
-    """les_readout='edge': l0 has width 1, is SO(3)-invariant, consistent
-    across forward variants, and zero for zero-edge structures."""
-    m = make_model(seed=0, les_readout='edge')
-    pos, types = random_structure()
-    Q = rand_rotation()
-    _, l0_a = m(pos, types, return_embeddings=True, l0_only=True)
-    _, l0_b = m(pos @ Q.T, types, return_embeddings=True, l0_only=True)
-    assert l0_a.shape == (len(types), 1), f"edge l0 shape: {tuple(l0_a.shape)}"
-    d0 = (l0_a - l0_b).abs().max()
-    assert d0 < TOL, f"edge read-out charge not invariant: {d0:.3e}"
-    assert l0_a.abs().max() > 0, "edge read-out is identically zero " \
-        "(zero-init would be a gradient-free saddle — must be standard init)"
+    """les_readout='edge'/'edge_basis': l0 has width 1, is SO(3)-invariant,
+    consistent across forward variants, and zero for zero-edge structures."""
+    for mode in ('edge', 'edge_basis'):
+        m = make_model(seed=0, les_readout=mode)
+        pos, types = random_structure()
+        Q = rand_rotation()
+        _, l0_a = m(pos, types, return_embeddings=True, l0_only=True)
+        _, l0_b = m(pos @ Q.T, types, return_embeddings=True, l0_only=True)
+        assert l0_a.shape == (len(types), 1), f"{mode} l0 shape: {tuple(l0_a.shape)}"
+        d0 = (l0_a - l0_b).abs().max()
+        assert d0 < TOL, f"{mode} read-out charge not invariant: {d0:.3e}"
+        assert l0_a.abs().max() > 0, f"{mode} read-out is identically zero " \
+            "(zero-init would be a gradient-free saddle — must be standard init)"
 
-    structs = [random_structure(n, seed=s) for n, s in [(5, 1), (1, 2), (7, 3)]]
-    energies, l0_list = m.forward_batch_multi(
-        [p for p, _ in structs], [t for _, t in structs],
-        return_embeddings=True, l0_only=True)
-    for b, (pos_b, types_b) in enumerate(structs):
-        _, l0_ref = m(pos_b, types_b, return_embeddings=True, l0_only=True)
-        dl = (l0_list[b] - l0_ref).abs().max()
-        assert dl < TOL, f"structure {b}: dl0={dl:.3e}"
-    assert l0_list[1].shape == (1, 1) and l0_list[1].abs().max() == 0.0
-    print(f"  edge read-out: width-1 invariant charge ({d0:.1e}), "
-          "variants consistent, zero-edge → q=0")
+        structs = [random_structure(n, seed=s) for n, s in [(5, 1), (1, 2), (7, 3)]]
+        energies, l0_list = m.forward_batch_multi(
+            [p for p, _ in structs], [t for _, t in structs],
+            return_embeddings=True, l0_only=True)
+        for b, (pos_b, types_b) in enumerate(structs):
+            _, l0_ref = m(pos_b, types_b, return_embeddings=True, l0_only=True)
+            dl = (l0_list[b] - l0_ref).abs().max()
+            assert dl < TOL, f"{mode} structure {b}: dl0={dl:.3e}"
+        assert l0_list[1].shape == (1, 1) and l0_list[1].abs().max() == 0.0
+        print(f"  {mode} read-out: width-1 invariant charge ({d0:.1e}), "
+              "variants consistent, zero-edge → q=0")
+
+    # 'edge_basis' only: the per-bond charge vanishes exactly at r_cut (the
+    # dotted radial basis carries the envelope), and the head has n_max_d
+    # channels rather than 1.
+    m = make_model(seed=0, les_readout='edge_basis')
+    assert m.les_edge_charge.weight.shape[0] == m.n_max_d
+    types2 = torch.tensor([0, 1])
+    eps_r = 1e-9
+    pos_at = torch.tensor([[0.0, 0.0, 0.0],
+                           [0.0, 0.0, m.r_cut_edge - eps_r]], dtype=DTYPE)
+    _, q_at = m(pos_at, types2, return_embeddings=True, l0_only=True)
+    assert q_at.abs().max() < 1e-6, \
+        f"edge_basis charge does not vanish at r_cut: {q_at.abs().max():.3e}"
+    print("  edge_basis: n_max_d-channel head, per-bond charge → 0 at r_cut")
 
 
 def test_edge_readout_les_energy():

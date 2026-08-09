@@ -222,17 +222,27 @@ class ECENet(nn.Module):
         #   saddle a zero-init head could never leave. Smoothness at r_cut is
         #   inherited from the edge features' own radial envelope, as in
         #   Allegro-LES's EdgewiseReduce.
-        if les_readout not in ('sum', 'softmax', 'edge'):
-            raise ValueError("les_readout must be 'sum', 'softmax' or 'edge', "
-                             f"got {les_readout!r}")
+        # 'edge_basis': 'edge' with the per-edge energy readout's trick — the
+        #   head emits n_max_d channels dotted with the (cutoff-enveloped)
+        #   radial basis of the edge length, exactly mirroring _apply_output.
+        #   The per-bond charge contribution gains an explicit learnable
+        #   distance profile and vanishes exactly at r_cut (n_max_d=None
+        #   falls back to a scalar × f_cut, as in the energy readout).
+        if les_readout not in ('sum', 'softmax', 'edge', 'edge_basis'):
+            raise ValueError("les_readout must be 'sum', 'softmax', 'edge' or "
+                             f"'edge_basis', got {les_readout!r}")
         self.les_readout = les_readout
-        self._l0_dim = 1 if les_readout == 'edge' else 2 * embed_dim
+        _edge_mode = les_readout in ('edge', 'edge_basis')
+        self._l0_dim = 1 if _edge_mode else 2 * embed_dim
         if les_readout == 'softmax':
             self.les_score = nn.Linear(2 * embed_dim, 1)
             nn.init.zeros_(self.les_score.weight)
             nn.init.zeros_(self.les_score.bias)
-        elif les_readout == 'edge':
-            self.les_edge_charge = nn.Linear(2 * embed_dim, 1, bias=False)
+        elif _edge_mode:
+            n_q_basis = 1
+            if les_readout == 'edge_basis' and n_max_d is not None:
+                n_q_basis = n_max_d
+            self.les_edge_charge = nn.Linear(2 * embed_dim, n_q_basis, bias=False)
 
         # ── Element(+distance)-conditioned FiLM gate (optional) ───────────────
         # A small MLP on [embed(type_i), embed(type_j), φ(r_ij)] → a scale γ on
@@ -547,12 +557,28 @@ class ECENet(nn.Module):
         h_l0 = h_sum[:, :, 0]                                       # (E, 2*embed_dim)
 
         a = None
-        if self.les_readout == 'edge':
+        if self.les_readout in ('edge', 'edge_basis'):
             # Per-edge charge decomposition (Allegro-LES style): a scalar per
             # edge from its invariants, summed at the receiver. The result is
-            # already the latent charge — width 1, no downstream head. The
-            # weight applies to l0 only; l1 keeps the plain unweighted sum.
-            h_l0 = self.les_edge_charge(h_l0)                        # (E, 1)
+            # already the latent charge — width 1, no downstream head. This
+            # applies to l0 only; l1 keeps the plain unweighted sum.
+            # 'edge_basis' mirrors _apply_output: the head's n_max_d channels
+            # are dotted with the enveloped radial basis of the edge length,
+            # so each bond's contribution carries a learnable distance
+            # profile and vanishes exactly at r_cut.
+            h_l0 = self.les_edge_charge(h_l0)              # (E, 1 | n_max_d)
+            if self.les_readout == 'edge_basis':
+                if dist_ij is None:
+                    raise ValueError("les_readout='edge_basis' needs dist_ij "
+                                     "in _aggregate_lr_embeddings")
+                if self.n_max_d is not None:
+                    rb = radial_basis(dist_ij, self.r_cut_edge, self.n_max_d,
+                                      cutoff_type=self.cutoff_type)
+                    h_l0 = (h_l0 * rb).sum(-1, keepdim=True)   # (E, 1)
+                else:
+                    env = get_cutoff_fn(self.cutoff_type)(dist_ij,
+                                                          self.r_cut_edge)
+                    h_l0 = h_l0 * env[:, None]
         elif self.les_readout == 'softmax':
             # Same shape as the MP layers' softmax path (one score slot):
             #   a_e = exp(s_e)·f_cut_e / (Σ_{e'→j} exp(s_e')·f_cut_e' + eps) · f_cut_e
