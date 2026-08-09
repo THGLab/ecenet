@@ -37,13 +37,33 @@ from ecenet import ECENet
 
 
 class _MultiForwardWrapper(nn.Module):
-    """Thin wrapper so DDP intercepts forward_batch_multi for gradient sync."""
-    def __init__(self, model):
+    """Thin wrapper so DDP intercepts forward_batch_multi for gradient sync.
+
+    With a LES module attached, also computes the long-range energy from the
+    per-structure ``l0`` embeddings and returns ``E_sr + E_lr``. Registering
+    the LES module HERE (not just in the optimizer) is what puts its
+    parameters inside DDP's bucket reduction — and the head runs on every
+    step, so no parameter is ever unused (``find_unused_parameters=False``
+    stays valid). The LES call is batched: one call over the concatenated
+    atoms with a structure-index vector, zero cells → the isolated
+    (non-periodic) pairwise path, which is what SPICE molecules are.
+    """
+    def __init__(self, model, les_module=None):
         super().__init__()
         self.model = model
+        self.les = les_module
 
     def forward(self, positions_list, types_list):
-        return self.model.forward_batch_multi(positions_list, types_list)
+        if self.les is None:
+            return self.model.forward_batch_multi(positions_list, types_list)
+        e_sr, l0_list = self.model.forward_batch_multi(
+            positions_list, types_list, return_embeddings=True, l0_only=True)
+        l0 = torch.cat(l0_list, dim=0)
+        pos = torch.cat(positions_list, dim=0)
+        batch = torch.cat([
+            torch.full((p.shape[0],), b, dtype=torch.long, device=p.device)
+            for b, p in enumerate(positions_list)])
+        return e_sr + self.les(l0, pos, batch=batch)          # (B,)
 
 
 def print_flush(*args, **kwargs):
@@ -314,6 +334,10 @@ def train_ecenet_spice(
     film_per_m=False,
     film_shift=False,
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax'
+    # Long-range (LES): E = E_sr + E_lr on one autograd graph. Needs the
+    # optional `les` package (see ecenet/les.py for install + licensing).
+    use_les=False,
+    les_arguments=None,    # extra kwargs for upstream les.Les
     # Optimiser
     lr=1e-3,
     weight_decay=1e-5,
@@ -469,18 +493,53 @@ def train_ecenet_spice(
 
     raw_model = model   # unwrapped reference for eval + checkpointing
 
+    if is_ddp and les_readout == 'softmax' and not use_les:
+        # les_score would never enter the forward graph (nothing calls
+        # return_embeddings during training), and a parameter that never
+        # receives a gradient breaks DDP's find_unused_parameters=False
+        # collective. Refuse loudly rather than hang/error mid-epoch.
+        raise ValueError("les_readout='softmax' without use_les=True is not "
+                         "supported under DDP: the les_score parameter would "
+                         "be unused in every forward.")
+
+    # ── LES long-range module (optional) ──────────────────────────────────
+    # Upstream builds its charge head lazily on the first forward (it infers
+    # the descriptor width then), so run one throwaway forward NOW: the DDP
+    # wrap, the optimizer, and any checkpoint restore below all need the
+    # parameters to exist. Each rank materialises with its own RNG state;
+    # DDP's construction-time broadcast then syncs rank 0's init to all.
+    les_module = None
+    if use_les:
+        from ecenet.les import LESLongRange
+        les_module = LESLongRange(les_arguments)
+        with torch.no_grad():
+            _, l0_list = model.forward_batch_multi(
+                [pos_train[0]], [typ_train[0]],
+                return_embeddings=True, l0_only=True)
+            les_module(l0_list[0], pos_train[0])
+        les_module = les_module.to(device=device, dtype=dtype)
+
+    all_params = list(model.parameters())
+    if les_module is not None:
+        all_params += list(les_module.parameters())
+
     if is_ddp:
-        wrapper = _MultiForwardWrapper(model)
+        wrapper = _MultiForwardWrapper(model, les_module)
         train_model = DDP(wrapper, device_ids=[local_rank], find_unused_parameters=False)
         # create_graph=True in force training can produce non-contiguous grads,
         # causing DDP bucket-view stride mismatches. Make them contiguous first.
-        for p in model.parameters():
+        for p in all_params:
             if p.requires_grad:
                 p.register_hook(lambda g: g.contiguous())
     else:
-        train_model = _MultiForwardWrapper(model)
+        train_model = _MultiForwardWrapper(model, les_module)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Plain (non-DDP) forward for evaluation — rank 0 calls it alone, so it
+    # must not be the DDP module. Includes E_lr when LES is on, so the val/test
+    # MAEs measure the same total energy the loss trains.
+    eval_fwd = _MultiForwardWrapper(model, les_module)
+
+    n_params = sum(p.numel() for p in all_params if p.requires_grad)
     if verbose:
         model_name = "ECENet"
         m_max_eff = m_max if m_max is not None else l_max
@@ -489,10 +548,11 @@ def train_ecenet_spice(
                     f"embed_dim={embed_dim}, n_max_d={n_max_d}")
         print_flush(f"  n_features_per_m: {model.n_features_per_m}")
         print_flush(f"  r_cut_edge={r_cut_edge}, r_cut_neighbor={r_cut_neighbor}")
-        print_flush(f"  Trainable parameters: {n_params:,}")
+        print_flush(f"  Trainable parameters: {n_params:,}"
+                    + (" (incl. LES charge head)" if use_les else ""))
 
     # ── Optimiser ─────────────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
     # LR schedule. 'plateau' (default): ReduceLROnPlateau on the val metric.
     # 'cosine': linear warmup over warmup_epochs, then cosine decay to
     # lr*lr_min_factor. 'multistep': the same warmup, then lr *= lr_gamma at each
@@ -550,9 +610,17 @@ def train_ecenet_spice(
     best_test_e_mae = float('nan')
     best_test_f_mae = float('nan')
     best_state = None
+    best_les_state = None
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt['model'], strict=False)
+        if use_les != ('les' in ckpt):
+            raise ValueError(
+                f"Checkpoint at {checkpoint_path} was trained with "
+                f"use_les={'les' in ckpt}, but this run has use_les={use_les}.")
+        if les_module is not None:
+            les_module.load_state_dict(ckpt['les']['state_dict'])
+            best_les_state = ckpt['les'].get('best_state')
         optimizer.load_state_dict(ckpt['optimizer'])
         # Open-loop schedules have no state (the LR is a function of the
         # epoch), and saved state may come from a different schedule.
@@ -574,7 +642,13 @@ def train_ecenet_spice(
         if checkpoint_path is None or not is_main:
             return
         print_flush("  Saving checkpoint...")
+        out_les = (None if les_module is None else {
+            'arguments': les_arguments,
+            'state_dict': les_module.state_dict(),
+            'best_state': best_les_state,
+        })
         torch.save({
+            **({'les': out_les} if out_les is not None else {}),
             'epoch': epoch,
             'model': raw_model.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -612,7 +686,7 @@ def train_ecenet_spice(
 
     # ── Evaluation (rank 0 only) ──────────────────────────────────────────
     def evaluate(pos_list, frc_list, eng_target, typ_list, max_samples=None):
-        raw_model.eval()
+        eval_fwd.eval()          # toggles the model AND the LES head
         indices = list(range(len(pos_list)))
         if max_samples is not None and max_samples < len(indices):
             indices = list(np.random.choice(indices, max_samples, replace=False))
@@ -627,7 +701,7 @@ def train_ecenet_spice(
             typ_b = [typ_list[i] for i in batch]
 
             with torch.enable_grad():
-                eng_b = raw_model.forward_batch_multi(pos_b, typ_b)
+                eng_b = eval_fwd(pos_b, typ_b)
                 # allow_unused: see training loop — a zero-edge structure
                 # (e.g. a lone atom) has no positional dependence in its
                 # predicted energy → forces are 0.
@@ -643,7 +717,7 @@ def train_ecenet_spice(
                 force_abs   += (-grads[k] - frc_list[i]).abs().sum().item()
                 force_count += frc_list[i].numel()
 
-        raw_model.train()
+        eval_fwd.train()
         n = len(indices)
         return energy_abs / n, force_abs / force_count
 
@@ -803,6 +877,9 @@ def train_ecenet_spice(
                 if val_weighted < best_val_weighted:
                     best_val_weighted = val_weighted
                     best_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
+                    if les_module is not None:
+                        best_les_state = {k: v.clone()
+                                          for k, v in les_module.state_dict().items()}
                     epochs_without_improvement = 0
                     _do_test_eval = True
                 else:
@@ -850,6 +927,8 @@ def train_ecenet_spice(
     if is_main:
         if best_state is not None:
             raw_model.load_state_dict(best_state, strict=False)
+            if les_module is not None and best_les_state is not None:
+                les_module.load_state_dict(best_les_state)
 
         train_e_mae, train_f_mae = evaluate(pos_train, frc_train, eng_train, typ_train, max_samples=500)
         val_e_mae,   val_f_mae   = evaluate(pos_val,   frc_val,   eng_val,   typ_val)
@@ -867,6 +946,7 @@ def train_ecenet_spice(
             'val_energy_mae':   val_e_mae,   'val_force_mae':   val_f_mae,
             'test_energy_mae':  test_e_mae,  'test_force_mae':  test_f_mae,
             'n_params': n_params, 'time': total_time,
+            'les_module': les_module,   # None unless use_les
         }
 
     if is_ddp:

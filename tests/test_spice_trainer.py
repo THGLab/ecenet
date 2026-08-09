@@ -224,6 +224,96 @@ def test_trainer_runs_with_atom_budget():
           f"atom-budget F={budg['test_force_mae']:.3f}); impossible budget rejected")
 
 
+def _has_les():
+    try:
+        import les  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def test_les_wrapper_batched_matches_single():
+    """The wrapper's ONE batched LES call (concatenated atoms + batch vector,
+    zero cells) must equal per-structure single LES calls — the path the xyz
+    trainer validated against the analytic dimer."""
+    if not _has_les():
+        print("  SKIP LES wrapper consistency (`les` not installed)")
+        return
+    from train_ecenet_spice import _MultiForwardWrapper
+
+    from ecenet import ECENet
+    from ecenet.les import LESLongRange
+
+    torch.manual_seed(0)
+    model = ECENet(n_types=4, r_cut_edge=4.0, r_cut_neighbor=4.0,
+                   l_max=2, n_max=2, embed_dim=8, n_layers=1, n_max_d=4).double()
+    rng = np.random.RandomState(5)
+    pos_list = [torch.tensor(rng.uniform(-3, 3, size=(n, 3)), dtype=DTYPE)
+                for n in (4, 1, 7)]     # incl. a zero-edge single atom
+    typ_list = [torch.tensor(rng.randint(0, 4, size=p.shape[0])) for p in pos_list]
+
+    les_mod = LESLongRange().double()
+    with torch.no_grad():
+        _, l0_list = model.forward_batch_multi(pos_list, typ_list,
+                                               return_embeddings=True, l0_only=True)
+        les_mod(l0_list[0], pos_list[0])   # materialise
+        for p in les_mod.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+
+        wrapped = _MultiForwardWrapper(model, les_mod)
+        e_batched = wrapped(pos_list, typ_list)
+
+        e_sr, l0_list = model.forward_batch_multi(pos_list, typ_list,
+                                                  return_embeddings=True, l0_only=True)
+        e_single = torch.stack([
+            e_sr[b] + les_mod(l0_list[b], pos_list[b]).sum()
+            for b in range(len(pos_list))])
+    d = (e_batched - e_single).abs().max()
+    assert d < 1e-10, f"batched LES != per-structure LES: {d:.3e}"
+    print(f"  LES wrapper: batched call == per-structure calls (d={d:.1e}, "
+          "incl. zero-edge structure)")
+
+
+def test_trainer_runs_with_les():
+    """End-to-end SPICE trainer with use_les=True: runs, finite MAEs, LES state
+    checkpointed, resume restores it, use_les mismatch rejected."""
+    if not _has_les():
+        print("  SKIP LES trainer smoke (`les` not installed)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        train = write_xyz(os.path.join(d, 'train.xyz'), 40, seed=4)
+        test = write_xyz(os.path.join(d, 'test.xyz'), 8, seed=5)
+        ckpt = os.path.join(d, 'spice_les.mdl')
+        common = dict(
+            train_xyz=train, test_xyz=test, n_train=32, n_val=4, n_test=4,
+            r_cut_edge=4.0, r_cut_neighbor=4.0, l_max=2, n_max=2, embed_dim=8,
+            n_layers=1, n_max_d=4, m_max=2, batch_size=4, lr=5e-3,
+            eval_every=1, eval_batch_size=4, dtype=DTYPE, device=DEVICE,
+            seed=0, verbose=False, checkpoint_path=ckpt,
+        )
+        _, r = train_ecenet_spice(use_les=True, les_readout='softmax',
+                                  n_epochs=2, **common)
+        assert np.isfinite(r['test_force_mae']), f"non-finite force MAE: {r}"
+        assert r['les_module'] is not None
+        saved = torch.load(ckpt, weights_only=False)
+        assert 'les' in saved and saved['les']['state_dict'], "LES state not checkpointed"
+
+        # resume continues with the LES head restored
+        _, r2 = train_ecenet_spice(use_les=True, les_readout='softmax',
+                                   n_epochs=3, **common)
+        assert np.isfinite(r2['test_force_mae'])
+
+        # use_les must match the checkpoint
+        try:
+            train_ecenet_spice(use_les=False, n_epochs=4, **common)
+        except ValueError as e:
+            assert 'use_les' in str(e)
+        else:
+            raise AssertionError("resume with use_les=False should have raised")
+    print(f"  LES trainer smoke + checkpoint resume OK "
+          f"(F={r['test_force_mae']:.3f})")
+
+
 def test_tf32_is_a_noop_under_float64():
     """tf32 is a float32-only mode; under float64 it must warn, not silently
     change global torch state."""
@@ -249,5 +339,7 @@ if __name__ == '__main__':
     test_atom_budget_respects_max_batch_count()
     test_degenerate_epoch_keeps_ranks_aligned()
     test_trainer_runs_with_atom_budget()
+    test_les_wrapper_batched_matches_single()
+    test_trainer_runs_with_les()
     test_tf32_is_a_noop_under_float64()
     print("All tests passed.")

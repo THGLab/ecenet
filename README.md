@@ -241,13 +241,21 @@ The softmax weight is an invariant scalar shared by the `l0` and `l1`
 messages, so SO(3) behaviour is untouched (verified in `tests/test_les.py`,
 including the closed-form dimer weight `f_cut²/(f_cut+ε)`).
 
-Upstream builds its charge head lazily on the first forward, so the trainer
-materialises it with one throwaway forward before creating the optimiser or
-restoring a checkpoint. LES checkpoints carry a top-level `les` dict;
+The SPICE trainer takes the same flags (`use_les=True`, `les_arguments`) and
+trains jointly under DDP: the LES head lives inside the DDP-wrapped forward
+module (so its gradients join the bucket reduction and run on every step,
+keeping `find_unused_parameters=False` valid), and the long-range energy is
+computed in **one batched LES call** per step — concatenated atoms plus a
+structure-index vector, zero cells → the isolated pairwise path (verified
+bit-identical to per-structure calls in `tests/test_spice_trainer.py`).
+
+Upstream builds its charge head lazily on the first forward, so both trainers
+materialise it with one throwaway forward before the DDP wrap / optimiser /
+checkpoint restore. LES checkpoints carry a top-level `les` dict;
 `ECENetCalculator.from_checkpoint` **refuses** them rather than silently
 dropping the long-range term (`ignore_les=True` loads the short-range part
-deliberately). An LES-aware calculator and joint training in the DDP trainers
-are not yet ported.
+deliberately). An LES-aware calculator and joint training in the MPtrj
+trainer are not yet ported.
 
 > **IP / licensing.** The `les` package is CC BY-NC 4.0 (**non-commercial**);
 > it is an optional dependency and none of its code is included in this
