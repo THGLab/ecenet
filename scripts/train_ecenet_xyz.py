@@ -173,9 +173,12 @@ def train_ecenet_xyz(
     stress_weight=0.0,
     stress_conv=1.0,          # ASE info['stress'] is already eV/Å³
     loss='mse',
+    loss_type=None,           # alias for `loss` (train_ecenet.py's name); wins if set
     huber_delta=0.01,
     eval_metric='mae',        # 'mae' | 'rmse' — reported metrics AND the best-val
-                              # selection (the training loss itself is unchanged)
+                              # selection value (the training loss itself is unchanged)
+    best_metric='weighted',   # 'force' | 'energy' | 'weighted' — which val metric
+                              # selects the best checkpoint (and drives 'plateau')
     eval_every=1,
     eval_batch_size=16,
     seed=42,
@@ -186,8 +189,15 @@ def train_ecenet_xyz(
     verbose=True,
 ):
     use_stress = stress_weight > 0
+    if loss_type is not None:
+        loss = loss_type
+    if loss not in ('mse', 'l1', 'huber'):
+        raise ValueError(f"loss must be 'mse', 'l1' or 'huber', got {loss!r}")
     if eval_metric not in ('mae', 'rmse'):
         raise ValueError(f"eval_metric must be 'mae' or 'rmse', got {eval_metric!r}")
+    if best_metric not in ('force', 'energy', 'weighted'):
+        raise ValueError("best_metric must be 'force', 'energy' or 'weighted', "
+                         f"got {best_metric!r}")
 
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -335,7 +345,7 @@ def train_ecenet_xyz(
 
     # ── Checkpoint restore ────────────────────────────────────────────────
     start_epoch = 0
-    best_val_weighted = float('inf')
+    best_val = float('inf')
     best_test = (float('nan'), float('nan'), float('nan'))
     best_state = None
     best_les_state = None
@@ -353,12 +363,17 @@ def train_ecenet_xyz(
         if scheduler is not None and ckpt.get('scheduler') is not None:
             scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt['epoch'] + 1
-        best_val_weighted = ckpt.get('best_val_weighted', float('inf'))
+        saved_metric = ckpt.get('best_metric', 'weighted')
+        best_val = ckpt.get('best_val', ckpt.get('best_val_weighted', float('inf')))
+        if saved_metric != best_metric:
+            # Values under different metrics are not comparable — restart the
+            # best-checkpoint selection rather than compare apples to oranges.
+            best_val = float('inf')
         best_state = ckpt['best_state']
         best_test = ckpt.get('best_test', best_test)
         if verbose:
             print_flush(f"Resumed from epoch {ckpt['epoch']}, "
-                        f"best val [weighted]={best_val_weighted:.4f}")
+                        f"best val [{best_metric}]={best_val:.4f}")
 
     def save_checkpoint(epoch):
         if checkpoint_path is None:
@@ -368,7 +383,8 @@ def train_ecenet_xyz(
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict() if scheduler is not None else None,
-            'best_val_weighted': best_val_weighted,
+            'best_val': best_val,
+            'best_metric': best_metric,
             'best_test': best_test,
             'best_state': best_state,
             'hparams': dict(
@@ -573,11 +589,13 @@ def train_ecenet_xyz(
             va_weighted = energy_weight * va_e + force_weight * va_f
             if use_stress:
                 va_weighted += stress_weight * va_s
+            va_sel = {'force': va_f, 'energy': va_e,
+                      'weighted': va_weighted}[best_metric]
             if scheduler is not None:
-                scheduler.step(va_weighted)
+                scheduler.step(va_sel)
 
-            if va_weighted < best_val_weighted:
-                best_val_weighted = va_weighted
+            if va_sel < best_val:
+                best_val = va_sel
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
                 if les_module is not None:
                     best_les_state = {k: v.clone()
@@ -600,7 +618,7 @@ def train_ecenet_xyz(
                     f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | "
                     f"train E={tr_e:.4f} F={tr_f:.4f} | val E={va_e:.4f} F={va_f:.4f}{ssfx} | "
                     f"lr={lr_now:.1e} | {time.time()-t_start:.0f}s | "
-                    f"best val [weighted]={best_val_weighted:.4f}{bt}")
+                    f"best val [{best_metric}]={best_val:.4f}{bt}")
             if (early_stopping_patience is not None
                     and epochs_without_improvement >= early_stopping_patience):
                 if verbose:
