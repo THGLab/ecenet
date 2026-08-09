@@ -925,7 +925,7 @@ def train_ecenet_spice(
                 elapsed = time.time() - t_start
                 lr_now = optimizer.param_groups[0]['lr']
                 print_flush(
-                    f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | "
+                    f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | [{eval_metric}] "
                     f"train E={train_e_mae:.4f} F={train_f_mae:.4f} | "
                     f"val E={val_e_mae:.4f} F={val_f_mae:.4f} | "
                     f"lr={lr_now:.1e} | {elapsed:.0f}s | "

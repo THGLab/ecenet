@@ -615,7 +615,7 @@ def train_ecenet_xyz(
                 bt = (f" [test E={best_test[0]:.4f} F={best_test[1]:.4f}{btsfx}]"
                       if test_data else "")
                 print_flush(
-                    f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | "
+                    f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | [{eval_metric}] "
                     f"train E={tr_e:.4f} F={tr_f:.4f} | val E={va_e:.4f} F={va_f:.4f}{ssfx} | "
                     f"lr={lr_now:.1e} | {time.time()-t_start:.0f}s | "
                     f"best val [{best_metric}]={best_val:.4f}{bt}")
