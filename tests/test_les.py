@@ -280,6 +280,47 @@ def test_smoke_forward():
     print(f"  smoke: E={e.item():.6f} eV, |F|max={f.abs().max():.3f}")
 
 
+def test_isolated_batched_matches_upstream_loop():
+    """The wrapper's vectorized isolated path (one masked full-batch quadratic
+    form) must equal upstream's per-structure Python loop exactly — energies,
+    latent charges, and position gradients — including a single-atom
+    structure mid-batch."""
+    if not HAVE_LES:
+        print("  skipped (`les` not installed)")
+        return
+    torch.manual_seed(2)
+    lr = LESLongRange().double()
+    g = torch.Generator().manual_seed(9)
+    sizes = [5, 1, 7]
+    pos = torch.randn(sum(sizes), 3, generator=g, dtype=DTYPE) * 2.0
+    l0 = torch.randn(sum(sizes), 16, generator=g, dtype=DTYPE)
+    batch = torch.cat([torch.full((n,), b, dtype=torch.long)
+                       for b, n in enumerate(sizes)])
+    with torch.no_grad():
+        lr(l0, pos, batch=batch, n_struct=len(sizes))   # materialise the head
+        for p in lr.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+
+    p_a = pos.clone().requires_grad_(True)
+    e_fast, q_fast = lr(l0, p_a, batch=batch, n_struct=len(sizes),
+                        return_charges=True)
+    f_a = torch.autograd.grad(e_fast.sum(), p_a)[0]
+
+    p_b = pos.clone().requires_grad_(True)
+    res = lr.les(desc=l0, positions=p_b, cell=None, batch=batch,
+                 compute_energy=True)                    # upstream's own loop
+    f_b = torch.autograd.grad(res["E_lr"].sum(), p_b)[0]
+
+    de = (e_fast - res["E_lr"].reshape(e_fast.shape)).abs().max()
+    dq = (q_fast.reshape(-1) - res["latent_charges"].reshape(-1)).abs().max()
+    df = (f_a - f_b).abs().max()
+    assert de < 1e-12, f"energy mismatch vs upstream loop: {de:.3e}"
+    assert dq == 0.0, f"charge mismatch vs upstream loop: {dq:.3e}"
+    assert df < 1e-12, f"gradient mismatch vs upstream loop: {df:.3e}"
+    print(f"  vectorized isolated path == upstream loop "
+          f"(dE={de:.1e}, dq={dq:.1e}, dF={df:.1e})")
+
+
 if __name__ == "__main__":
     print(f"LES integration tests (upstream `les` installed: {HAVE_LES})")
     test_energy_unchanged_and_l0_only_consistent()
@@ -293,4 +334,5 @@ if __name__ == "__main__":
     test_lazy_import()
     test_missing_dep_error()
     test_smoke_forward()
+    test_isolated_batched_matches_upstream_loop()
     print("All tests passed.")

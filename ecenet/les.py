@@ -90,15 +90,18 @@ class LESLongRange(nn.Module):
     def forward(self, l0: torch.Tensor, positions: torch.Tensor,
                 cell: torch.Tensor | None = None,
                 batch: torch.Tensor | None = None,
-                return_charges: bool = False):
+                return_charges: bool = False,
+                n_struct: int | None = None):
         """Long-range energy for one structure or a packed batch.
 
         l0        (N, C)   per-atom invariant descriptor (any flattenable shape)
         positions (N, 3)   in Å, on the same autograd graph as the SR energy
-        cell      (B, 3, 3) or (3, 3); None → isolated / non-periodic (same
-                  physics as a zero cell, but skips upstream's per-structure
-                  degenerate-cell det check — pass None whenever possible)
+        cell      (B, 3, 3) or (3, 3); None → isolated / non-periodic, served
+                  by the vectorized batched path below (verified equal to
+                  upstream's per-structure loop in tests/test_les.py)
         batch     (N,) structure index per atom; None → single structure
+        n_struct  number of structures (optional; saves a batch.max() GPU
+                  sync on the isolated path when the caller knows it)
 
         Returns the per-structure long-range energy in eV (with
         ``return_charges=True``, also the per-atom latent charges).
@@ -106,14 +109,11 @@ class LESLongRange(nn.Module):
         if batch is None:
             batch = torch.zeros(positions.shape[0], dtype=torch.long,
                                 device=positions.device)
-        # cell=None is passed straight through: upstream short-circuits its
-        # per-structure degenerate-cell check at `box_now is None`, whereas a
-        # fabricated zero cell forces a det() per structure per call — a
-        # cuSOLVER call (or a GPU→CPU sync) times batch size, every training
-        # step. Physically identical: zero cell and no cell both mean the
-        # isolated (direct-sum) path.
-        if cell is not None:
-            cell = cell.view(-1, 3, 3)
+            if n_struct is None:
+                n_struct = 1
+        if cell is None:
+            return self._isolated_batched(l0, positions, batch, n_struct,
+                                          return_charges)
         # Scope the default dtype to the input's so upstream's lazily built
         # charge MLP (and any default-dtype internals) match float64 inputs.
         prev_dtype = torch.get_default_dtype()
@@ -122,7 +122,7 @@ class LESLongRange(nn.Module):
             result = self.les(
                 desc=l0.reshape(l0.shape[0], -1),
                 positions=positions,
-                cell=cell,
+                cell=cell.view(-1, 3, 3),
                 batch=batch,
                 compute_energy=True,
             )
@@ -131,3 +131,56 @@ class LESLongRange(nn.Module):
         if return_charges:
             return result["E_lr"], result["latent_charges"]
         return result["E_lr"]
+
+    def _isolated_batched(self, l0, positions, batch, n_struct, return_charges):
+        """Isolated (non-periodic) long-range energy, vectorized over the batch.
+
+        Upstream's ``Les.forward`` loops over structures in Python — masked
+        gathers plus a dozen small kernels per structure, which is launch-
+        latency-bound for many-molecule batches (measured ~2× SPICE step time;
+        the same disease forward_batch_multi cured on the model side). This
+        path computes the identical quantity in a handful of full-batch
+        kernels. No LES physics is reimplemented: the latent charges come from
+        upstream's own ``atomwise`` head and the interaction matrix from
+        upstream's ``make_kernels`` (smearing kernel, self-term convention,
+        constants); this method only masks cross-structure pairs out of the
+        charges-only quadratic form ``E_b = ½ Σ_{i,j∈b} q_i f_qq[i,j] q_j``
+        and scatters it per structure. Verified equal to upstream's loop
+        (energies, charges, and position gradients) in tests/test_les.py.
+
+        Tradeoff: the dense kernel spans ALL atom pairs, so this does
+        (ΣN)² pair work where the loop does Σ(N_b²) — ~batch_size× redundant
+        FLOPs. On GPU that is the right trade (a few large kernels vs
+        hundreds of tiny launches + syncs); on CPU the loop can be faster,
+        but training runs there don't care. Memory is (ΣN)² per kernel
+        tensor — fine for typical atom budgets (2000 atoms → 32 MB fp64).
+        """
+        from les.module.ewald import make_kernels
+
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(positions.dtype)
+        try:
+            q = self.les.atomwise(l0.reshape(l0.shape[0], -1), batch)
+        finally:
+            torch.set_default_dtype(prev_dtype)
+        charges = q
+        if q.dim() == 1:
+            q = q.unsqueeze(1)
+        q = q.to(positions.dtype)
+
+        if n_struct is None:
+            n_struct = int(batch.max().item()) + 1
+
+        ew = self.les.ewald
+        f_qq, _, _, _, _ = make_kernels(positions, ew.sigma,
+                                        ew.norm_factor / ew.twopi,
+                                        compute_u=False, compute_Q=False)
+        same = (batch.unsqueeze(0) == batch.unsqueeze(1))
+        e_phi = torch.einsum('iq,ij->jq', q, f_qq * same.to(f_qq.dtype))
+        per_atom = 0.5 * (e_phi * q).sum(dim=-1)                    # (N,)
+        e_lr = torch.zeros(n_struct, dtype=per_atom.dtype,
+                           device=per_atom.device
+                           ).scatter_add(0, batch, per_atom)
+        if return_charges:
+            return e_lr, charges
+        return e_lr

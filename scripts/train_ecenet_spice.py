@@ -63,7 +63,8 @@ class _MultiForwardWrapper(nn.Module):
         batch = torch.cat([
             torch.full((p.shape[0],), b, dtype=torch.long, device=p.device)
             for b, p in enumerate(positions_list)])
-        return e_sr + self.les(l0, pos, batch=batch)          # (B,)
+        return e_sr + self.les(l0, pos, batch=batch,
+                               n_struct=len(positions_list))  # (B,)
 
 
 def print_flush(*args, **kwargs):
