@@ -313,6 +313,7 @@ def train_ecenet_spice(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
+    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax'
     # Optimiser
     lr=1e-3,
     weight_decay=1e-5,
@@ -460,6 +461,7 @@ def train_ecenet_spice(
         element_film=element_film, film_embed_dim=film_embed_dim,
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
+        les_readout=les_readout,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -599,6 +601,7 @@ def train_ecenet_spice(
                 element_film=element_film, film_embed_dim=film_embed_dim,
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
+                les_readout=les_readout,
             ),
             'e_ref': e_ref,  # per-element reference energies (eV/atom)
             # Self-describing metadata for the calculator (no dataset coupling).

@@ -228,6 +228,19 @@ model, les_module, results = train_ecenet_xyz(
     use_les=True, n_epochs=200)
 ```
 
+`les_readout` selects how the per-atom `l0` fed to the charge head is
+aggregated from the final edge invariants (available on all trainers and
+`ecenet.ECENet(...)`):
+
+| `les_readout` | aggregation |
+| --- | --- |
+| `'sum'` (default) | parameter-free scatter-sum over the atom's in-edges — extensive in coordination |
+| `'softmax'` | attention: a zero-init linear score on each edge's invariants, segment-softmax over the receiver's in-edges with `f_cut` as a multiplicative log-bias, envelope multiplied back in (exactly the MP layers' softmax + `mp_msg_envelope` recipe) — intensive, and decaying with absolute distance |
+
+The softmax weight is an invariant scalar shared by the `l0` and `l1`
+messages, so SO(3) behaviour is untouched (verified in `tests/test_les.py`,
+including the closed-form dimer weight `f_cut²/(f_cut+ε)`).
+
 Upstream builds its charge head lazily on the first forward, so the trainer
 materialises it with one throwaway forward before creating the optimiser or
 restoring a checkpoint. LES checkpoints carry a top-level `les` dict;

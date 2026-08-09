@@ -122,6 +122,7 @@ def train_ecenet_xyz(
     # Long-range (LES)
     use_les=False,
     les_arguments=None,      # extra kwargs for upstream les.Les (see ecenet/les.py)
+    les_readout='sum',       # (l0,l1) read-out: 'sum' | 'softmax' (attention + envelope)
     # Geometry
     r_cut_edge=5.0,
     r_cut_neighbor=4.0,
@@ -268,6 +269,7 @@ def train_ecenet_xyz(
         element_film=element_film, film_embed_dim=film_embed_dim,
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
+        les_readout=les_readout,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -382,6 +384,7 @@ def train_ecenet_xyz(
                 element_film=element_film, film_embed_dim=film_embed_dim,
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
+                les_readout=les_readout,
             ),
             'element_to_type': elements.to_element_to_type(type_map),
             'e_ref': e_ref,

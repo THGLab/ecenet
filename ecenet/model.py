@@ -154,6 +154,7 @@ class ECENet(nn.Module):
         film_hidden=None,
         film_per_m: bool = False,
         film_shift: bool = False,
+        les_readout: str = 'sum',
     ):
         super().__init__()
         if mp_type == 'transformer':
@@ -198,6 +199,28 @@ class ECENet(nn.Module):
         self.sph_to_angular = SphToAngular(embed_dim, l_max, m_max=self.m_max)
         # n_features_per_m = 2 * embed_dim * (l_max+1): one channel per (side, embed, l)
         self.n_features_per_m = 2 * embed_dim * (l_max + 1)
+
+        # ── (l0, l1) read-out aggregation (return_embeddings) ─────────────
+        # 'sum' (default): parameter-free scatter-sum of the final edge
+        #   invariants — extensive in coordination, smooth only through the
+        #   radial basis's own envelope.
+        # 'softmax': attention-weighted aggregation mirroring the MP layers'
+        #   softmax path — a zero-init linear score on each edge's invariant
+        #   h_l0, segment-softmaxed over the receiver's in-edges with f_cut as
+        #   a multiplicative log-bias, then the envelope multiplied back in
+        #   (the normalizer divides the absolute f_cut out, exactly as in
+        #   mp_msg_envelope). Weight is an invariant scalar shared by the l0
+        #   and l1 messages, so equivariance is untouched. Zero-init score →
+        #   uniform attention at init; on a lone in-edge the weight reduces to
+        #   f_cut(r), giving the read-out absolute-distance decay.
+        if les_readout not in ('sum', 'softmax'):
+            raise ValueError("les_readout must be 'sum' or 'softmax', "
+                             f"got {les_readout!r}")
+        self.les_readout = les_readout
+        if les_readout == 'softmax':
+            self.les_score = nn.Linear(2 * embed_dim, 1)
+            nn.init.zeros_(self.les_score.weight)
+            nn.init.zeros_(self.les_score.bias)
 
         # ── Element(+distance)-conditioned FiLM gate (optional) ───────────────
         # A small MLP on [embed(type_i), embed(type_j), φ(r_ij)] → a scale γ on
@@ -475,7 +498,8 @@ class ECENet(nn.Module):
         h = h.scatter_add(2, sin_idx[None].expand(n_e, -1, -1), A_sin * sin_valid)
         return h  # (n_edges, n_ch, n_sph)
 
-    def _aggregate_lr_embeddings(self, A_cos, A_sin, r_hat, edge_j, n_atoms, with_l1=True):
+    def _aggregate_lr_embeddings(self, A_cos, A_sin, r_hat, edge_j, n_atoms,
+                                 with_l1=True, dist_ij=None):
         """Aggregate edge features to per-atom (l0, l1) equivariant embeddings
         (exposed via return_embeddings; e.g. for downstream long-range terms).
 
@@ -484,7 +508,9 @@ class ECENet(nn.Module):
           2. Sum over the l'-expansion axis first       (E, 2*embed_dim, n_sph)
           3. l=0: D^0=1, rotation-invariant — take directly
           4. l=1: apply D^1_T (3×3) to get global frame — much cheaper than full D^l_max
-          5. Scatter-sum to atoms
+          5. Scatter to atoms — plain sum (les_readout='sum'), or the
+             attention weights of les_readout='softmax' (see __init__), which
+             need dist_ij for the f_cut log-bias + envelope.
 
         Returns:
             l0: (n_atoms, 2*embed_dim)     per-atom invariant scalar embeddings
@@ -507,6 +533,30 @@ class ECENet(nn.Module):
 
         # l=0: D^0 = 1, no rotation needed
         h_l0 = h_sum[:, :, 0]                                       # (E, 2*embed_dim)
+
+        a = None
+        if self.les_readout == 'softmax':
+            # Same shape as the MP layers' softmax path (one score slot):
+            #   a_e = exp(s_e)·f_cut_e / (Σ_{e'→j} exp(s_e')·f_cut_e' + eps) · f_cut_e
+            # The trailing f_cut is the envelope multiplied back in — the
+            # normalizer divides the absolute f_cut out, so without it a lone
+            # neighbour near r_cut would keep weight ≈ 1. The weight is an
+            # invariant scalar, so applying it to both l0 and l1 messages
+            # preserves equivariance.
+            if dist_ij is None:
+                raise ValueError("les_readout='softmax' needs dist_ij in "
+                                 "_aggregate_lr_embeddings")
+            s = self.les_score(h_l0).squeeze(-1)                     # (E,)
+            f_cut = get_cutoff_fn(self.cutoff_type)(dist_ij, self.r_cut_edge)
+            s_max = torch.full((n_atoms,), float('-inf'), device=device, dtype=dtype
+                               ).scatter_reduce(0, edge_j, s.detach(), reduce='amax',
+                                                include_self=True)
+            num = torch.exp(s - s_max[edge_j]) * f_cut               # (E,)
+            denom = torch.zeros(n_atoms, device=device, dtype=dtype
+                                ).scatter_add(0, edge_j, num)
+            a = num / (denom[edge_j] + 1e-6) * f_cut                 # (E,)
+            h_l0 = a[:, None] * h_l0
+
         l0 = torch.zeros(n_atoms, n_base, device=device, dtype=dtype
                          ).scatter_add(0, edge_j[:, None].expand_as(h_l0), h_l0)
 
@@ -518,6 +568,8 @@ class ECENet(nn.Module):
         # einsum: h_global[e,c,n] = Σ_m h_bond[e,c,m] * D[e,n,m]
         D1 = build_D1_from_rhat(r_hat)                              # (E, 3, 3)
         h_l1 = torch.einsum('ecm,enm->ecn', h_sum[:, :, 1:4], D1)  # (E, 2*embed_dim, 3)
+        if a is not None:
+            h_l1 = a[:, None, None] * h_l1
         l1 = torch.zeros(n_atoms, n_base, 3, device=device, dtype=dtype
                          ).scatter_add(0, edge_j[:, None, None].expand_as(h_l1), h_l1)
         return l0, l1
@@ -642,7 +694,8 @@ class ECENet(nn.Module):
 
         if return_embeddings:
             l0, l1 = self._aggregate_lr_embeddings(
-                A_cos, A_sin, r_hat, edge_j, len(types), with_l1=not l0_only)
+                A_cos, A_sin, r_hat, edge_j, len(types), with_l1=not l0_only,
+                dist_ij=dist_ij)
             if l0_only:
                 return energy, l0
             return energy, l0, l1
@@ -713,7 +766,8 @@ class ECENet(nn.Module):
 
         if return_embeddings:
             l0, l1 = self._aggregate_lr_embeddings(
-                A_cos, A_sin, r_hat, edge_j, len(types), with_l1=not l0_only)
+                A_cos, A_sin, r_hat, edge_j, len(types), with_l1=not l0_only,
+                dist_ij=dist_ij)
             if l0_only:
                 return energy, l0
             return energy, l0, l1
@@ -846,7 +900,8 @@ class ECENet(nn.Module):
 
         if return_embeddings:
             l0_flat, l1_flat = self._aggregate_lr_embeddings(
-                A_cos, A_sin, r_hat, edge_j_flat, atom_offset, with_l1=not l0_only)
+                A_cos, A_sin, r_hat, edge_j_flat, atom_offset, with_l1=not l0_only,
+                dist_ij=dist_ij)
             # edge_j_flat indexes the full [0, atom_offset) atom space — the
             # running offset spans every structure, including any zero-edge ones —
             # so slice back by true atom count from positions_list (NOT
@@ -959,7 +1014,7 @@ class ECENet(nn.Module):
         if return_embeddings:
             l0_flat, l1_flat = self._aggregate_lr_embeddings(
                 A_cos_flat, A_sin_flat, r_hat_flat, edge_j_flat, B * N,
-                with_l1=not l0_only)
+                with_l1=not l0_only, dist_ij=dist_ij.reshape(B * n_edges))
             l0_list = [l0_flat[b * N:(b + 1) * N] for b in range(B)]
             if l0_only:
                 return energies, l0_list

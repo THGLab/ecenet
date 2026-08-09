@@ -144,6 +144,97 @@ def test_forward_pbc_zero_shift_matches_forward():
     print(f"  forward_pbc(zero shifts) == forward: dE={de:.1e}, dl0={dl:.1e}")
 
 
+# ── Softmax (l0,l1) read-out (les_readout='softmax') ────────────────────────
+
+def make_softmax_model(seed=0, score_std=0.0):
+    m = make_model(seed=seed, les_readout='softmax')
+    if score_std > 0:
+        with torch.no_grad():
+            m.les_score.weight.normal_(std=score_std)
+            m.les_score.bias.normal_(std=score_std)
+    return m
+
+
+def test_softmax_readout_so3():
+    # With a non-trivial (randomized) score head, the weighted read-out must
+    # keep l0 invariant and l1 vector-equivariant: the weight is an invariant
+    # scalar shared by both.
+    m = make_softmax_model(score_std=0.5)
+    pos, types = random_structure()
+    Q = rand_rotation()
+    _, l0_a, l1_a = m(pos, types, return_embeddings=True)
+    _, l0_b, l1_b = m(pos @ Q.T, types, return_embeddings=True)
+    d0 = (l0_a - l0_b).abs().max()
+    assert d0 < TOL, f"softmax read-out broke l0 invariance: {d0:.3e}"
+    cart = [2, 0, 1]
+    d1 = (l1_b[:, :, cart]
+          - torch.einsum('ncj,ij->nci', l1_a[:, :, cart], Q)).abs().max()
+    assert d1 < 1e-6, f"softmax read-out broke l1 equivariance: {d1:.3e}"
+    print(f"  softmax read-out: l0 invariant ({d0:.1e}), l1 equivariant ({d1:.1e})")
+
+
+def test_softmax_readout_dimer_weight():
+    # On a dimer each atom has exactly one in-edge, so the softmax weight has
+    # a closed form: a = f_cut² / (f_cut + eps) — i.e. ≈ f_cut, the envelope.
+    # les_readout is read at aggregation time, so flipping the attribute on ONE
+    # model compares both paths with identical weights.
+    from ecenet.radial import get_cutoff_fn
+    m = make_softmax_model()          # zero-init score → s = 0 exactly
+    types = torch.tensor([0, 1])
+    f = get_cutoff_fn(m.cutoff_type)
+    for r in (1.5, 3.0, 4.5):
+        pos = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, r]], dtype=DTYPE)
+        m.les_readout = 'sum'
+        _, l0_sum = m(pos, types, return_embeddings=True, l0_only=True)
+        m.les_readout = 'softmax'
+        _, l0_soft = m(pos, types, return_embeddings=True, l0_only=True)
+        f_cut = f(torch.tensor([r], dtype=DTYPE), m.r_cut_edge)
+        expected = l0_sum * (f_cut ** 2 / (f_cut + 1e-6))
+        d = (l0_soft - expected).abs().max()
+        assert d < TOL, f"dimer weight mismatch at r={r}: {d:.3e}"
+        ratio = f_cut.item() ** 2 / (f_cut.item() + 1e-6)
+        print(f"  dimer r={r}: softmax/sum = {ratio:.4f} (≈ f_cut={f_cut.item():.4f})")
+
+
+def test_softmax_readout_variants_consistent():
+    # forward == forward_pbc(zero shifts) == forward_batch_multi, softmax
+    # read-out with a randomized score, incl. a zero-edge structure mid-batch.
+    m = make_softmax_model(score_std=0.5)
+    structs = [random_structure(n, seed=s) for n, s in [(5, 1), (1, 2), (7, 3)]]
+    pos_list = [p for p, _ in structs]
+    types_list = [t for _, t in structs]
+    energies, l0_list = m.forward_batch_multi(
+        pos_list, types_list, return_embeddings=True, l0_only=True)
+    for b, (pos, types) in enumerate(structs):
+        _, l0_ref = m(pos, types, return_embeddings=True, l0_only=True)
+        dl = (l0_list[b] - l0_ref).abs().max()
+        assert dl < TOL, f"structure {b}: dl0={dl:.3e}"
+    assert l0_list[1].abs().max() == 0.0, "zero-edge structure must have zero l0"
+
+    pos, types = structs[0]
+    with torch.no_grad():
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+        dist = torch.sqrt((diff ** 2).sum(-1) + 1e-30)
+        ei, ej = ((dist < m.r_cut_edge) & (dist > 1e-10)).nonzero(as_tuple=True)
+        ns, nd = ((dist < m.r_cut_neighbor) & (dist > 1e-10)).nonzero(as_tuple=True)
+    _, l0_a = m(pos, types, return_embeddings=True, l0_only=True)
+    _, l0_b = m.forward_pbc(pos, types, ei, ej, torch.zeros(len(ei), 3, dtype=DTYPE),
+                            ns, nd, torch.zeros(len(ns), 3, dtype=DTYPE),
+                            return_embeddings=True, l0_only=True)
+    dl = (l0_a - l0_b).abs().max()
+    assert dl < TOL, f"pbc mismatch: {dl:.3e}"
+    print("  softmax read-out consistent across forward variants (incl. zero-edge)")
+
+
+def test_les_readout_validation():
+    try:
+        ECENet(**COMMON, les_readout='mean')
+        raise AssertionError("les_readout='mean' should have raised")
+    except ValueError as e:
+        assert 'les_readout' in str(e)
+    print("  invalid les_readout rejected")
+
+
 # ── Wrapper: lazy import / upstream smoke ───────────────────────────────────
 
 def test_lazy_import():
@@ -188,6 +279,10 @@ if __name__ == "__main__":
     test_l0_rotation_invariant_l1_equivariant()
     test_batch_multi_matches_loop_with_zero_edge_structure()
     test_forward_pbc_zero_shift_matches_forward()
+    test_softmax_readout_so3()
+    test_softmax_readout_dimer_weight()
+    test_softmax_readout_variants_consistent()
+    test_les_readout_validation()
     test_lazy_import()
     test_missing_dep_error()
     test_smoke_forward()

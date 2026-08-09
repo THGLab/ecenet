@@ -180,6 +180,7 @@ def train_ecenet(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
+    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax'
     # Batching
     use_graph_batch=True,
     # Optimiser
@@ -271,6 +272,7 @@ def train_ecenet(
         element_film=element_film, film_embed_dim=film_embed_dim,
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
+        les_readout=les_readout,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -416,6 +418,7 @@ def train_ecenet(
                 element_film=element_film, film_embed_dim=film_embed_dim,
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
+                les_readout=les_readout,
             ),
             # molecule-specific element mapping: {symbol: type_index}
             'element_to_type': elements.to_element_to_type(type_to_idx),
