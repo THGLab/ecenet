@@ -314,11 +314,50 @@ def test_isolated_batched_matches_upstream_loop():
     de = (e_fast - res["E_lr"].reshape(e_fast.shape)).abs().max()
     dq = (q_fast.reshape(-1) - res["latent_charges"].reshape(-1)).abs().max()
     df = (f_a - f_b).abs().max()
-    assert de < 1e-12, f"energy mismatch vs upstream loop: {de:.3e}"
+    # The anti-coincidence grid shift costs ~eps·offset of fp cancellation
+    # noise in the intra-structure distances, so equality is to ~1e-12 in
+    # float64 rather than bit-exact. A real break is orders louder.
+    assert de < 1e-10, f"energy mismatch vs upstream loop: {de:.3e}"
     assert dq == 0.0, f"charge mismatch vs upstream loop: {dq:.3e}"
-    assert df < 1e-12, f"gradient mismatch vs upstream loop: {df:.3e}"
+    assert df < 1e-10, f"gradient mismatch vs upstream loop: {df:.3e}"
     print(f"  vectorized isolated path == upstream loop "
           f"(dE={de:.1e}, dq={dq:.1e}, dF={df:.1e})")
+
+
+def test_isolated_batched_coincident_cross_atoms():
+    """Structures in a batch are individually centered, so atoms of DIFFERENT
+    structures can sit at identical coordinates. The dense kernel used to
+    produce inf·0 = NaN there (masking cannot clean a NaN); the grid shift
+    must keep energies and gradients finite and equal to upstream's loop."""
+    if not HAVE_LES:
+        print("  skipped (`les` not installed)")
+        return
+    torch.manual_seed(3)
+    lr = LESLongRange().double()
+    pos = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0], [0.0, 1.5, 0.0]], dtype=DTYPE)
+    l0 = torch.randn(4, 8, dtype=DTYPE)
+    batch = torch.tensor([0, 0, 1, 1])
+    with torch.no_grad():
+        lr(l0[:2], pos[:2])                       # materialise the head
+        for p in lr.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+
+    p_a = pos.clone().requires_grad_(True)
+    e_fast = lr(l0, p_a, batch=batch, n_struct=2)
+    assert torch.isfinite(e_fast).all(), f"NaN with coincident cross atoms: {e_fast}"
+    f_a = torch.autograd.grad(e_fast.sum(), p_a)[0]
+    assert torch.isfinite(f_a).all(), "NaN gradient with coincident cross atoms"
+
+    p_b = pos.clone().requires_grad_(True)
+    res = lr.les(desc=l0, positions=p_b, cell=None, batch=batch,
+                 compute_energy=True)
+    f_b = torch.autograd.grad(res["E_lr"].sum(), p_b)[0]
+    de = (e_fast - res["E_lr"].reshape(e_fast.shape)).abs().max()
+    df = (f_a - f_b).abs().max()
+    assert de < 1e-10 and df < 1e-10, f"mismatch: dE={de:.3e}, dF={df:.3e}"
+    print(f"  coincident cross-structure atoms: finite and == upstream "
+          f"(dE={de:.1e}, dF={df:.1e})")
 
 
 if __name__ == "__main__":
@@ -335,4 +374,5 @@ if __name__ == "__main__":
     test_missing_dep_error()
     test_smoke_forward()
     test_isolated_batched_matches_upstream_loop()
+    test_isolated_batched_coincident_cross_atoms()
     print("All tests passed.")

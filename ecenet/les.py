@@ -34,6 +34,8 @@ calculator and joint training in the MPtrj trainer are not yet ported.
     F = -torch.autograd.grad(E, pos, create_graph=True)[0]
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -171,8 +173,25 @@ class LESLongRange(nn.Module):
         if n_struct is None:
             n_struct = int(batch.max().item()) + 1
 
+        # Structures in a batch are individually centered, so atoms from
+        # DIFFERENT structures can (nearly) coincide. make_kernels masks only
+        # the exact diagonal: a coincident cross-structure pair yields
+        # 1/r = inf and erf(0)·inf = NaN, which the post-hoc mask cannot
+        # clean (NaN·0 = NaN; and a torch.where would still leak NaN through
+        # the 1/r backward). Shift each structure onto its own site of a
+        # coarse 2D grid first: intra-structure distances are translation-
+        # invariant (up to fp cancellation noise ~eps·offset), cross
+        # distances become large and finite, and the finite cross entries
+        # are then masked to exact zero. The spacing is detached, so no
+        # gradient flows through the offsets.
+        k = max(1, math.isqrt(max(0, n_struct - 1)) + 1)      # grid side ≥ √B
+        spacing = 2.0 * positions.detach().abs().max() + 10.0
+        gx = (batch % k).to(positions.dtype)
+        gy = torch.div(batch, k, rounding_mode='floor').to(positions.dtype)
+        shift = torch.stack([gx, gy, torch.zeros_like(gx)], dim=1) * spacing
+
         ew = self.les.ewald
-        f_qq, _, _, _, _ = make_kernels(positions, ew.sigma,
+        f_qq, _, _, _, _ = make_kernels(positions + shift, ew.sigma,
                                         ew.norm_factor / ew.twopi,
                                         compute_u=False, compute_Q=False)
         same = (batch.unsqueeze(0) == batch.unsqueeze(1))
