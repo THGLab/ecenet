@@ -695,7 +695,7 @@ def train_ecenet_mptrj(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
-    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax'
+    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     # Optimiser
     lr=1e-3,
     weight_decay=1e-5,

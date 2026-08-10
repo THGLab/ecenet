@@ -338,7 +338,7 @@ def train_ecenet_spice(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
-    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax'
+    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     # Long-range (LES): E = E_sr + E_lr on one autograd graph. Needs the
     # optional `les` package (see ecenet/les.py for install + licensing).
     use_les=False,
