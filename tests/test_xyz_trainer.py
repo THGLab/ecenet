@@ -135,7 +135,9 @@ def test_smoke_train_les():
 
 
 def test_les_force_fd():
-    """Forces from the joint graph (E_sr + E_lr) match finite differences."""
+    """Forces from the joint graph (E_sr + E_lr) match finite differences —
+    with the default 'sum' read-out (upstream atomwise charge head) and with
+    'edge_basis' (charge from the model's own MLP head, upstream bypassed)."""
     if not _has_les():
         print("=== SKIP: LES force FD (optional `les` package not installed) ===\n")
         return
@@ -148,50 +150,58 @@ def test_les_force_fd():
     structs = make_structures(1, seed=7, n_atoms_range=(5, 6))
     s = structs[0]
     type_map = elements.build_type_map(int(z) for z in s['numbers'])
-
-    torch.manual_seed(3)
-    model = ECENet(n_types=len(type_map), r_cut_edge=4.0, r_cut_neighbor=3.5,
-                   l_max=2, n_max=2, embed_dim=8, n_layers=1, n_max_d=4
-                   ).double().to(DEVICE)
-    lr_mod = LESLongRange().double()
     types = torch.tensor([type_map[int(z)] for z in s['numbers']],
                          dtype=torch.long, device=DEVICE)
     cell_t = torch.tensor(s['cell'], dtype=DTYPE, device=DEVICE)
 
-    def total_energy(pos_np, requires_grad=False):
-        # topology rebuilt per evaluation so FD displacements stay consistent
-        ei, ej, she, ni, nj, shn = build_topology(
-            pos_np, s['cell'], True, 4.0, 3.5, DEVICE, DTYPE)
-        pos = torch.tensor(pos_np, dtype=DTYPE, device=DEVICE,
-                           requires_grad=requires_grad)
-        e_sr, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
-                                     return_embeddings=True, l0_only=True)
-        e = e_sr + lr_mod(l0, pos, cell=cell_t).sum()
-        return e, pos
+    for readout in ('sum', 'edge_basis'):
+        torch.manual_seed(3)
+        model = ECENet(n_types=len(type_map), r_cut_edge=4.0,
+                       r_cut_neighbor=3.5, l_max=2, n_max=2, embed_dim=8,
+                       n_layers=1, n_max_d=4, les_readout=readout
+                       ).double().to(DEVICE)
+        lr_mod = LESLongRange().double()
+        is_charge = readout in ('edge', 'edge_basis')
 
-    # materialise the lazy LES head, then perturb it away from zero-ish init
-    with torch.no_grad():
-        total_energy(s['positions'])
-    for p in lr_mod.parameters():
-        with torch.no_grad():
-            p.add_(0.1 * torch.randn_like(p))
+        def total_energy(pos_np, requires_grad=False):
+            # topology rebuilt per evaluation so FD displacements stay consistent
+            ei, ej, she, ni, nj, shn = build_topology(
+                pos_np, s['cell'], True, 4.0, 3.5, DEVICE, DTYPE)
+            pos = torch.tensor(pos_np, dtype=DTYPE, device=DEVICE,
+                               requires_grad=requires_grad)
+            e_sr, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
+                                         return_embeddings=True, l0_only=True)
+            e = e_sr + lr_mod(l0, pos, cell=cell_t,
+                              l0_is_charge=is_charge).sum()
+            return e, pos
 
-    e, pos = total_energy(s['positions'], requires_grad=True)
-    forces = -torch.autograd.grad(e, pos)[0].cpu().numpy()
-
-    h = 1e-5
-    max_err = 0.0
-    for a in range(min(3, s['n_atoms'])):
-        for c in range(3):
-            pp = s['positions'].copy(); pp[a, c] += h
-            pm = s['positions'].copy(); pm[a, c] -= h
+        if not is_charge:
+            # materialise the lazy LES head, then perturb it away from
+            # zero-ish init ('edge_basis' bypasses the head: parameter-free)
             with torch.no_grad():
-                ep, _ = total_energy(pp)
-                em, _ = total_energy(pm)
-            f_fd = -(ep.item() - em.item()) / (2 * h)
-            max_err = max(max_err, abs(f_fd - forces[a, c]))
-    assert max_err < 1e-6, f"FD force mismatch through LES: {max_err:.2e}"
-    print(f"  max |F_autograd - F_fd| = {max_err:.2e}  (incl. E_lr)\n")
+                total_energy(s['positions'])
+            for p in lr_mod.parameters():
+                with torch.no_grad():
+                    p.add_(0.1 * torch.randn_like(p))
+
+        e, pos = total_energy(s['positions'], requires_grad=True)
+        forces = -torch.autograd.grad(e, pos)[0].cpu().numpy()
+
+        h = 1e-5
+        max_err = 0.0
+        for a in range(min(3, s['n_atoms'])):
+            for c in range(3):
+                pp = s['positions'].copy(); pp[a, c] += h
+                pm = s['positions'].copy(); pm[a, c] -= h
+                with torch.no_grad():
+                    ep, _ = total_energy(pp)
+                    em, _ = total_energy(pm)
+                f_fd = -(ep.item() - em.item()) / (2 * h)
+                max_err = max(max_err, abs(f_fd - forces[a, c]))
+        assert max_err < 1e-6, \
+            f"FD force mismatch through LES ({readout}): {max_err:.2e}"
+        print(f"  {readout}: max |F_autograd - F_fd| = {max_err:.2e}  (incl. E_lr)")
+    print()
 
 
 def test_calculator_rejects_les_checkpoint():

@@ -254,10 +254,22 @@ def test_edge_readout_model():
               "variants consistent, zero-edge → q=0")
 
     # 'edge_basis' only: the per-bond charge vanishes exactly at r_cut (the
-    # dotted radial basis carries the envelope), and the head has n_max_d
-    # channels rather than 1.
+    # dotted radial basis carries the envelope), and the head is an MLP
+    # mirroring the energy readout: same dims (full m=0 invariant set in,
+    # n_max_d channels out) — but standard-init last layer, not output_net's
+    # near-zero init (the LES energy's q=0 saddle).
     m = make_model(seed=0, les_readout='edge_basis')
-    assert m.les_edge_charge.weight.shape[0] == m.n_max_d
+    q_dims = [(lin.in_features, lin.out_features)
+              for lin in m.les_edge_charge.linears]
+    e_dims = [(lin.in_features, lin.out_features)
+              for lin in m.output_net.linears]
+    assert q_dims == e_dims, f"head does not mirror output_net: {q_dims} vs {e_dims}"
+    assert q_dims[0][0] == m.n_features_per_m
+    assert q_dims[-1][1] == m.n_max_d
+    q_last = m.les_edge_charge.linears[-1].weight.abs().mean()
+    e_last = m.output_net.linears[-1].weight.abs().mean()
+    assert q_last > 5 * e_last, \
+        "edge_basis head last layer looks near-zero-init (q=0 saddle)"
     types2 = torch.tensor([0, 1])
     eps_r = 1e-9
     pos_at = torch.tensor([[0.0, 0.0, 0.0],
@@ -265,7 +277,8 @@ def test_edge_readout_model():
     _, q_at = m(pos_at, types2, return_embeddings=True, l0_only=True)
     assert q_at.abs().max() < 1e-6, \
         f"edge_basis charge does not vanish at r_cut: {q_at.abs().max():.3e}"
-    print("  edge_basis: n_max_d-channel head, per-bond charge → 0 at r_cut")
+    print("  edge_basis: MLP head mirrors output_net (standard-init last "
+          "layer), per-bond charge → 0 at r_cut")
 
 
 def test_edge_readout_les_energy():

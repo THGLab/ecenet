@@ -222,12 +222,17 @@ class ECENet(nn.Module):
         #   saddle a zero-init head could never leave. Smoothness at r_cut is
         #   inherited from the edge features' own radial envelope, as in
         #   Allegro-LES's EdgewiseReduce.
-        # 'edge_basis': 'edge' with the per-edge energy readout's trick — the
-        #   head emits n_max_d channels dotted with the (cutoff-enveloped)
-        #   radial basis of the edge length, exactly mirroring _apply_output.
-        #   The per-bond charge contribution gains an explicit learnable
-        #   distance profile and vanishes exactly at r_cut (n_max_d=None
-        #   falls back to a scalar × f_cut, as in the energy readout).
+        # 'edge_basis': 'edge' upgraded to mirror the energy readout end to
+        #   end — an MLP with output_net's architecture (same input: the full
+        #   n_features_per_m m=0 invariant set of _contract, not the l'-summed
+        #   h_l0; same hidden widths and activation) emits n_max_d channels
+        #   dotted with the (cutoff-enveloped) radial basis of the edge
+        #   length, exactly mirroring _apply_output. The per-bond charge
+        #   contribution gains an explicit learnable distance profile and
+        #   vanishes exactly at r_cut (n_max_d=None falls back to a scalar ×
+        #   f_cut, as in the energy readout). Built below, after the output-
+        #   MLP config it mirrors. Last layer standard init, NOT output_net's
+        #   near-zero init — see the saddle note under 'edge'.
         if les_readout not in ('sum', 'softmax', 'edge', 'edge_basis'):
             raise ValueError("les_readout must be 'sum', 'softmax', 'edge' or "
                              f"'edge_basis', got {les_readout!r}")
@@ -238,11 +243,9 @@ class ECENet(nn.Module):
             self.les_score = nn.Linear(2 * embed_dim, 1)
             nn.init.zeros_(self.les_score.weight)
             nn.init.zeros_(self.les_score.bias)
-        elif _edge_mode:
-            n_q_basis = 1
-            if les_readout == 'edge_basis' and n_max_d is not None:
-                n_q_basis = n_max_d
-            self.les_edge_charge = nn.Linear(2 * embed_dim, n_q_basis, bias=False)
+        elif les_readout == 'edge':
+            self.les_edge_charge = nn.Linear(2 * embed_dim, 1, bias=False)
+        # (the 'edge_basis' head is built with the output MLP below)
 
         # ── Element(+distance)-conditioned FiLM gate (optional) ───────────────
         # A small MLP on [embed(type_i), embed(type_j), φ(r_ij)] → a scale γ on
@@ -358,6 +361,14 @@ class ECENet(nn.Module):
         act = {'silu': nn.SiLU, 'tanh': nn.Tanh, 'relu': nn.ReLU,
                'gelu': nn.GELU}.get(activation, nn.SiLU)
         self.output_net = OutputMLP(mlp_dims, activation=act())
+
+        # 'edge_basis' charge head: same dims/activation as output_net (built
+        # here so it mirrors the readout config exactly). zero_init_last=False:
+        # near-zero charges would start at the quadratic LES energy's
+        # gradient-free saddle (see the 'edge' note above).
+        if les_readout == 'edge_basis':
+            self.les_edge_charge = OutputMLP(mlp_dims, activation=act(),
+                                             zero_init_last=False)
 
         # ── Per-type atomic energy baseline ──────────────────────────────
         self.atomic_energy = nn.Parameter(torch.zeros(n_types))
@@ -547,14 +558,19 @@ class ECENet(nn.Module):
         n_e = A_cos.shape[0]
         n_base = 2 * self.embed_dim
 
-        h = self._pack_sph(A_cos, A_sin)                            # (E, n_ch, n_sph)
+        # The l'-summed h_l0 feeds every read-out except 'edge_basis' (whose
+        # head runs on the full m=0 set directly); the packed h_sum also feeds
+        # l1. Skip the pack when neither is needed (edge_basis + l0_only).
+        h_sum = None
+        if with_l1 or self.les_readout != 'edge_basis':
+            h = self._pack_sph(A_cos, A_sin)                        # (E, n_ch, n_sph)
 
-        # Sum over l'-expansion axis first (rotation is linear, sum commutes with D^T)
-        h_sum = (h.view(n_e, n_base, self.l_max + 1, self.n_sph)
-                  .sum(dim=2))                                       # (E, 2*embed_dim, n_sph)
+            # Sum over l'-expansion axis first (rotation is linear, sum commutes with D^T)
+            h_sum = (h.view(n_e, n_base, self.l_max + 1, self.n_sph)
+                      .sum(dim=2))                                   # (E, 2*embed_dim, n_sph)
 
-        # l=0: D^0 = 1, no rotation needed
-        h_l0 = h_sum[:, :, 0]                                       # (E, 2*embed_dim)
+            # l=0: D^0 = 1, no rotation needed
+            h_l0 = h_sum[:, :, 0]                                   # (E, 2*embed_dim)
 
         a = None
         if self.les_readout in ('edge', 'edge_basis'):
@@ -562,15 +578,18 @@ class ECENet(nn.Module):
             # edge from its invariants, summed at the receiver. The result is
             # already the latent charge — width 1, no downstream head. This
             # applies to l0 only; l1 keeps the plain unweighted sum.
-            # 'edge_basis' mirrors _apply_output: the head's n_max_d channels
-            # are dotted with the enveloped radial basis of the edge length,
-            # so each bond's contribution carries a learnable distance
-            # profile and vanishes exactly at r_cut.
-            h_l0 = self.les_edge_charge(h_l0)              # (E, 1 | n_max_d)
+            # 'edge': a linear head on the l'-summed invariants h_l0.
+            # 'edge_basis' mirrors the energy readout end to end: its MLP head
+            # runs on the full m=0 invariant set (the same input _contract
+            # feeds output_net) and its n_max_d channels are dotted with the
+            # enveloped radial basis of the edge length, so each bond's
+            # contribution carries a learnable distance profile and vanishes
+            # exactly at r_cut.
             if self.les_readout == 'edge_basis':
                 if dist_ij is None:
                     raise ValueError("les_readout='edge_basis' needs dist_ij "
                                      "in _aggregate_lr_embeddings")
+                h_l0 = self.les_edge_charge(A_cos[:, :, 0])  # (E, n_max_d | 1)
                 if self.n_max_d is not None:
                     rb = radial_basis(dist_ij, self.r_cut_edge, self.n_max_d,
                                       cutoff_type=self.cutoff_type)
@@ -579,6 +598,8 @@ class ECENet(nn.Module):
                     env = get_cutoff_fn(self.cutoff_type)(dist_ij,
                                                           self.r_cut_edge)
                     h_l0 = h_l0 * env[:, None]
+            else:
+                h_l0 = self.les_edge_charge(h_l0)              # (E, 1)
         elif self.les_readout == 'softmax':
             # Same shape as the MP layers' softmax path (one score slot):
             #   a_e = exp(s_e)·f_cut_e / (Σ_{e'→j} exp(s_e')·f_cut_e' + eps) · f_cut_e
