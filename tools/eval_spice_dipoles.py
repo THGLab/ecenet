@@ -124,24 +124,27 @@ def summarise(records, skipped):
         norm = (np.linalg.norm(p, axis=1) * np.linalg.norm(r, axis=1))
         cos = ((p * r).sum(1) / np.maximum(norm, 1e-12)).mean()
         corr = float(np.corrcoef(p.reshape(-1), r.reshape(-1))[0, 1])
-        return mae, mag_mae, cos, corr
+        # least-squares slope of pred on ref through the origin:
+        # scale < 1 → predicted dipoles uniformly too small
+        scale = float((p * r).sum() / np.maximum((r * r).sum(), 1e-12))
+        return mae, mag_mae, cos, corr, scale
 
     print(f"\nGlobal charge sign: {'+' if sign > 0 else '-'} "
           "(aligned on all frames; not identifiable from training)")
     print(f"{'subset':22s} {'frames':>6s} {'skip':>4s} {'MAE_xyz':>9s} "
-          f"{'MAE_|mu|':>9s} {'cos':>7s} {'corr':>7s}   [e*Ang]")
+          f"{'MAE_|mu|':>9s} {'cos':>7s} {'corr':>7s} {'scale':>7s}   [e*Ang]")
     subsets = sorted({r['subset'] for r in records})
     for s in subsets:
         idx = [i for i, r in enumerate(records) if r['subset'] == s]
-        mae, mag_mae, cos, corr = row(pred[idx], ref[idx])
+        mae, mag_mae, cos, corr, scale = row(pred[idx], ref[idx])
         print(f"{s:22s} {len(idx):6d} {skipped.get(s, 0):4d} {mae:9.4f} "
-              f"{mag_mae:9.4f} {cos:7.3f} {corr:7.3f}")
+              f"{mag_mae:9.4f} {cos:7.3f} {corr:7.3f} {scale:7.3f}")
     for s in sorted(set(skipped) - set(subsets)):
         print(f"{s:22s} {0:6d} {skipped[s]:4d}   (all frames skipped — "
               "unknown elements or no reference)")
-    mae, mag_mae, cos, corr = row(pred, ref)
+    mae, mag_mae, cos, corr, scale = row(pred, ref)
     print(f"{'ALL':22s} {len(records):6d} {sum(skipped.values()):4d} "
-          f"{mae:9.4f} {mag_mae:9.4f} {cos:7.3f} {corr:7.3f}")
+          f"{mae:9.4f} {mag_mae:9.4f} {cos:7.3f} {corr:7.3f} {scale:7.3f}")
     qs = np.abs([r['q_sum'] for r in records])
     print(f"net latent charge |sum q| (pre-removal): "
           f"mean {qs.mean():.4f}, max {qs.max():.4f}")
@@ -165,7 +168,9 @@ def main():
                          "BEC's remove_mean=True convention)")
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--save', default=None,
-                    help='write per-frame sign-aligned results to this .npz')
+                    help='write per-frame sign-aligned results to this file: '
+                         '.csv (one row per frame, ready for a correlation '
+                         'plot) or .npz (arrays)')
     args = ap.parse_args()
 
     data_dir = os.path.expanduser(args.data_dir)
@@ -189,13 +194,25 @@ def main():
     sign = summarise(records, skipped)
 
     if args.save:
-        np.savez(args.save,
-                 subset=np.array([r['subset'] for r in records]),
-                 frame=np.array([r['frame'] for r in records]),
-                 n_atoms=np.array([r['n_atoms'] for r in records]),
-                 mu_pred=sign * np.array([r['mu_pred'] for r in records]),
-                 mu_ref=np.array([r['mu_ref'] for r in records]),
-                 q_sum=np.array([r['q_sum'] for r in records]))
+        mu_pred = sign * np.array([r['mu_pred'] for r in records])
+        mu_ref = np.array([r['mu_ref'] for r in records])
+        if args.save.endswith('.csv'):
+            with open(args.save, 'w') as fh:
+                fh.write('subset,frame,n_atoms,'
+                         'mu_pred_x,mu_pred_y,mu_pred_z,'
+                         'mu_ref_x,mu_ref_y,mu_ref_z,q_sum\n')
+                for r, p, m in zip(records, mu_pred, mu_ref):
+                    fh.write(f"{r['subset']},{r['frame']},{r['n_atoms']},"
+                             f"{p[0]:.6f},{p[1]:.6f},{p[2]:.6f},"
+                             f"{m[0]:.6f},{m[1]:.6f},{m[2]:.6f},"
+                             f"{r['q_sum']:.6f}\n")
+        else:
+            np.savez(args.save,
+                     subset=np.array([r['subset'] for r in records]),
+                     frame=np.array([r['frame'] for r in records]),
+                     n_atoms=np.array([r['n_atoms'] for r in records]),
+                     mu_pred=mu_pred, mu_ref=mu_ref,
+                     q_sum=np.array([r['q_sum'] for r in records]))
         print(f"Saved to {args.save}")
 
 
