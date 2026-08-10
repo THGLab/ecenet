@@ -95,17 +95,19 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
         hp['r_cut_edge'], hp['r_cut_neighbor'], device, dtype)
 
     # les_readout='edge': l0 IS the charge; the LES module holds no state.
+    # les_dipole: l0 is packed (N, 4) = [q | u] (bond-dipole read-out).
     is_charge = hp.get('les_readout', 'sum') in ('edge', 'edge_basis')
+    les_dip = bool(hp.get('les_dipole', False))
     with torch.no_grad():
         _, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
                                   return_embeddings=True, l0_only=True)
-        les_module(l0, pos, cell=cell,
-                   l0_is_charge=is_charge)      # materialise the lazy head...
+        les_module(l0, pos, cell=cell, l0_is_charge=is_charge,
+                   les_dipole=les_dip)          # materialise the lazy head...
         les_module = les_module.to(device=device, dtype=dtype)
         les_module.load_state_dict(les_state)   # ...then load the trained one
         les_module.eval()
         e_lr, q = les_module(l0, pos, cell=cell, return_charges=True,
-                             l0_is_charge=is_charge)
+                             l0_is_charge=is_charge, les_dipole=les_dip)
 
     out = {
         'symbols': np.array(symbols),
@@ -113,6 +115,8 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
         'charges': q.cpu().numpy().reshape(-1),
         'e_lr': float(e_lr.sum()),
     }
+    if les_dip:
+        out['dipoles'] = l0[:, 1:4].cpu().numpy()
     if 'q' in atoms.arrays:
         out['charges_ref'] = np.asarray(atoms.arrays['q'], dtype=np.float64)
     return out
@@ -136,6 +140,13 @@ def main():
     print(f"Frame {args.frame}: {len(q)} atoms | E_lr = {r['e_lr']:+.6f} eV")
     print(f"Latent charges: sum = {q.sum():+.4f}, "
           f"min = {q.min():+.4f}, max = {q.max():+.4f}")
+    if 'dipoles' in r:
+        u = r['dipoles']
+        mu = (q - q.mean())[:, None] * r['positions']
+        mu = mu.sum(0) + u.sum(0)
+        print(f"Latent dipoles: |u| mean = {np.linalg.norm(u, axis=1).mean():.4f}, "
+              f"max = {np.linalg.norm(u, axis=1).max():.4f} e·Å | "
+              f"molecular μ = [{mu[0]:+.4f} {mu[1]:+.4f} {mu[2]:+.4f}]")
     for s in sorted(set(r['symbols'])):
         qs = q[r['symbols'] == s]
         print(f"  {s:2s}: mean {qs.mean():+.4f}  std {qs.std():.4f}  (n={len(qs)})")

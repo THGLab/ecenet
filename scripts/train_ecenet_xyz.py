@@ -124,6 +124,7 @@ def train_ecenet_xyz(
     les_arguments=None,      # extra kwargs for upstream les.Les (see ecenet/les.py)
     les_readout='sum',       # (l0,l1) read-out: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     les_charge_scale=1.0,    # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
+    les_dipole=False,        # edge head also emits bond dipoles; l0 packed [q | u]
     # Geometry
     r_cut_edge=5.0,
     r_cut_neighbor=4.0,
@@ -286,6 +287,7 @@ def train_ecenet_xyz(
         film_per_m=film_per_m, film_shift=film_shift,
         les_readout=les_readout,
         les_charge_scale=les_charge_scale,
+        les_dipole=les_dipole,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -308,7 +310,8 @@ def train_ecenet_xyz(
                 d0['pos'], d0['types'], d0['edge_i'], d0['edge_j'], d0['shift_e'],
                 d0['nb_src'], d0['nb_dst'], d0['shift_nb'],
                 return_embeddings=True, l0_only=True)
-            les_module(l0, d0['pos'], cell=d0['cell'], l0_is_charge=les_is_charge)
+            les_module(l0, d0['pos'], cell=d0['cell'],
+                       l0_is_charge=les_is_charge, les_dipole=les_dipole)
         les_module = les_module.to(device=device, dtype=dtype)
 
     params = list(model.parameters())
@@ -411,6 +414,7 @@ def train_ecenet_xyz(
                 film_per_m=film_per_m, film_shift=film_shift,
                 les_readout=les_readout,
                 les_charge_scale=les_charge_scale,
+                les_dipole=les_dipole,
             ),
             'element_to_type': elements.to_element_to_type(type_map),
             'e_ref': e_ref,
@@ -467,7 +471,8 @@ def train_ecenet_xyz(
                     d['nb_src'], d['nb_dst'], shift_nb_in,
                     return_embeddings=True, l0_only=True)
                 e_lr = les_module(l0, pos_in, cell=cell_in,
-                                  l0_is_charge=les_is_charge)
+                                  l0_is_charge=les_is_charge,
+                                  les_dipole=les_dipole)
                 energies.append(e_sr + e_lr.sum())
             else:
                 energies.append(model.forward_pbc(

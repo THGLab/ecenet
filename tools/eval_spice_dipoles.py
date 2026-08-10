@@ -62,6 +62,7 @@ def predict_dipoles(checkpoint_path, xyz_files, device='cpu', max_frames=None,
     hp = torch.load(checkpoint_path, map_location='cpu',
                     weights_only=False)['hparams']
     is_charge = hp.get('les_readout', 'sum') in ('edge', 'edge_basis')
+    les_dip = bool(hp.get('les_dipole', False))
     materialised = False
 
     records, skipped = [], {}
@@ -85,24 +86,35 @@ def predict_dipoles(checkpoint_path, xyz_files, device='cpu', max_frames=None,
             ei, ej, she, ni, nj, shn = build_topology(
                 pos_np, None, False,
                 hp['r_cut_edge'], hp['r_cut_neighbor'], device, dtype)
+            u = None
             with torch.no_grad():
                 _, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
                                           return_embeddings=True, l0_only=True)
-                if not materialised:
-                    # upstream's charge head builds lazily on first forward;
-                    # only then can the trained state be loaded
-                    les_module(l0, pos, cell=None, l0_is_charge=is_charge)
-                    les_module = les_module.to(device=device, dtype=dtype)
-                    les_module.load_state_dict(les_state)
-                    les_module.eval()
-                    materialised = True
-                _, q = les_module(l0, pos, cell=None, return_charges=True,
-                                  l0_is_charge=is_charge)
+                if is_charge:
+                    # edge modes: l0 IS the charge (packed [q | u] with
+                    # les_dipole); the LES module is parameter-free, so the
+                    # wrapper is not needed for prediction at all
+                    q = l0[:, 0]
+                    if les_dip:
+                        u = l0[:, 1:4].cpu().numpy()
+                else:
+                    if not materialised:
+                        # upstream's charge head builds lazily on first
+                        # forward; only then can the trained state be loaded
+                        les_module(l0, pos, cell=None)
+                        les_module = les_module.to(device=device, dtype=dtype)
+                        les_module.load_state_dict(les_state)
+                        les_module.eval()
+                        materialised = True
+                    _, q = les_module(l0, pos, cell=None, return_charges=True)
             q = q.cpu().numpy().reshape(-1)
             q0 = q if keep_mean else q - q.mean()
+            mu_pred = q0 @ pos_np
+            if u is not None:
+                mu_pred = mu_pred + u.sum(axis=0)   # μ = Σ q·r + Σ u
             records.append({
                 'subset': subset, 'frame': fi, 'n_atoms': len(symbols),
-                'mu_pred': q0 @ pos_np, 'mu_ref': np.asarray(mu_ref),
+                'mu_pred': mu_pred, 'mu_ref': np.asarray(mu_ref),
                 'q_sum': float(q.sum()),
             })
     return records, skipped

@@ -94,7 +94,8 @@ class LESLongRange(nn.Module):
                 batch: torch.Tensor | None = None,
                 return_charges: bool = False,
                 n_struct: int | None = None,
-                l0_is_charge: bool = False):
+                l0_is_charge: bool = False,
+                les_dipole: bool = False):
         """Long-range energy for one structure or a packed batch.
 
         l0        (N, C)   per-atom invariant descriptor (any flattenable
@@ -102,23 +103,46 @@ class LESLongRange(nn.Module):
                   itself ((N,) or (N, 1); a model built with
                   ``les_readout='edge'`` emits this), in which case
                   upstream's atomwise head is bypassed entirely and this
-                  module holds no parameters.
+                  module holds no parameters. With ``les_dipole=True``
+                  (requires ``l0_is_charge``), l0 is the model's packed
+                  (N, 4) = [q | u] and the latent atomic dipoles u are passed
+                  to upstream's charge–dipole/dipole–dipole terms.
         positions (N, 3)   in Å, on the same autograd graph as the SR energy
         cell      (B, 3, 3) or (3, 3); None → isolated / non-periodic, served
                   by the vectorized batched path below (verified equal to
-                  upstream's per-structure loop in tests/test_les.py)
+                  upstream's per-structure loop in tests/test_les.py) —
+                  except with dipoles, which that path does not vectorize
+                  yet: those go through upstream's per-structure loop.
         batch     (N,) structure index per atom; None → single structure
         n_struct  number of structures (optional; saves a batch.max() GPU
                   sync on the isolated path when the caller knows it)
 
         Returns the per-structure long-range energy in eV (with
-        ``return_charges=True``, also the per-atom latent charges).
+        ``return_charges=True``, also the per-atom latent charges — the q
+        column only under ``les_dipole``; take u from l0 directly).
         """
+        if les_dipole and not l0_is_charge:
+            raise ValueError("les_dipole=True requires l0_is_charge=True "
+                             "(the packed [q | u] comes from the model's "
+                             "edge head).")
         if batch is None:
             batch = torch.zeros(positions.shape[0], dtype=torch.long,
                                 device=positions.device)
             if n_struct is None:
                 n_struct = 1
+        if les_dipole:
+            q, u = l0[:, 0], l0[:, 1:4]
+            result = self.les(
+                latent_charges=q,
+                latent_dipoles=u,
+                positions=positions,
+                cell=None if cell is None else cell.view(-1, 3, 3),
+                batch=batch,
+                compute_energy=True,
+            )
+            if return_charges:
+                return result["E_lr"], q
+            return result["E_lr"]
         if cell is None:
             return self._isolated_batched(l0, positions, batch, n_struct,
                                           return_charges, l0_is_charge)

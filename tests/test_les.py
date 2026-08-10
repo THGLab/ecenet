@@ -298,6 +298,107 @@ def test_edge_readout_model():
     print("  les_charge_scale: q(0.1) == 0.1*q(1) exactly; non-edge readout warns")
 
 
+def test_edge_dipole():
+    """les_dipole: l0 packed (N, 4) = [q | u]; u exactly 0 at init (zero-init
+    dipole slot), q invariant / u vector-equivariant once trained, u confined
+    to the bond span (planar structure → in-plane), batched variants
+    consistent, and non-edge read-outs rejected."""
+    for mode in ('edge', 'edge_basis'):
+        m = make_model(seed=0, les_readout=mode, les_dipole=True)
+        pos, types = random_structure()
+        _, l0 = m(pos, types, return_embeddings=True, l0_only=True)
+        assert l0.shape == (len(types), 4), f"{mode}: {tuple(l0.shape)}"
+        assert l0[:, 1:].abs().max() == 0.0, f"{mode}: u must be 0 at init"
+        assert l0[:, 0].abs().max() > 0, f"{mode}: q must not be 0 at init"
+
+        # perturb the zero-init dipole slot, then check SO(3) behaviour
+        with torch.no_grad():
+            if mode == 'edge':
+                m.les_edge_charge.weight[1].normal_(std=0.5)
+            else:
+                m.les_edge_charge.linears[-1].weight[m.n_max_d:].normal_(std=0.5)
+        Q = rand_rotation()
+        _, l0a = m(pos, types, return_embeddings=True, l0_only=True)
+        _, l0b = m(pos @ Q.T, types, return_embeddings=True, l0_only=True)
+        assert l0a[:, 1:].abs().max() > 0
+        dq = (l0a[:, 0] - l0b[:, 0]).abs().max()
+        du = (l0a[:, 1:] @ Q.T - l0b[:, 1:]).abs().max()
+        assert dq < TOL, f"{mode}: q not invariant: {dq:.3e}"
+        assert du < TOL, f"{mode}: u not vector-equivariant: {du:.3e}"
+
+        # planar structure: every edge lies in z=0, so the bond-dipole span —
+        # and mirror symmetry — force u_z = 0 exactly
+        g = torch.Generator().manual_seed(9)
+        pos_p = torch.randn(6, 3, generator=g, dtype=DTYPE) * 1.8
+        pos_p[:, 2] = 0.0
+        _, l0p = m(pos_p, types, return_embeddings=True, l0_only=True)
+        assert l0p[:, 3].abs().max() < TOL, \
+            f"{mode}: planar structure has out-of-plane dipole"
+        print(f"  {mode}+dipole: packed (N,4), u=0 at init, q invariant "
+              f"({dq:.1e}), u equivariant ({du:.1e}), planar → u_z=0")
+
+    # batched slicing of the packed l0 matches per-structure forwards
+    structs = [random_structure(5, seed=1), random_structure(7, seed=3)]
+    m = make_model(seed=0, les_readout='edge_basis', les_dipole=True)
+    with torch.no_grad():
+        m.les_edge_charge.linears[-1].weight[m.n_max_d:].normal_(std=0.5)
+    _, l0_list = m.forward_batch_multi([p for p, _ in structs],
+                                       [t for _, t in structs],
+                                       return_embeddings=True, l0_only=True)
+    for b, (pos_b, types_b) in enumerate(structs):
+        _, l0_ref = m(pos_b, types_b, return_embeddings=True, l0_only=True)
+        dl = (l0_list[b] - l0_ref).abs().max()
+        assert dl < TOL, f"structure {b}: dl0={dl:.3e}"
+
+    try:
+        ECENet(**COMMON, les_readout='sum', les_dipole=True)
+        raise AssertionError("les_dipole with 'sum' should have raised")
+    except ValueError as e:
+        assert 'les_dipole' in str(e)
+    print("  dipole read-out: batched variants consistent; non-edge rejected")
+
+
+def test_edge_dipole_les_energy():
+    """Wrapper with les_dipole: equals upstream's latent_charges+latent_dipoles
+    call, u=0 reduces exactly to the charges-only energy, and the flag
+    without l0_is_charge is rejected."""
+    if not HAVE_LES:
+        print("  skipped (`les` not installed)")
+        return
+    lr = LESLongRange().double()
+    g = torch.Generator().manual_seed(12)
+    sizes = [4, 6]
+    pos = torch.randn(sum(sizes), 3, generator=g, dtype=DTYPE) * 2.0
+    q = torch.randn(sum(sizes), generator=g, dtype=DTYPE) * 0.3
+    u = torch.randn(sum(sizes), 3, generator=g, dtype=DTYPE) * 0.2
+    batch = torch.cat([torch.full((n,), b, dtype=torch.long)
+                       for b, n in enumerate(sizes)])
+    packed = torch.cat([q[:, None], u], dim=1)
+
+    e = lr(packed, pos, batch=batch, n_struct=2,
+           l0_is_charge=True, les_dipole=True)
+    res = lr.les(latent_charges=q, latent_dipoles=u, positions=pos,
+                 cell=None, batch=batch, compute_energy=True)
+    de = (e - res['E_lr'].reshape(e.shape)).abs().max()
+    assert de < 1e-12, f"dipole path != upstream: {de:.3e}"
+
+    packed0 = torch.cat([q[:, None], torch.zeros_like(u)], dim=1)
+    e0 = lr(packed0, pos, batch=batch, n_struct=2,
+            l0_is_charge=True, les_dipole=True)
+    eq = lr(q[:, None], pos, batch=batch, n_struct=2, l0_is_charge=True)
+    d0 = (e0 - eq).abs().max()
+    assert d0 < 1e-10, f"u=0 does not reduce to charges-only: {d0:.3e}"
+    assert (e - e0).abs().max() > 0, "dipoles changed nothing"
+
+    try:
+        lr(packed, pos, batch=batch, n_struct=2, les_dipole=True)
+        raise AssertionError("les_dipole without l0_is_charge should raise")
+    except ValueError as err:
+        assert 'l0_is_charge' in str(err)
+    print(f"  wrapper dipole path == upstream (dE={de:.1e}); "
+          f"u=0 → charges-only ({d0:.1e}); flag misuse rejected")
+
+
 def test_edge_readout_les_energy():
     """l0_is_charge=True: isolated fast path and upstream's latent_charges
     path agree, and the LES module holds no parameters (head bypassed)."""
@@ -477,6 +578,8 @@ if __name__ == "__main__":
     test_softmax_readout_dimer_weight()
     test_softmax_readout_variants_consistent()
     test_edge_readout_model()
+    test_edge_dipole()
+    test_edge_dipole_les_energy()
     test_edge_readout_les_energy()
     test_les_readout_validation()
     test_lazy_import()

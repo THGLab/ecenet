@@ -154,14 +154,21 @@ def test_les_force_fd():
                          dtype=torch.long, device=DEVICE)
     cell_t = torch.tensor(s['cell'], dtype=DTYPE, device=DEVICE)
 
-    for readout in ('sum', 'edge_basis'):
+    for readout, dip in (('sum', False), ('edge_basis', False),
+                         ('edge_basis', True)):
         torch.manual_seed(3)
         model = ECENet(n_types=len(type_map), r_cut_edge=4.0,
                        r_cut_neighbor=3.5, l_max=2, n_max=2, embed_dim=8,
-                       n_layers=1, n_max_d=4, les_readout=readout
-                       ).double().to(DEVICE)
+                       n_layers=1, n_max_d=4, les_readout=readout,
+                       les_dipole=dip).double().to(DEVICE)
         lr_mod = LESLongRange().double()
         is_charge = readout in ('edge', 'edge_basis')
+        if dip:
+            # dipole slot is zero-init; perturb it so the FD exercises the
+            # charge–dipole and dipole–dipole terms too
+            with torch.no_grad():
+                model.les_edge_charge.linears[-1].weight[model.n_max_d:
+                                                         ].normal_(std=0.5)
 
         def total_energy(pos_np, requires_grad=False):
             # topology rebuilt per evaluation so FD displacements stay consistent
@@ -171,8 +178,8 @@ def test_les_force_fd():
                                requires_grad=requires_grad)
             e_sr, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
                                          return_embeddings=True, l0_only=True)
-            e = e_sr + lr_mod(l0, pos, cell=cell_t,
-                              l0_is_charge=is_charge).sum()
+            e = e_sr + lr_mod(l0, pos, cell=cell_t, l0_is_charge=is_charge,
+                              les_dipole=dip).sum()
             return e, pos
 
         if not is_charge:
@@ -198,9 +205,10 @@ def test_les_force_fd():
                     em, _ = total_energy(pm)
                 f_fd = -(ep.item() - em.item()) / (2 * h)
                 max_err = max(max_err, abs(f_fd - forces[a, c]))
+        label = readout + ('+dipole' if dip else '')
         assert max_err < 1e-6, \
-            f"FD force mismatch through LES ({readout}): {max_err:.2e}"
-        print(f"  {readout}: max |F_autograd - F_fd| = {max_err:.2e}  (incl. E_lr)")
+            f"FD force mismatch through LES ({label}): {max_err:.2e}"
+        print(f"  {label}: max |F_autograd - F_fd| = {max_err:.2e}  (incl. E_lr)")
     print()
 
 

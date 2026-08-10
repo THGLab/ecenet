@@ -255,6 +255,28 @@ relative to it. It is not a parameter and is recorded in the checkpoint's
 hparams; for `'sum'`/`'softmax'` it cannot apply (the charge is produced
 inside the upstream head) and setting it warns.
 
+`les_dipole=True` (edge modes only; currently `train_ecenet_xyz` and the
+tools) additionally gives every atom a **latent dipole**: the edge head
+emits a second block of channels, reduced exactly like the charge, whose
+scalar `d_e` contributes the bond dipole `d_e·r̂_e` at the receiver. The
+model's `l0` is then packed `(n_atoms, 4) = [q | u]`, and the wrapper feeds
+`u` to upstream's charge–dipole and dipole–dipole Ewald terms
+(`E_lr = ½qᵀf_qq q + qᵀf_qu u + ½uᵀf_uu u`), so polarization the fixed
+point charges cannot express — the physics behind the extended-LES `u`
+channel — joins the same autograd graph. Because `u` is an invariant scalar
+times a true polar vector, parity is exact by construction: a planar
+molecule (e.g. water) cannot acquire an out-of-plane dipole, matching its
+mirror symmetry — and that bond-direction span coincides with the
+symmetry-allowed subspace whenever it binds (coplanar or collinear
+neighbourhoods), so nothing expressible is lost. The dipole block is
+zero-init — safe here, unlike the charge head, because the `qᵀf_qu u`
+cross-term supplies a gradient at u = 0 — so enabling the flag changes
+nothing at initialisation. The molecular dipole becomes
+`μ = Σᵢ qᵢrᵢ + Σᵢ uᵢ` (`tools/eval_spice_dipoles.py` handles this
+automatically). The vectorized batched isolated path does not cover the
+dipole terms yet, so SPICE-scale DDP training with `les_dipole` is not
+wired up; joint training is available in `train_ecenet_xyz`.
+
 The SPICE trainer takes the same flags (`use_les=True`, `les_arguments`) and
 trains jointly under DDP: the LES head lives inside the DDP-wrapped forward
 module (so its gradients join the bucket reduction and run on every step,
