@@ -255,8 +255,8 @@ relative to it. It is not a parameter and is recorded in the checkpoint's
 hparams; for `'sum'`/`'softmax'` it cannot apply (the charge is produced
 inside the upstream head) and setting it warns.
 
-`les_dipole=True` (edge modes only; currently `train_ecenet_xyz` and the
-tools) additionally gives every atom a **latent dipole**: the edge head
+`les_dipole=True` (edge modes only; `train_ecenet_xyz`, `train_ecenet_spice`,
+and the tools) additionally gives every atom a **latent dipole**: the edge head
 emits a second block of channels, reduced exactly like the charge, whose
 scalar `d_e` contributes the bond dipole `d_e·r̂_e` at the receiver. The
 model's `l0` is then packed `(n_atoms, 4) = [q | u]`, and the wrapper feeds
@@ -273,9 +273,11 @@ zero-init — safe here, unlike the charge head, because the `qᵀf_qu u`
 cross-term supplies a gradient at u = 0 — so enabling the flag changes
 nothing at initialisation. The molecular dipole becomes
 `μ = Σᵢ qᵢrᵢ + Σᵢ uᵢ` (`tools/eval_spice_dipoles.py` handles this
-automatically). The vectorized batched isolated path does not cover the
-dipole terms yet, so SPICE-scale DDP training with `les_dipole` is not
-wired up; joint training is available in `train_ecenet_xyz`.
+automatically). The SPICE trainer's one-batched-call path covers the dipole
+terms too — the vectorized isolated path masks upstream's `f_qu`/`f_uu`
+kernels exactly as it does `f_qq` (verified against upstream's per-structure
+loop) — but note the dipole–dipole kernel is a `(ΣN)²·3·3` tensor, 9× the
+charge kernel's memory, so dipole runs want smaller atom budgets.
 
 The SPICE trainer takes the same flags (`use_les=True`, `les_arguments`) and
 trains jointly under DDP: the LES head lives inside the DDP-wrapped forward

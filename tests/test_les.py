@@ -359,9 +359,11 @@ def test_edge_dipole():
 
 
 def test_edge_dipole_les_energy():
-    """Wrapper with les_dipole: equals upstream's latent_charges+latent_dipoles
-    call, u=0 reduces exactly to the charges-only energy, and the flag
-    without l0_is_charge is rejected."""
+    """Wrapper with les_dipole: the VECTORIZED isolated path (masked
+    f_qq/f_qu/f_uu on the concatenated batch) equals upstream's per-structure
+    loop in energies and position gradients; u=0 reduces exactly to the
+    charges-only energy; coincident cross-structure atoms stay finite; the
+    flag without l0_is_charge is rejected."""
     if not HAVE_LES:
         print("  skipped (`les` not installed)")
         return
@@ -375,12 +377,18 @@ def test_edge_dipole_les_energy():
                        for b, n in enumerate(sizes)])
     packed = torch.cat([q[:, None], u], dim=1)
 
-    e = lr(packed, pos, batch=batch, n_struct=2,
+    p_a = pos.clone().requires_grad_(True)
+    e = lr(torch.cat([q[:, None], u], dim=1), p_a, batch=batch, n_struct=2,
            l0_is_charge=True, les_dipole=True)
-    res = lr.les(latent_charges=q, latent_dipoles=u, positions=pos,
+    f_a = torch.autograd.grad(e.sum(), p_a)[0]
+    p_b = pos.clone().requires_grad_(True)
+    res = lr.les(latent_charges=q, latent_dipoles=u, positions=p_b,
                  cell=None, batch=batch, compute_energy=True)
+    f_b = torch.autograd.grad(res['E_lr'].sum(), p_b)[0]
     de = (e - res['E_lr'].reshape(e.shape)).abs().max()
-    assert de < 1e-12, f"dipole path != upstream: {de:.3e}"
+    df = (f_a - f_b).abs().max()
+    assert de < 1e-10 and df < 1e-10, \
+        f"vectorized dipole path != upstream loop: dE={de:.3e}, dF={df:.3e}"
 
     packed0 = torch.cat([q[:, None], torch.zeros_like(u)], dim=1)
     e0 = lr(packed0, pos, batch=batch, n_struct=2,
@@ -390,13 +398,29 @@ def test_edge_dipole_les_energy():
     assert d0 < 1e-10, f"u=0 does not reduce to charges-only: {d0:.3e}"
     assert (e - e0).abs().max() > 0, "dipoles changed nothing"
 
+    # exactly coincident atoms in DIFFERENT structures: the grid shift must
+    # keep f_qu/f_uu finite exactly as it does f_qq
+    pos_c = pos.clone()
+    pos_c[sizes[0]] = pos_c[0]
+    p_c = pos_c.clone().requires_grad_(True)
+    e_c = lr(packed, p_c, batch=batch, n_struct=2,
+             l0_is_charge=True, les_dipole=True)
+    f_c = torch.autograd.grad(e_c.sum(), p_c)[0]
+    assert torch.isfinite(e_c).all() and torch.isfinite(f_c).all(), \
+        "coincident cross-structure atoms NaN'd the dipole path"
+    res_c = lr.les(latent_charges=q, latent_dipoles=u, positions=pos_c,
+                   cell=None, batch=batch, compute_energy=True)
+    dc = (e_c - res_c['E_lr'].reshape(e_c.shape)).abs().max()
+    assert dc < 1e-10, f"coincident case != upstream: {dc:.3e}"
+
     try:
         lr(packed, pos, batch=batch, n_struct=2, les_dipole=True)
         raise AssertionError("les_dipole without l0_is_charge should raise")
     except ValueError as err:
         assert 'l0_is_charge' in str(err)
-    print(f"  wrapper dipole path == upstream (dE={de:.1e}); "
-          f"u=0 → charges-only ({d0:.1e}); flag misuse rejected")
+    print(f"  vectorized dipole path == upstream loop (dE={de:.1e}, "
+          f"dF={df:.1e}); u=0 → charges-only ({d0:.1e}); coincident finite "
+          f"({dc:.1e}); flag misuse rejected")
 
 
 def test_edge_readout_les_energy():

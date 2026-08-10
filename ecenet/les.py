@@ -110,9 +110,8 @@ class LESLongRange(nn.Module):
         positions (N, 3)   in Å, on the same autograd graph as the SR energy
         cell      (B, 3, 3) or (3, 3); None → isolated / non-periodic, served
                   by the vectorized batched path below (verified equal to
-                  upstream's per-structure loop in tests/test_les.py) —
-                  except with dipoles, which that path does not vectorize
-                  yet: those go through upstream's per-structure loop.
+                  upstream's per-structure loop in tests/test_les.py,
+                  charge-only and with dipoles).
         batch     (N,) structure index per atom; None → single structure
         n_struct  number of structures (optional; saves a batch.max() GPU
                   sync on the isolated path when the caller knows it)
@@ -132,11 +131,15 @@ class LESLongRange(nn.Module):
                 n_struct = 1
         if les_dipole:
             q, u = l0[:, 0], l0[:, 1:4]
+            if cell is None:
+                return self._isolated_batched(q, positions, batch, n_struct,
+                                              return_charges, l0_is_charge=True,
+                                              u=u)
             result = self.les(
                 latent_charges=q,
                 latent_dipoles=u,
                 positions=positions,
-                cell=None if cell is None else cell.view(-1, 3, 3),
+                cell=cell.view(-1, 3, 3),
                 batch=batch,
                 compute_energy=True,
             )
@@ -176,7 +179,7 @@ class LESLongRange(nn.Module):
         return result["E_lr"]
 
     def _isolated_batched(self, l0, positions, batch, n_struct, return_charges,
-                          l0_is_charge=False):
+                          l0_is_charge=False, u=None):
         """Isolated (non-periodic) long-range energy, vectorized over the batch.
 
         Upstream's ``Les.forward`` loops over structures in Python — masked
@@ -188,16 +191,26 @@ class LESLongRange(nn.Module):
         upstream's own ``atomwise`` head and the interaction matrix from
         upstream's ``make_kernels`` (smearing kernel, self-term convention,
         constants); this method only masks cross-structure pairs out of the
-        charges-only quadratic form ``E_b = ½ Σ_{i,j∈b} q_i f_qq[i,j] q_j``
-        and scatters it per structure. Verified equal to upstream's loop
-        (energies, charges, and position gradients) in tests/test_les.py.
+        quadratic form and scatters it per structure. With latent dipoles
+        ``u`` (N, 3) the same masking extends to upstream's charge–dipole
+        and dipole–dipole terms, mirroring ``compute_potential_realspace``
+        exactly:
+
+            E_b = ½ qᵀf_qq q + (u·f_qu)ᵀq − ½ uᵀf_uu u   (i,j ∈ b)
+
+        (the qu coefficient is 1, not ½, and the self-interaction is removed
+        by ``make_kernels`` — both upstream's conventions). Verified equal to
+        upstream's loop (energies, charges, and position gradients) in
+        tests/test_les.py, charge-only and with dipoles.
 
         Tradeoff: the dense kernel spans ALL atom pairs, so this does
         (ΣN)² pair work where the loop does Σ(N_b²) — ~batch_size× redundant
         FLOPs. On GPU that is the right trade (a few large kernels vs
         hundreds of tiny launches + syncs); on CPU the loop can be faster,
         but training runs there don't care. Memory is (ΣN)² per kernel
-        tensor — fine for typical atom budgets (2000 atoms → 32 MB fp64).
+        tensor — fine for typical atom budgets (2000 atoms → 32 MB fp64);
+        the dipole–dipole kernel is (ΣN)²·3·3, i.e. 9× that, so dipole runs
+        want correspondingly smaller atom budgets.
         """
         from les.module.ewald import make_kernels
 
@@ -236,12 +249,21 @@ class LESLongRange(nn.Module):
         shift = torch.stack([gx, gy, torch.zeros_like(gx)], dim=1) * spacing
 
         ew = self.les.ewald
-        f_qq, _, _, _, _ = make_kernels(positions + shift, ew.sigma,
-                                        ew.norm_factor / ew.twopi,
-                                        compute_u=False, compute_Q=False)
-        same = (batch.unsqueeze(0) == batch.unsqueeze(1))
-        e_phi = torch.einsum('iq,ij->jq', q, f_qq * same.to(f_qq.dtype))
+        f_qq, f_qu, f_uu, _, _ = make_kernels(positions + shift, ew.sigma,
+                                              ew.norm_factor / ew.twopi,
+                                              compute_u=u is not None,
+                                              compute_Q=False)
+        same = (batch.unsqueeze(0) == batch.unsqueeze(1)).to(f_qq.dtype)
+        e_phi = torch.einsum('iq,ij->jq', q, f_qq * same)
         per_atom = 0.5 * (e_phi * q).sum(dim=-1)                    # (N,)
+        if u is not None:
+            # upstream's dipole terms with the same cross-structure masking;
+            # coefficients (qu: 1, uu: -1/2) mirror compute_potential_realspace
+            uq = u.to(positions.dtype).unsqueeze(1)                 # (N, 1, 3)
+            e_phi_u = torch.einsum('iqc,ijc->jq', uq, f_qu * same[..., None])
+            per_atom = per_atom + (e_phi_u * q).sum(dim=-1)
+            E_u = torch.einsum('ijcd,iqc->jqd', f_uu * same[..., None, None], uq)
+            per_atom = per_atom - 0.5 * (uq * E_u).sum(dim=(1, 2))
         e_lr = torch.zeros(n_struct, dtype=per_atom.dtype,
                            device=per_atom.device
                            ).scatter_add(0, batch, per_atom)

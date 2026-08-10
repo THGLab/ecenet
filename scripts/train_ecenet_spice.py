@@ -55,6 +55,7 @@ class _MultiForwardWrapper(nn.Module):
         # les_readout='edge': l0 IS the latent charge; upstream's atomwise
         # head is bypassed (the LES module then holds no parameters).
         self.les_is_charge = getattr(model, 'les_readout', 'sum') in ('edge', 'edge_basis')
+        self.les_dipole = bool(getattr(model, 'les_dipole', False))
 
     def forward(self, positions_list, types_list):
         if self.les is None:
@@ -68,7 +69,8 @@ class _MultiForwardWrapper(nn.Module):
             for b, p in enumerate(positions_list)])
         return e_sr + self.les(l0, pos, batch=batch,
                                n_struct=len(positions_list),
-                               l0_is_charge=self.les_is_charge)  # (B,)
+                               l0_is_charge=self.les_is_charge,
+                               les_dipole=self.les_dipole)  # (B,)
 
 
 def print_flush(*args, **kwargs):
@@ -340,6 +342,7 @@ def train_ecenet_spice(
     film_shift=False,
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
+    les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     # Long-range (LES): E = E_sr + E_lr on one autograd graph. Needs the
     # optional `les` package (see ecenet/les.py for install + licensing).
     use_les=False,
@@ -497,6 +500,7 @@ def train_ecenet_spice(
         film_per_m=film_per_m, film_shift=film_shift,
         les_readout=les_readout,
         les_charge_scale=les_charge_scale,
+        les_dipole=les_dipole,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -529,7 +533,8 @@ def train_ecenet_spice(
                 [pos_train[0]], [typ_train[0]],
                 return_embeddings=True, l0_only=True)
             les_module(l0_list[0], pos_train[0],
-                       l0_is_charge=(les_readout in ('edge', 'edge_basis')))
+                       l0_is_charge=(les_readout in ('edge', 'edge_basis')),
+                       les_dipole=les_dipole)
         les_module = les_module.to(device=device, dtype=dtype)
 
     all_params = list(model.parameters())
@@ -690,6 +695,7 @@ def train_ecenet_spice(
                 film_per_m=film_per_m, film_shift=film_shift,
                 les_readout=les_readout,
                 les_charge_scale=les_charge_scale,
+                les_dipole=les_dipole,
             ),
             'e_ref': e_ref,  # per-element reference energies (eV/atom)
             # Self-describing metadata for the calculator (no dataset coupling).

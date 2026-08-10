@@ -273,6 +273,31 @@ def test_les_wrapper_batched_matches_single():
     print(f"  LES wrapper: batched call == per-structure calls (d={d:.1e}, "
           "incl. zero-edge structure)")
 
+    # les_dipole variant: packed l0 [q | u] through the DDP wrapper's one
+    # batched call vs per-structure calls (both on the vectorized path /
+    # its per-structure limit)
+    torch.manual_seed(1)
+    model_d = ECENet(n_types=4, r_cut_edge=4.0, r_cut_neighbor=4.0,
+                     l_max=2, n_max=2, embed_dim=8, n_layers=1, n_max_d=4,
+                     les_readout='edge_basis', les_dipole=True).double()
+    with torch.no_grad():
+        model_d.les_edge_charge.linears[-1].weight[model_d.n_max_d:
+                                                   ].normal_(std=0.5)
+        les_mod_d = LESLongRange().double()   # parameter-free (head bypassed)
+        wrapped_d = _MultiForwardWrapper(model_d, les_mod_d)
+        e_batched = wrapped_d(pos_list, typ_list)
+        e_sr, l0_list = model_d.forward_batch_multi(
+            pos_list, typ_list, return_embeddings=True, l0_only=True)
+        e_single = torch.stack([
+            e_sr[b] + les_mod_d(l0_list[b], pos_list[b], l0_is_charge=True,
+                                les_dipole=True).sum()
+            for b in range(len(pos_list))])
+    dd = (e_batched - e_single).abs().max()
+    assert dd < 1e-10, f"batched dipole LES != per-structure: {dd:.3e}"
+    assert any(l0.shape[1] == 4 and l0[:, 1:].abs().max() > 0
+               for l0 in l0_list), "dipoles are identically zero in the test"
+    print(f"  LES wrapper: dipole (packed l0) batched == per-structure (d={dd:.1e})")
+
 
 def test_trainer_runs_with_les():
     """End-to-end SPICE trainer with use_les=True: runs, finite MAEs, LES state
