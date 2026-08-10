@@ -123,6 +123,7 @@ def train_ecenet_xyz(
     use_les=False,
     les_arguments=None,      # extra kwargs for upstream les.Les (see ecenet/les.py)
     les_readout='sum',       # (l0,l1) read-out: 'sum' | 'softmax' | 'edge' | 'edge_basis'
+    les_charge_scale=1.0,    # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     # Geometry
     r_cut_edge=5.0,
     r_cut_neighbor=4.0,
@@ -284,6 +285,7 @@ def train_ecenet_xyz(
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
         les_readout=les_readout,
+        les_charge_scale=les_charge_scale,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -408,6 +410,7 @@ def train_ecenet_xyz(
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
                 les_readout=les_readout,
+                les_charge_scale=les_charge_scale,
             ),
             'element_to_type': elements.to_element_to_type(type_map),
             'e_ref': e_ref,

@@ -339,6 +339,7 @@ def train_ecenet_spice(
     film_per_m=False,
     film_shift=False,
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
+    les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     # Long-range (LES): E = E_sr + E_lr on one autograd graph. Needs the
     # optional `les` package (see ecenet/les.py for install + licensing).
     use_les=False,
@@ -495,6 +496,7 @@ def train_ecenet_spice(
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
         les_readout=les_readout,
+        les_charge_scale=les_charge_scale,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -687,6 +689,7 @@ def train_ecenet_spice(
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
                 les_readout=les_readout,
+                les_charge_scale=les_charge_scale,
             ),
             'e_ref': e_ref,  # per-element reference energies (eV/atom)
             # Self-describing metadata for the calculator (no dataset coupling).

@@ -280,6 +280,23 @@ def test_edge_readout_model():
     print("  edge_basis: MLP head mirrors output_net (standard-init last "
           "layer), per-bond charge → 0 at r_cut")
 
+    # les_charge_scale: q scales exactly linearly (same seed → same weights),
+    # and a non-edge readout warns that the scale cannot apply.
+    pos, types = random_structure(seed=5)
+    q1 = make_model(seed=0, les_readout='edge_basis')(
+        pos, types, return_embeddings=True, l0_only=True)[1]
+    qs = make_model(seed=0, les_readout='edge_basis', les_charge_scale=0.1)(
+        pos, types, return_embeddings=True, l0_only=True)[1]
+    dq = (qs - 0.1 * q1).abs().max()
+    assert dq < TOL, f"les_charge_scale not exactly linear: {dq:.3e}"
+    import warnings as _w
+    with _w.catch_warnings(record=True) as rec:
+        _w.simplefilter('always')
+        make_model(seed=0, les_readout='sum', les_charge_scale=0.1)
+    assert any('les_charge_scale' in str(r.message) for r in rec), \
+        "les_charge_scale with les_readout='sum' should warn"
+    print("  les_charge_scale: q(0.1) == 0.1*q(1) exactly; non-edge readout warns")
+
 
 def test_edge_readout_les_energy():
     """l0_is_charge=True: isolated fast path and upstream's latent_charges

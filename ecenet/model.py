@@ -155,6 +155,7 @@ class ECENet(nn.Module):
         film_per_m: bool = False,
         film_shift: bool = False,
         les_readout: str = 'sum',
+        les_charge_scale: float = 1.0,
     ):
         super().__init__()
         if mp_type == 'transformer':
@@ -239,6 +240,25 @@ class ECENet(nn.Module):
         self.les_readout = les_readout
         _edge_mode = les_readout in ('edge', 'edge_basis')
         self._l0_dim = 1 if _edge_mode else 2 * embed_dim
+        # les_charge_scale: fixed multiplier on the edge-mode latent charge
+        # (MACELES's output_scale; they ship 0.1). With standard head init,
+        # q = s·q_raw starts small-but-nonzero — off the quadratic energy's
+        # q=0 saddle, but with E_lr suppressed ~s² early, so the short-range
+        # fit leads and the charges learn gently relative to it. Not a
+        # parameter; recorded in hparams, so eval tools see scaled charges.
+        if les_charge_scale <= 0:
+            raise ValueError(f"les_charge_scale must be > 0, "
+                             f"got {les_charge_scale!r}")
+        if les_charge_scale != 1.0 and not _edge_mode:
+            # Warn rather than silently ignore (repo convention): for
+            # 'sum'/'softmax' the charge comes out of upstream's atomwise
+            # head, so the model never sees it and cannot scale it.
+            warnings.warn(
+                f"les_charge_scale={les_charge_scale} is ignored: "
+                f"les_readout={les_readout!r} maps l0 to charges inside the "
+                "upstream LES head; only 'edge'/'edge_basis' emit the charge "
+                "directly.", stacklevel=2)
+        self.les_charge_scale = float(les_charge_scale)
         if les_readout == 'softmax':
             self.les_score = nn.Linear(2 * embed_dim, 1)
             nn.init.zeros_(self.les_score.weight)
@@ -600,6 +620,8 @@ class ECENet(nn.Module):
                     h_l0 = h_l0 * env[:, None]
             else:
                 h_l0 = self.les_edge_charge(h_l0)              # (E, 1)
+            if self.les_charge_scale != 1.0:
+                h_l0 = h_l0 * self.les_charge_scale
         elif self.les_readout == 'softmax':
             # Same shape as the MP layers' softmax path (one score slot):
             #   a_e = exp(s_e)·f_cut_e / (Σ_{e'→j} exp(s_e')·f_cut_e' + eps) · f_cut_e

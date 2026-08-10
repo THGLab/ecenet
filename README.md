@@ -246,6 +246,15 @@ The softmax weight is an invariant scalar shared by the `l0` and `l1`
 messages, so SO(3) behaviour is untouched (verified in `tests/test_les.py`,
 including the closed-form dimer weight `f_cut²/(f_cut+ε)`).
 
+For the edge modes, `les_charge_scale` (default 1.0) multiplies the emitted
+latent charge by a fixed factor (MACE-LES ships 0.1 as `output_scale`): with
+a standard-init head the charges then start small but nonzero — clear of the
+quadratic energy's q = 0 saddle, while E_lr (quadratic in q) is suppressed
+~scale² early, so the short-range fit leads and the charges grow gently
+relative to it. It is not a parameter and is recorded in the checkpoint's
+hparams; for `'sum'`/`'softmax'` it cannot apply (the charge is produced
+inside the upstream head) and setting it warns.
+
 The SPICE trainer takes the same flags (`use_les=True`, `les_arguments`) and
 trains jointly under DDP: the LES head lives inside the DDP-wrapped forward
 module (so its gradients join the bucket reduction and run on every step,
