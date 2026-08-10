@@ -40,6 +40,9 @@ tests/                 test suite (test_*.py, run from the repo root)
 tools/                 developer utilities (run from the repo root)
   profile_step.py        profile a single calculator step
   equiv_vs_ref.py        numerical-equivalence check vs a git ref
+  predict_charges.py     LES latent charges + E_lr for one frame of an ASE file
+  eval_spice_dipoles.py  latent-charge dipoles vs DFT reference dipoles
+                         (ChengUCB/les_fit SPICE test slices, downloaded separately)
 ```
 
 ## Install
