@@ -174,6 +174,9 @@ def main():
     parser.add_argument('--batch_size',       type=int,   default=8)
     parser.add_argument('--float32',          action='store_true')
     parser.add_argument('--device',           default=None)
+    parser.add_argument('--ignore_les',       action='store_true',
+                        help='Evaluate the short-range part of an LES checkpoint '
+                             'alone (deliberately dropping E_lr).')
     args = parser.parse_args()
 
     dtype  = torch.float32 if args.float32 else torch.float64
@@ -278,8 +281,52 @@ def main():
     print(f"\nLoaded checkpoint (epoch {epoch}, "
           f"best val F-MAE={ckpt.get('best_val_force_mae', float('nan')):.4f} eV/Å)")
 
+    # ── LES (when the checkpoint carries it) ───────────────────────────────
+    # A checkpoint trained with use_les was fit to E_sr + E_lr; evaluating the
+    # SR part alone silently scores a different PES, so E_lr is added exactly
+    # as in training (one batched call, zero cells → isolated path) unless
+    # --ignore_les asks for the SR-only ablation explicitly.
+    les_module = None
+    les_is_charge = les_dipole = False
+    if 'les' in ckpt and args.ignore_les:
+        print("\nWARNING: --ignore_les — dropping the checkpoint's E_lr term "
+              "(SR-only ablation; MAEs are NOT the trained model's).")
+    elif 'les' in ckpt:
+        from ecenet.les import LESLongRange
+        les_is_charge = getattr(model, 'les_readout', 'sum') in ('edge', 'edge_basis')
+        les_dipole = bool(getattr(model, 'les_dipole', False))
+        les_module = LESLongRange(ckpt['les'].get('arguments'))
+        s0 = test_structs[0]
+        p0 = torch.tensor(s0['positions'], dtype=dtype, device=device)
+        t0 = torch.tensor(s0['types'].astype(np.int64), dtype=torch.long,
+                          device=device)
+        with torch.no_grad():
+            # upstream's charge head builds lazily on the first forward; only
+            # then can the trained state be loaded (edge modes: parameter-free)
+            _, l0_list = model.forward_batch_multi(
+                [p0], [t0], return_embeddings=True, l0_only=True)
+            les_module(l0_list[0], p0, l0_is_charge=les_is_charge,
+                       les_dipole=les_dipole)
+        les_module = les_module.to(device=device, dtype=dtype)
+        les_module.load_state_dict(ckpt['les'].get('best_state')
+                                   or ckpt['les']['state_dict'])
+        les_module.eval()
+        print(f"LES: on (readout={getattr(model, 'les_readout', 'sum')}"
+              f"{', dipole' if les_dipole else ''}) — evaluating E_sr + E_lr")
+
     def energy_fn(pos_list, typ_list):
-        return model.forward_batch_multi(pos_list, typ_list)
+        if les_module is None:
+            return model.forward_batch_multi(pos_list, typ_list)
+        e_sr, l0_list = model.forward_batch_multi(
+            pos_list, typ_list, return_embeddings=True, l0_only=True)
+        l0 = torch.cat(l0_list, dim=0)
+        pos = torch.cat(pos_list, dim=0)
+        batch = torch.cat([
+            torch.full((p.shape[0],), b, dtype=torch.long, device=p.device)
+            for b, p in enumerate(pos_list)])
+        return e_sr + les_module(l0, pos, batch=batch, n_struct=len(pos_list),
+                                 l0_is_charge=les_is_charge,
+                                 les_dipole=les_dipole)
 
     # ── Evaluate ───────────────────────────────────────────────────────────
     print(f"\nEvaluating on test set (batch_size={args.batch_size})...\n")
