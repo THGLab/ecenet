@@ -56,11 +56,13 @@ class _MultiForwardWrapper(nn.Module):
         # the single source of truth for how l0 is interpreted.
         self.les_flags = model.les_flags
 
-    def forward(self, positions_list, types_list):
+    def forward(self, positions_list, types_list, topology=None):
         if self.les is None:
-            return self.model.forward_batch_multi(positions_list, types_list)
+            return self.model.forward_batch_multi(positions_list, types_list,
+                                                  topology=topology)
         e_sr, l0_list = self.model.forward_batch_multi(
-            positions_list, types_list, return_embeddings=True, l0_only=True)
+            positions_list, types_list, return_embeddings=True, l0_only=True,
+            topology=topology)
         l0 = torch.cat(l0_list, dim=0)
         pos = torch.cat(positions_list, dim=0)
         batch = torch.cat([
@@ -370,6 +372,8 @@ def train_ecenet_spice(
     seed=42,
     dtype=torch.float64,
     tf32=False,              # route float32 matmuls to TF32 tensor cores (Ampere+)
+    precompute_topology=False,  # build neighbour lists once at startup (fixed
+                             # training positions) → skip the per-step nonzero syncs
     # Batching
     bucket=False,              # size-bucketed, cross-rank-aligned batching (DDP load balance)
     bucket_sort=True,          # sort by atom count before packing; False → greedy on the
@@ -553,6 +557,18 @@ def train_ecenet_spice(
     # must not be the DDP module. Includes E_lr when LES is on, so the val/test
     # MAEs measure the same total energy the loss trains.
     eval_fwd = _MultiForwardWrapper(model, les_module)
+
+    # Precompute per-structure neighbour lists once (fixed training positions)
+    # so the training step skips the O(N²) dist_mat + per-structure nonzero
+    # syncs. Training only: evaluation rebuilds topology on the fly.
+    topo_train = None
+    if precompute_topology:
+        topo_train = raw_model.build_topology(pos_train)
+        if verbose:
+            n_edges = sum(int(t[0].numel()) for t in topo_train)
+            print_flush(f"  [precompute_topology] built neighbour lists for "
+                        f"{len(topo_train):,} structures ({n_edges:,} edges total); "
+                        f"per-step nonzero syncs skipped")
 
     n_params = sum(p.numel() for p in all_params if p.requires_grad)
     if verbose:
@@ -823,7 +839,12 @@ def train_ecenet_spice(
 
             pos_rg   = [pos_train[i].detach().clone().requires_grad_(True) for i in batch_indices]
             typ_b    = [typ_train[i] for i in batch_indices]
-            eng_pred = train_model(pos_rg, typ_b)   # DDP syncs gradients here
+            # Precomputed neighbour lists for this batch (positions are fixed, so
+            # topo_train[i] matches the freshly re-leafed pos_rg). None → build
+            # topology on the fly inside forward_batch_multi.
+            topo_b = ([topo_train[i] for i in batch_indices]
+                      if topo_train is not None else None)
+            eng_pred = train_model(pos_rg, typ_b, topology=topo_b)   # DDP syncs gradients here
             eng_tgt  = torch.stack([eng_train[i] for i in batch_indices])
 
             # Per-element loss according to --loss

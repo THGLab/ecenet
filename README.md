@@ -408,6 +408,13 @@ batches share a round, so per-step work is aligned across ranks and the
 molecule-size straggler disappears — the biggest win multi-node. Measured spread
 in per-rank total atoms at `world_size=8`: 3.4% bucketed, 0.9% atom-budget.
 
+`precompute_topology=True` (SPICE trainer) builds every training structure's
+neighbour lists once at startup and reuses them each step. Training positions
+are fixed, so the topology never changes — yet the on-the-fly path recomputes
+the O(N²) distance matrix and calls `nonzero` twice per structure per step,
+each a GPU→CPU sync. Skipping them is numerics-identical (verified to 0 in
+`tests/test_spice_trainer.py`); evaluation still builds topology on the fly.
+
 `tf32=True` (both trainers) routes float32 matmuls to TF32 tensor cores on
 Ampere+. TF32 keeps ~10 mantissa bits, so A/B the validation MAE before trusting
 it. It is a float32-only mode: under `dtype=torch.float64` it warns and changes

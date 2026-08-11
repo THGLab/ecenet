@@ -224,6 +224,70 @@ def test_trainer_runs_with_atom_budget():
           f"atom-budget F={budg['test_force_mae']:.3f}); impossible budget rejected")
 
 
+def test_precomputed_topology_matches_on_the_fly():
+    """build_topology + forward_batch_multi(topology=...) must be bit-identical
+    to the on-the-fly nonzero path — energies, forces, AND parameter grads —
+    including a zero-edge single-atom structure. Then end-to-end: a trainer run
+    with precompute_topology=True reproduces the plain run exactly."""
+    from ecenet import ECENet
+
+    torch.manual_seed(0)
+    model = ECENet(n_types=4, r_cut_edge=4.0, r_cut_neighbor=4.0,
+                   l_max=2, n_max=2, embed_dim=8, n_layers=2, n_mp=2,
+                   n_max_d=4).double()
+    rng = np.random.RandomState(7)
+    pos_list = [torch.tensor(rng.uniform(-3, 3, size=(n, 3)), dtype=DTYPE)
+                for n in (5, 1, 8)]     # incl. a zero-edge single atom
+    typ_list = [torch.tensor(rng.randint(0, 4, size=p.shape[0])) for p in pos_list]
+
+    topo = model.build_topology(pos_list)
+
+    def run(topology):
+        pos_rg = [p.detach().clone().requires_grad_(True) for p in pos_list]
+        e = model.forward_batch_multi(pos_rg, typ_list, topology=topology)
+        grads = torch.autograd.grad(e.sum(), pos_rg, create_graph=True,
+                                    allow_unused=True)
+        grads = [g if g is not None else torch.zeros_like(pos_rg[k])
+                 for k, g in enumerate(grads)]
+        loss = e.sum() + sum((g ** 2).sum() for g in grads)
+        model.zero_grad()
+        loss.backward()
+        pgrads = [p.grad.clone() if p.grad is not None else None
+                  for p in model.parameters()]
+        return e.detach(), [g.detach() for g in grads], pgrads
+
+    e_fly, f_fly, pg_fly = run(None)
+    e_pre, f_pre, pg_pre = run(topo)
+
+    de = (e_fly - e_pre).abs().max().item()
+    df = max((a - b).abs().max().item() for a, b in zip(f_fly, f_pre))
+    dp = max((a - b).abs().max().item()
+             for a, b in zip(pg_fly, pg_pre) if a is not None)
+    assert de == 0.0 and df == 0.0 and dp == 0.0, \
+        f"precomputed topology diverges: dE={de:.3e} dF={df:.3e} dgrad={dp:.3e}"
+    print(f"  precomputed topology == on-the-fly (dE={de:.1e}, dF={df:.1e}, "
+          f"dparam-grad={dp:.1e}, incl. zero-edge structure)")
+
+    # End-to-end: same seed, with vs without precompute → identical metrics.
+    with tempfile.TemporaryDirectory() as d:
+        train = write_xyz(os.path.join(d, 'train.xyz'), 40, seed=4)
+        test = write_xyz(os.path.join(d, 'test.xyz'), 8, seed=5)
+        common = dict(
+            train_xyz=train, test_xyz=test, n_train=32, n_val=4, n_test=6,
+            r_cut_edge=4.0, r_cut_neighbor=4.0, l_max=2, n_max=2, embed_dim=8,
+            n_layers=1, n_max_d=4, m_max=2, n_epochs=2, batch_size=4, lr=5e-3,
+            eval_every=2, eval_batch_size=4, dtype=DTYPE, device=DEVICE,
+            seed=0, verbose=False,
+        )
+        _, plain = train_ecenet_spice(**common)
+        _, pre = train_ecenet_spice(precompute_topology=True, **common)
+    dtrain = abs(plain['test_force_mae'] - pre['test_force_mae'])
+    assert dtrain == 0.0, \
+        f"precompute_topology changed the training trajectory: dF={dtrain:.3e}"
+    print(f"  trainer with precompute_topology=True reproduces the plain run "
+          f"exactly (F={pre['test_force_mae']:.4f})")
+
+
 def _has_les():
     try:
         import les  # noqa: F401
@@ -364,6 +428,7 @@ if __name__ == '__main__':
     test_atom_budget_respects_max_batch_count()
     test_degenerate_epoch_keeps_ranks_aligned()
     test_trainer_runs_with_atom_budget()
+    test_precomputed_topology_matches_on_the_fly()
     test_les_wrapper_batched_matches_single()
     test_trainer_runs_with_les()
     test_tf32_is_a_noop_under_float64()

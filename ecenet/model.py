@@ -924,8 +924,32 @@ class ECENet(nn.Module):
             return energy, l0, l1
         return energy
 
+    @torch.no_grad()
+    def build_topology(self, positions_list):
+        """Precompute per-structure (edge_i, edge_j, nb_src, nb_dst) LOCAL indices,
+        matching forward_batch_multi's nonzero output exactly.
+
+        Pass the returned list back as forward_batch_multi(..., topology=...) to
+        skip the per-step O(N²) dist_mat + per-structure nonzero syncs. Valid only
+        for FIXED positions (e.g. an in-memory training set) — the indices go
+        stale the moment an atom crosses a cutoff. Indices land on each
+        structure's own device. (Distinct from forward_batch's topology dict,
+        which is one topology shared by every structure of the same molecule.)
+        """
+        topo = []
+        for pos in positions_list:
+            diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+            dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)
+            ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+            nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor)
+                              & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+            topo.append((ei.contiguous(), ej.contiguous(),
+                         nb_src.contiguous(), nb_dst.contiguous()))
+        return topo
+
     def forward_batch_multi(self, positions_list, types_list,
-                            return_embeddings=False, l0_only=False):
+                            return_embeddings=False, l0_only=False,
+                            topology=None):
         """Batch forward for variable-size, variable-composition structures.
 
         Only topology (edge/neighbour indices) is built per-structure in a
@@ -940,6 +964,10 @@ class ECENet(nn.Module):
                                each as a list of B per-structure tensors
             l0_only:           with return_embeddings, skip the l=1 work
                                (returns (energies, l0_list))
+            topology:          optional list of B per-structure
+                               (edge_i, edge_j, nb_src, nb_dst) LOCAL index
+                               tuples from build_topology (fixed positions);
+                               skips the per-structure dist_mat + nonzero syncs
 
         Returns:
             energies: (B,) tensor — or (energies, l0_list[, l1_list])
@@ -965,24 +993,31 @@ class ECENet(nn.Module):
         # structures, so the single batched basis is block-diagonal == per-frame.
         for b, (pos, types) in enumerate(zip(positions_list, types_list)):
             N_b = pos.shape[0]
-            # Topology (edge/neighbour indices) is non-differentiable; build it
+            # Topology (edge/neighbour indices) is non-differentiable. Either it
+            # was precomputed once and passed in (topology=... — from
+            # build_topology; skips the O(N²) dist_mat + per-structure nonzero
+            # syncs entirely, valid for fixed positions) or it is built here
             # under no_grad so dist_mat's sub/sqrt don't spawn dead nodes into
             # the force double-backward graph (the energy's distances are
             # recomputed below from the concatenated positions). atomic_e
             # (param-grad) stays OUTSIDE the no_grad.
-            with torch.no_grad():
-                diff = pos.unsqueeze(0) - pos.unsqueeze(1)              # (N_b, N_b, 3)
-                dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)      # (N_b, N_b)
-                ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+            if topology is not None:
+                ei, ej, nb_src, nb_dst = topology[b]
+            else:
+                with torch.no_grad():
+                    diff = pos.unsqueeze(0) - pos.unsqueeze(1)              # (N_b, N_b, 3)
+                    dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)      # (N_b, N_b)
+                    ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
 
             atomic_e_list.append(self.atomic_energy[types].sum())
             if len(ei) == 0:
                 atom_offset += N_b
                 continue
 
-            with torch.no_grad():
-                nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor)
-                                  & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+            if topology is None:
+                with torch.no_grad():
+                    nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor)
+                                      & (dist_mat > 1e-10)).nonzero(as_tuple=True)
 
             edge_i_list.append(ei + atom_offset)
             edge_j_list.append(ej + atom_offset)
