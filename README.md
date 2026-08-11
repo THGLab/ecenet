@@ -43,6 +43,8 @@ tools/                 developer utilities (run from the repo root)
   predict_charges.py     LES latent charges + E_lr for one frame of an ASE file
   eval_spice_dipoles.py  latent-charge dipoles vs DFT reference dipoles
                          (ChengUCB/les_fit SPICE test slices, downloaded separately)
+  eval_spice_bec.py      zero-shot Born effective charges (dP/dr via autograd,
+                         charge-flow terms included) vs the same slices' references
 ```
 
 ## Install
