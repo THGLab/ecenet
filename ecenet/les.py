@@ -129,26 +129,11 @@ class LESLongRange(nn.Module):
                                 device=positions.device)
             if n_struct is None:
                 n_struct = 1
-        if les_dipole:
-            q, u = l0[:, 0], l0[:, 1:4]
-            if cell is None:
-                return self._isolated_batched(q, positions, batch, n_struct,
-                                              return_charges, l0_is_charge=True,
-                                              u=u)
-            result = self.les(
-                latent_charges=q,
-                latent_dipoles=u,
-                positions=positions,
-                cell=cell.view(-1, 3, 3),
-                batch=batch,
-                compute_energy=True,
-            )
-            if return_charges:
-                return result["E_lr"], q
-            return result["E_lr"]
+        # unpack once; the branches below carry u alongside the charges
+        q, u = (l0[:, 0], l0[:, 1:4]) if les_dipole else (l0, None)
         if cell is None:
-            return self._isolated_batched(l0, positions, batch, n_struct,
-                                          return_charges, l0_is_charge)
+            return self._isolated_batched(q, positions, batch, n_struct,
+                                          return_charges, l0_is_charge, u=u)
         # Scope the default dtype to the input's so upstream's lazily built
         # charge MLP (and any default-dtype internals) match float64 inputs.
         prev_dtype = torch.get_default_dtype()
@@ -156,7 +141,8 @@ class LESLongRange(nn.Module):
         try:
             if l0_is_charge:
                 result = self.les(
-                    latent_charges=l0.reshape(-1),
+                    latent_charges=q.reshape(-1),
+                    latent_dipoles=u,
                     positions=positions,
                     cell=cell.view(-1, 3, 3),
                     batch=batch,
@@ -164,7 +150,7 @@ class LESLongRange(nn.Module):
                 )
             else:
                 result = self.les(
-                    desc=l0.reshape(l0.shape[0], -1),
+                    desc=q.reshape(q.shape[0], -1),
                     positions=positions,
                     cell=cell.view(-1, 3, 3),
                     batch=batch,
@@ -173,7 +159,7 @@ class LESLongRange(nn.Module):
         finally:
             torch.set_default_dtype(prev_dtype)
         if return_charges:
-            charges = (l0.reshape(-1) if l0_is_charge
+            charges = (q.reshape(-1) if l0_is_charge
                        else result["latent_charges"])
             return result["E_lr"], charges
         return result["E_lr"]
@@ -258,15 +244,52 @@ class LESLongRange(nn.Module):
         per_atom = 0.5 * (e_phi * q).sum(dim=-1)                    # (N,)
         if u is not None:
             # upstream's dipole terms with the same cross-structure masking;
-            # coefficients (qu: 1, uu: -1/2) mirror compute_potential_realspace
-            uq = u.to(positions.dtype).unsqueeze(1)                 # (N, 1, 3)
-            e_phi_u = torch.einsum('iqc,ijc->jq', uq, f_qu * same[..., None])
-            per_atom = per_atom + (e_phi_u * q).sum(dim=-1)
-            E_u = torch.einsum('ijcd,iqc->jqd', f_uu * same[..., None, None], uq)
-            per_atom = per_atom - 0.5 * (uq * E_u).sum(dim=(1, 2))
+            # coefficients (qu: 1, uu: -1/2) mirror compute_potential_realspace.
+            # `same` is pair-indexed and component-independent, so it commutes
+            # past the c/d contractions — mask the contracted (N, N) results
+            # instead of building masked copies of the (N, N, 3[, 3]) kernels
+            # (the uu copy alone would double the documented 9× memory).
+            u_ = u.to(positions.dtype)                              # (N, 3)
+            M = torch.einsum('ic,ijc->ij', u_, f_qu)
+            per_atom = per_atom + (M * same).sum(dim=0) * q[:, 0]
+            G = torch.einsum('ic,ijcd->ijd', u_, f_uu)              # (N, N, 3)
+            T = torch.einsum('ijd,jd->ij', G, u_)
+            per_atom = per_atom - 0.5 * (T * same).sum(dim=0)
         e_lr = torch.zeros(n_struct, dtype=per_atom.dtype,
                            device=per_atom.device
                            ).scatter_add(0, batch, per_atom)
         if return_charges:
             return e_lr, charges
         return e_lr
+
+
+def load_les_module(ckpt_les, model, device, dtype, load_state=True):
+    """Rebuild a ready-to-use ``LESLongRange`` from a checkpoint's ``les`` dict.
+
+    The one shared implementation of the materialise-then-load dance that
+    trainers, tools, and calculators all need: upstream builds its charge
+    head **lazily on the first forward** (it infers the descriptor width
+    then), so state loaded into an unmaterialised head would silently no-op.
+    This materialises with a synthetic probe of the model's ``l0`` width —
+    no dataset, topology, or cell required — then loads the trained state
+    (``best_state`` if present) and switches to eval mode. Edge-mode
+    read-outs bypass the head entirely (the module is parameter-free), so
+    the probe is skipped there.
+
+    ``load_state=False`` returns a materialised but freshly-initialised
+    module (what a trainer wants before its own optimiser/restore takes over).
+    """
+    module = LESLongRange(ckpt_les.get('arguments') if ckpt_les else None)
+    flags = model.les_flags
+    if not flags['l0_is_charge']:
+        with torch.no_grad():
+            l0_probe = torch.zeros(2, model._l0_dim, dtype=dtype, device=device)
+            pos_probe = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                                     dtype=dtype, device=device)
+            module(l0_probe, pos_probe, **flags)
+    module = module.to(device=device, dtype=dtype)
+    if load_state and ckpt_les:
+        module.load_state_dict(ckpt_les.get('best_state')
+                               or ckpt_les['state_dict'])
+    module.eval()
+    return module

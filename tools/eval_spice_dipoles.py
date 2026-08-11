@@ -52,25 +52,25 @@ def predict_dipoles(checkpoint_path, xyz_files, device='cpu', max_frames=None,
     model's arbitrary global sign (align downstream). skipped maps subset →
     number of frames dropped for unknown elements or a missing reference.
     """
-    from ase.io import read
+    import itertools
+
+    from ase.io import iread
     from predict_charges import load_les_model
     from train_ecenet_mptrj import build_topology
 
     device = torch.device(device)
-    model, les_module, les_state, elem_to_type, dtype = load_les_model(
+    model, les_module, hp, elem_to_type, dtype = load_les_model(
         checkpoint_path, device)
-    hp = torch.load(checkpoint_path, map_location='cpu',
-                    weights_only=False)['hparams']
-    is_charge = hp.get('les_readout', 'sum') in ('edge', 'edge_basis')
-    les_dip = bool(hp.get('les_dipole', False))
-    materialised = False
+    is_charge = model.les_flags['l0_is_charge']
+    les_dip = model.les_dipole
 
     records, skipped = [], {}
     for path in xyz_files:
         subset = os.path.splitext(os.path.basename(path))[0]
-        frames = read(path, index=':')
+        # lazy: --max_frames stops reading after N instead of parsing the file
+        frames = iread(path)
         if max_frames is not None:
-            frames = frames[:max_frames]
+            frames = itertools.islice(frames, max_frames)
         skipped[subset] = 0
         for fi, atoms in enumerate(frames):
             symbols = atoms.get_chemical_symbols()
@@ -98,14 +98,6 @@ def predict_dipoles(checkpoint_path, xyz_files, device='cpu', max_frames=None,
                     if les_dip:
                         u = l0[:, 1:4].cpu().numpy()
                 else:
-                    if not materialised:
-                        # upstream's charge head builds lazily on first
-                        # forward; only then can the trained state be loaded
-                        les_module(l0, pos, cell=None)
-                        les_module = les_module.to(device=device, dtype=dtype)
-                        les_module.load_state_dict(les_state)
-                        les_module.eval()
-                        materialised = True
                     _, q = les_module(l0, pos, cell=None, return_charges=True)
             q = q.cpu().numpy().reshape(-1)
             q0 = q if keep_mean else q - q.mean()

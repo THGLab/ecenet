@@ -50,6 +50,11 @@ class ECENetCalculator(Calculator):
 
     implemented_properties = ['energy', 'forces', 'stress']
 
+    # Whether _energy_pbc consumes the cell tensor. The SR model does not
+    # (PBC enters through the shift vectors), so the base skips building it;
+    # the LES subclass flips this for its Ewald term.
+    _uses_cell = False
+
     def __init__(self, model, device=None, dtype=torch.float64,
                  energy_reference=None, element_to_type=None,
                  energy_units='eV', energy_mean=0.0,
@@ -82,7 +87,7 @@ class ECENetCalculator(Calculator):
     def from_checkpoint(cls, checkpoint_path, device=None, dtype=None,
                         energy_reference=None, element_to_type=None,
                         energy_units=None, log_timings=False,
-                        ignore_les=False):
+                        ignore_les=False, ckpt=None):
         """Load model and hparams directly from a checkpoint file.
 
         The checkpoint is expected to be self-describing: the training scripts
@@ -116,7 +121,12 @@ class ECENetCalculator(Calculator):
         elif isinstance(device, str):
             device = torch.device(device)
 
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        # ckpt: optional pre-loaded checkpoint dict — callers that already
+        # deserialised the file (load_calculator, the LES subclass) pass it
+        # through instead of paying a second multi-hundred-MB torch.load.
+        if ckpt is None:
+            ckpt = torch.load(checkpoint_path, map_location=device,
+                              weights_only=False)
 
         # Checkpoints trained jointly with LES (train_ecenet_xyz use_les=True)
         # carry a top-level 'les' dict. This calculator computes only the
@@ -129,9 +139,10 @@ class ECENetCalculator(Calculator):
                 "Checkpoint was trained jointly with LES long-range "
                 "electrostatics; ECENetCalculator computes only the "
                 "short-range energy and would silently drop the E_lr term. "
-                "Use ECENetLESCalculator.from_checkpoint for the full "
-                "E_sr + E_lr, or pass ignore_les=True to load the "
-                "short-range part deliberately."
+                "Load through ecenet.calculator.load_calculator (which "
+                "dispatches to ECENetLESCalculator for the full E_sr + E_lr), "
+                "or pass ignore_les=True to load the short-range part "
+                "deliberately."
             )
 
         hp = ckpt.get('hparams')
@@ -332,8 +343,10 @@ class ECENetCalculator(Calculator):
         pos_s      = pos + pos @ strain
         shift_e_s  = shift_vecs_edge + shift_vecs_edge @ strain
         shift_nb_s = shift_vecs_nb   + shift_vecs_nb   @ strain
-        cell_t = torch.tensor(cell_np, dtype=self.dtype, device=self.device)
-        cell_s = cell_t + cell_t @ strain
+        cell_s = None
+        if self._uses_cell:
+            cell_t = torch.tensor(cell_np, dtype=self.dtype, device=self.device)
+            cell_s = cell_t + cell_t @ strain
         energy_tensor = self._energy_pbc(
             pos_s, types, edge_i, edge_j, shift_e_s, nb_src, nb_dst,
             shift_nb_s, cell=cell_s)
@@ -376,7 +389,8 @@ class ECENetCalculator(Calculator):
                 pos, types, edge_i, edge_j, shift_vecs_edge,
                 nb_src, nb_dst, shift_vecs_nb, cell)
         else:
-            cell_t = torch.tensor(cell, dtype=self.dtype, device=self.device)
+            cell_t = (torch.tensor(cell, dtype=self.dtype, device=self.device)
+                      if self._uses_cell else None)
             energy_tensor = self._energy_pbc(
                 pos, types, edge_i, edge_j, shift_vecs_edge,
                 nb_src, nb_dst, shift_vecs_nb, cell=cell_t)
@@ -472,61 +486,43 @@ class ECENetLESCalculator(ECENetCalculator):
     module is then parameter-free.
     """
 
-    def __init__(self, model, les_module, les_is_charge=False,
-                 les_dipole=False, **kwargs):
+    _uses_cell = True
+
+    def __init__(self, model, les_module=None, **kwargs):
+        """The l0 convention (l0_is_charge / les_dipole) is read off the
+        model — it is a pure function of the model's ``les_readout`` and
+        ``les_dipole`` hparams, so taking it as arguments could only ever
+        mis-pair them (silently: a wrong ``l0_is_charge`` would route l0
+        through a randomly-initialised upstream head). ``les_module=None``
+        exists so the base ``from_checkpoint`` can construct the instance
+        before the module is built; it is attached right after.
+        """
         super().__init__(model, **kwargs)
         self.les_module = les_module
-        self.les_module.eval()
-        self.les_is_charge = bool(les_is_charge)
-        self.les_dipole = bool(les_dipole)
+        self.les_flags = model.les_flags
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path, device=None, dtype=None,
                         energy_reference=None, element_to_type=None,
-                        energy_units=None, log_timings=False):
+                        energy_units=None, log_timings=False, ckpt=None):
         """Load model + LES module from a joint checkpoint (see base class)."""
-        ckpt = torch.load(checkpoint_path, map_location='cpu',
-                          weights_only=False)
+        if ckpt is None:
+            ckpt = torch.load(checkpoint_path, map_location='cpu',
+                              weights_only=False)
         if 'les' not in ckpt:
             raise ValueError(
                 "Checkpoint carries no 'les' dict — it is a short-range "
                 "model; use ECENetCalculator.from_checkpoint instead.")
 
-        base = ECENetCalculator.from_checkpoint(
+        calc = super().from_checkpoint(
             checkpoint_path, device=device, dtype=dtype,
             energy_reference=energy_reference, element_to_type=element_to_type,
             energy_units=energy_units, log_timings=log_timings,
-            ignore_les=True)
+            ignore_les=True, ckpt=ckpt)
 
-        from ecenet.les import LESLongRange
-        model = base.model
-        les_is_charge = getattr(model, 'les_readout', 'sum') in ('edge', 'edge_basis')
-        les_dipole = bool(getattr(model, 'les_dipole', False))
-        les_module = LESLongRange(ckpt['les'].get('arguments'))
-        # Upstream builds its charge head lazily on the first forward (it
-        # infers the descriptor width then) — materialise with a probe of the
-        # model's l0 width, then load the trained state. Edge modes bypass the
-        # head (parameter-free); the probe is still harmless.
-        with torch.no_grad():
-            l0_probe = torch.zeros(2, model._l0_dim, dtype=base.dtype,
-                                   device=base.device)
-            pos_probe = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-                                     dtype=base.dtype, device=base.device)
-            les_module(l0_probe, pos_probe, l0_is_charge=les_is_charge,
-                       les_dipole=les_dipole)
-        les_module = les_module.to(device=base.device, dtype=base.dtype)
-        les_module.load_state_dict(ckpt['les'].get('best_state')
-                                   or ckpt['les']['state_dict'])
-
-        calc = cls(model, les_module,
-                   les_is_charge=les_is_charge, les_dipole=les_dipole,
-                   device=base.device, dtype=base.dtype,
-                   energy_reference=base.energy_reference,
-                   element_to_type=base.element_to_type,
-                   log_timings=log_timings)
-        # unit metadata was resolved by the base loader; copy it verbatim
-        calc._to_ev = base._to_ev
-        calc._energy_mean_ev = base._energy_mean_ev
+        from ecenet.les import load_les_module
+        calc.les_module = load_les_module(ckpt['les'], calc.model,
+                                          calc.device, calc.dtype)
         return calc
 
     # ── Energy seams: add E_lr on the same graph ────────────────────────────
@@ -534,8 +530,7 @@ class ECENetLESCalculator(ECENetCalculator):
     def _energy_free(self, pos, types):
         e_sr, l0 = self.model.forward(pos, types, return_embeddings=True,
                                       l0_only=True)
-        return e_sr + self.les_module(l0, pos, l0_is_charge=self.les_is_charge,
-                                      les_dipole=self.les_dipole).sum()
+        return e_sr + self.les_module(l0, pos, **self.les_flags).sum()
 
     def _energy_pbc(self, pos, types, edge_i, edge_j, shift_vecs_edge,
                     nb_src, nb_dst, shift_vecs_nb, cell=None):
@@ -544,5 +539,18 @@ class ECENetLESCalculator(ECENetCalculator):
             nb_src, nb_dst, shift_vecs_nb,
             return_embeddings=True, l0_only=True)
         return e_sr + self.les_module(l0, pos, cell=cell,
-                                      l0_is_charge=self.les_is_charge,
-                                      les_dipole=self.les_dipole).sum()
+                                      **self.les_flags).sum()
+
+
+def load_calculator(checkpoint_path, **kwargs):
+    """Load the right calculator for a checkpoint, whatever it was trained with.
+
+    One deserialisation, one dispatch: joint-LES checkpoints (top-level
+    ``les`` dict) get :class:`ECENetLESCalculator` so MD and single points
+    run on the trained PES; short-range ones get :class:`ECENetCalculator`.
+    Every driver/example should load through here rather than re-implementing
+    the peek. ``kwargs`` are forwarded to ``from_checkpoint``.
+    """
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    cls = ECENetLESCalculator if 'les' in ckpt else ECENetCalculator
+    return cls.from_checkpoint(checkpoint_path, ckpt=ckpt, **kwargs)

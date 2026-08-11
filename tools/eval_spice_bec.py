@@ -49,25 +49,25 @@ def predict_becs(checkpoint_path, xyz_files, device='cpu', max_frames=None):
     'bec_pred' (N, 3, 3) carrying the model's arbitrary global sign, and
     'bec_ref' (N, 3, 3).
     """
-    from ase.io import read
+    import itertools
+
+    from ase.io import iread
     from predict_charges import load_les_model
     from train_ecenet_mptrj import build_topology
 
     device = torch.device(device)
-    model, les_module, les_state, elem_to_type, dtype = load_les_model(
+    model, les_module, hp, elem_to_type, dtype = load_les_model(
         checkpoint_path, device)
-    hp = torch.load(checkpoint_path, map_location='cpu',
-                    weights_only=False)['hparams']
-    is_charge = hp.get('les_readout', 'sum') in ('edge', 'edge_basis')
-    les_dip = bool(hp.get('les_dipole', False))
-    materialised = is_charge   # edge modes: parameter-free, nothing to load
+    is_charge = model.les_flags['l0_is_charge']
+    les_dip = model.les_dipole
 
     records, skipped = [], {}
     for path in xyz_files:
         subset = os.path.splitext(os.path.basename(path))[0]
-        frames = read(path, index=':')
+        # lazy: --max_frames stops reading after N instead of parsing the file
+        frames = iread(path)
         if max_frames is not None:
-            frames = frames[:max_frames]
+            frames = itertools.islice(frames, max_frames)
         skipped[subset] = 0
         for fi, atoms in enumerate(frames):
             symbols = atoms.get_chemical_symbols()
@@ -92,13 +92,6 @@ def predict_becs(checkpoint_path, xyz_files, device='cpu', max_frames=None):
                 q = l0[:, 0]
                 u = l0[:, 1:4] if les_dip else None
             else:
-                if not materialised:
-                    with torch.no_grad():
-                        les_module(l0.detach(), pos.detach(), cell=None)
-                    les_module = les_module.to(device=device, dtype=dtype)
-                    les_module.load_state_dict(les_state)
-                    les_module.eval()
-                    materialised = True
                 q = les_module.les.atomwise(
                     l0.reshape(l0.shape[0], -1),
                     torch.zeros(len(symbols), dtype=torch.long, device=device))

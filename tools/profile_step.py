@@ -14,7 +14,7 @@ from ase.io import read
 from ase.neighborlist import neighbor_list as ase_neighbor_list
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root → import ecenet
-from ecenet.calculator import ECENetCalculator
+from ecenet.calculator import load_calculator
 from ecenet.radial import radial_basis
 from ecenet.spherical import build_D_block_from_list, recursive_wigner_D, wigner_rotate
 
@@ -51,27 +51,18 @@ if args.tf32:
 atoms  = read(args.box, index=args.frame_idx)
 atoms.set_pbc(True)
 
-# LES checkpoints are rejected by from_checkpoint (the calculator has no
-# long-range term); load the SR part with ignore_les and rebuild the LES
-# module alongside so the E_lr cost is profiled too.
-ckpt_raw = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-has_les  = 'les' in ckpt_raw
-
-calc   = ECENetCalculator.from_checkpoint(args.checkpoint, dtype=dtype,
-                                          ignore_les=has_les)
+# load_calculator dispatches: a joint-LES checkpoint yields the LES-aware
+# calculator with the module already materialised and loaded, so the E_lr
+# cost is profiled too (flags read off the model — the single source).
+calc   = load_calculator(args.checkpoint, dtype=dtype)
 model  = calc.model
 device = calc.device
 
-les_module = None
-if has_les:
-    from ecenet.les import LESLongRange
-    _hp = ckpt_raw['hparams']
-    les_readout   = _hp.get('les_readout', 'sum')
-    les_is_charge = les_readout in ('edge', 'edge_basis')
-    les_dipole    = bool(_hp.get('les_dipole', False))
-    les_module = LESLongRange(ckpt_raw['les'].get('arguments'))
-    print(f"[les] checkpoint carries LES (readout={les_readout}"
-          f"{', dipole' if les_dipole else ''}) — profiling E_lr too")
+les_module = getattr(calc, 'les_module', None)
+if les_module is not None:
+    les_flags = model.les_flags
+    print(f"[les] checkpoint carries LES (readout={model.les_readout}"
+          f"{', dipole' if model.les_dipole else ''}) — profiling E_lr too")
 
 if args.fuse_nonlin:
     model.set_activation_fused(True)
@@ -317,14 +308,6 @@ if les_module is not None:
         _, l0 = model.forward_pbc(pos_d, types, edge_i, edge_j, shift_e,
                                   nb_src, nb_dst, shift_n,
                                   return_embeddings=True, l0_only=True)
-        # upstream's charge head builds lazily on the first forward; only
-        # then can the trained state be loaded (edge modes: parameter-free)
-        les_module(l0, pos_d, cell=cell_t, l0_is_charge=les_is_charge,
-                   les_dipole=les_dipole)
-        les_module = les_module.to(device=device, dtype=dtype)
-        les_module.load_state_dict(ckpt_raw['les'].get('best_state')
-                                   or ckpt_raw['les']['state_dict'])
-        les_module.eval()
 
     # marginal cost of the (l0, l1)/charge read-out on top of the SR forward
     time_fn("forward_pbc + l0 read-out",
@@ -332,16 +315,12 @@ if les_module is not None:
                                       shift_e, nb_src, nb_dst, shift_n,
                                       return_embeddings=True, l0_only=True))
     time_fn("E_lr (periodic Ewald, this cell)",
-            lambda: les_module(l0, pos_d, cell=cell_t,
-                               l0_is_charge=les_is_charge,
-                               les_dipole=les_dipole))
+            lambda: les_module(l0, pos_d, cell=cell_t, **les_flags))
     # isolated-path reference (what a SPICE training step pays). Dense
     # (N, N[, 3, 3]) kernels — skip on big boxes rather than OOM the profile.
     if len(atoms) <= 1000:
         time_fn("E_lr (isolated path, cell=None)",
-                lambda: les_module(l0, pos_d, cell=None,
-                                   l0_is_charge=les_is_charge,
-                                   les_dipole=les_dipole))
+                lambda: les_module(l0, pos_d, cell=None, **les_flags))
     else:
         print(f"  (isolated-path timing skipped: {len(atoms)} atoms → dense "
               "pair kernels would dominate memory)")
@@ -368,9 +347,7 @@ if les_module is not None:
             e_sr, l0_g = model.forward_pbc(p, types, edge_i, edge_j, shift_e,
                                            nb_src, nb_dst, shift_n,
                                            return_embeddings=True, l0_only=True)
-            e = e_sr + les_module(l0_g, p, cell=cell_t,
-                                  l0_is_charge=les_is_charge,
-                                  les_dipole=les_dipole).sum()
+            e = e_sr + les_module(l0_g, p, cell=cell_t, **les_flags).sum()
             return torch.autograd.grad(e, p)[0]
 
     time_fn("forward_pbc + E_lr + forces (joint graph)", fwd_forces_les)

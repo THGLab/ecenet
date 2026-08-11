@@ -41,6 +41,11 @@ from ecenet.film import ElementFiLM
 from ecenet.radial import find_edges, get_cutoff_fn, radial_basis
 from ecenet.spherical import build_D1_from_rhat, build_D_block, spherical_harmonics_float64, wigner_rotate
 
+# les_readout modes whose l0 IS the latent charge itself (upstream's atomwise
+# head bypassed via l0_is_charge). The single definition — consumers read the
+# derived facts off the model via `les_flags` rather than re-spelling this.
+_LES_EDGE_MODES = ('edge', 'edge_basis')
+
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
@@ -235,11 +240,11 @@ class ECENet(nn.Module):
         #   f_cut, as in the energy readout). Built below, after the output-
         #   MLP config it mirrors. Last layer standard init, NOT output_net's
         #   near-zero init — see the saddle note under 'edge'.
-        if les_readout not in ('sum', 'softmax', 'edge', 'edge_basis'):
+        if les_readout not in ('sum', 'softmax', *_LES_EDGE_MODES):
             raise ValueError("les_readout must be 'sum', 'softmax', 'edge' or "
                              f"'edge_basis', got {les_readout!r}")
         self.les_readout = les_readout
-        _edge_mode = les_readout in ('edge', 'edge_basis')
+        _edge_mode = les_readout in _LES_EDGE_MODES
         # les_dipole: the edge head also emits a per-edge scalar d_e whose
         # bond-dipole contribution d_e·r̂_e is scattered alongside the charge —
         # l0 is then PACKED as (n_atoms, 4): column 0 the latent charge,
@@ -259,7 +264,8 @@ class ECENet(nn.Module):
         self.les_dipole = bool(les_dipole)
         self._l0_dim = (4 if les_dipole else 1) if _edge_mode else 2 * embed_dim
         # les_charge_scale: fixed multiplier on the edge-mode latent charge
-        # (MACELES's output_scale; they ship 0.1). With standard head init,
+        # — the whole packed [q | u] when les_dipole is on, keeping the q–u
+        # sign coupling intact (MACELES's output_scale; they ship 0.1). With standard head init,
         # q = s·q_raw starts small-but-nonzero — off the quadratic energy's
         # q=0 saddle, but with E_lr suppressed ~s² early, so the short-range
         # fit leads and the charges learn gently relative to it. Not a
@@ -411,20 +417,33 @@ class ECENet(nn.Module):
         # last layer widens to a second n_output_out block (dipole channels,
         # dotted with the same radial basis), zero-init per the note above.
         if les_readout == 'edge_basis':
-            q_dims = mlp_dims[:-1] + [mlp_dims[-1] * (2 if les_dipole else 1)]
+            q_dims = mlp_dims[:-1] + [n_output_out * (2 if les_dipole else 1)]
             self.les_edge_charge = OutputMLP(q_dims, activation=act(),
                                              zero_init_last=False)
             if les_dipole:
                 with torch.no_grad():
                     last = self.les_edge_charge.linears[-1]
-                    last.weight[mlp_dims[-1]:].zero_()       # dipole block
-                    last.bias[mlp_dims[-1]:].zero_()
+                    last.weight[n_output_out:].zero_()       # dipole block
+                    last.bias[n_output_out:].zero_()
 
         # ── Per-type atomic energy baseline ──────────────────────────────
         self.atomic_energy = nn.Parameter(torch.zeros(n_types))
 
 
     # ── Helpers ────────────────────────────────────────────────────────────
+
+    @property
+    def les_flags(self):
+        """The l0 convention as ``LESLongRange.forward`` kwargs.
+
+        ``{'l0_is_charge': ..., 'les_dipole': ...}`` — the single source of
+        truth for how this model's ``l0`` read-out is to be interpreted
+        (edge modes: l0 IS the charge, packed [q | u] under ``les_dipole``).
+        Call sites do ``les_module(l0, pos, ..., **model.les_flags)`` instead
+        of re-deriving the flags from hparams or ``les_readout`` literals.
+        """
+        return {'l0_is_charge': self.les_readout in _LES_EDGE_MODES,
+                'les_dipole': self.les_dipole}
 
     def _compute_ace_basis(self, pos_batch, nb_src, nb_dst, types, shift_vecs_nb=None):
         """Compute ACE atomic basis: (B, N, n_types, n_max, n_sph)."""
@@ -661,8 +680,6 @@ class ECENet(nn.Module):
                 h_l0 = torch.cat([out[:, :1], out[:, 1:2] * r_hat], dim=1)
             else:
                 h_l0 = out
-            if self.les_charge_scale != 1.0:
-                h_l0 = h_l0 * self.les_charge_scale
         elif self.les_readout == 'softmax':
             # Same shape as the MP layers' softmax path (one score slot):
             #   a_e = exp(s_e)·f_cut_e / (Σ_{e'→j} exp(s_e')·f_cut_e' + eps) · f_cut_e
@@ -687,6 +704,12 @@ class ECENet(nn.Module):
 
         l0 = torch.zeros(n_atoms, h_l0.shape[1], device=device, dtype=dtype
                          ).scatter_add(0, edge_j[:, None].expand_as(h_l0), h_l0)
+        # scale after the scatter — scatter_add is linear, and atoms are
+        # ~30-60× fewer than edges (exact same result, applies to l0 only:
+        # l1 keeps the plain unweighted sum)
+        if (self.les_charge_scale != 1.0
+                and self.les_readout in _LES_EDGE_MODES):
+            l0 = l0 * self.les_charge_scale
 
         if not with_l1:
             return l0, None

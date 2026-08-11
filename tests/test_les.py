@@ -378,7 +378,7 @@ def test_edge_dipole_les_energy():
     packed = torch.cat([q[:, None], u], dim=1)
 
     p_a = pos.clone().requires_grad_(True)
-    e = lr(torch.cat([q[:, None], u], dim=1), p_a, batch=batch, n_struct=2,
+    e = lr(packed, p_a, batch=batch, n_struct=2,
            l0_is_charge=True, les_dipole=True)
     f_a = torch.autograd.grad(e.sum(), p_a)[0]
     p_b = pos.clone().requires_grad_(True)

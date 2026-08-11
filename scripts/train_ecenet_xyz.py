@@ -301,17 +301,13 @@ def train_ecenet_xyz(
     if use_les:
         from ecenet.les import LESLongRange
         les_module = LESLongRange(les_arguments)
-        # les_readout='edge': the model's l0 IS the latent charge; upstream's
-        # atomwise head is bypassed and the LES module holds no parameters.
-        les_is_charge = les_readout in ('edge', 'edge_basis')
         d0 = train_data[0]
         with torch.no_grad():
             _, l0 = model.forward_pbc(
                 d0['pos'], d0['types'], d0['edge_i'], d0['edge_j'], d0['shift_e'],
                 d0['nb_src'], d0['nb_dst'], d0['shift_nb'],
                 return_embeddings=True, l0_only=True)
-            les_module(l0, d0['pos'], cell=d0['cell'],
-                       l0_is_charge=les_is_charge, les_dipole=les_dipole)
+            les_module(l0, d0['pos'], cell=d0['cell'], **model.les_flags)
         les_module = les_module.to(device=device, dtype=dtype)
 
     params = list(model.parameters())
@@ -471,8 +467,7 @@ def train_ecenet_xyz(
                     d['nb_src'], d['nb_dst'], shift_nb_in,
                     return_embeddings=True, l0_only=True)
                 e_lr = les_module(l0, pos_in, cell=cell_in,
-                                  l0_is_charge=les_is_charge,
-                                  les_dipole=les_dipole)
+                                  **model.les_flags)
                 energies.append(e_sr + e_lr.sum())
             else:
                 energies.append(model.forward_pbc(

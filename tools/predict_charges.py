@@ -31,22 +31,25 @@ import torch
 
 
 def load_les_model(checkpoint_path, device):
-    """Rebuild (model, les_module, element_to_type, e_ref) from a checkpoint.
+    """Rebuild (model, les_module, hparams, element_to_type, dtype).
 
-    Uses the best-val weights when present. The upstream LES charge head is
-    built lazily on its first forward, so the caller must run one forward
-    through ``les_module`` before ``load_les_state`` (below) — loading state
-    into an unmaterialised head would silently no-op.
+    Uses the best-val weights when present. The returned ``les_module`` is
+    ready to use — materialised and loaded via ``ecenet.les.load_les_module``
+    (which owns the lazy-upstream-head ordering trap) — and ``hparams`` is
+    the checkpoint's dict so callers need no second ``torch.load``. The l0
+    convention comes off the model: ``model.les_flags``.
     """
     from ecenet import ECENet
+    from ecenet.les import load_les_module
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if 'les' not in ckpt:
         raise ValueError(
             f"{checkpoint_path} carries no 'les' dict — this tool is for "
-            "checkpoints trained with train_ecenet_xyz(use_les=True).")
+            "checkpoints trained with use_les=True.")
 
-    hp = dict(ckpt['hparams'])
+    hparams = dict(ckpt['hparams'])
+    hp = dict(hparams)
     n_mp = hp.pop('n_mp', 1)
     state = ckpt.get('best_state') or ckpt['model']
     dtype = next(iter(state.values())).dtype
@@ -58,11 +61,8 @@ def load_les_model(checkpoint_path, device):
     model.load_state_dict(state)
     model.eval()
 
-    from ecenet.les import LESLongRange
-    les_module = LESLongRange(ckpt['les'].get('arguments'))
-    les_state = ckpt['les'].get('best_state') or ckpt['les']['state_dict']
-
-    return model, les_module, les_state, ckpt['element_to_type'], dtype
+    les_module = load_les_module(ckpt['les'], model, device, dtype)
+    return model, les_module, hparams, ckpt['element_to_type'], dtype
 
 
 def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
@@ -71,7 +71,7 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
     from train_ecenet_mptrj import build_topology
 
     device = torch.device(device)
-    model, les_module, les_state, elem_to_type, dtype = load_les_model(
+    model, les_module, hp, elem_to_type, dtype = load_les_model(
         checkpoint_path, device)
 
     atoms = read(data_path, index=frame)
@@ -89,25 +89,15 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
     cell = (torch.tensor(cell_np, dtype=dtype, device=device)
             if periodic else None)
 
-    hp = torch.load(checkpoint_path, map_location='cpu', weights_only=False)['hparams']
     ei, ej, she, ni, nj, shn = build_topology(
         atoms.get_positions(), cell_np, periodic,
         hp['r_cut_edge'], hp['r_cut_neighbor'], device, dtype)
 
-    # les_readout='edge': l0 IS the charge; the LES module holds no state.
-    # les_dipole: l0 is packed (N, 4) = [q | u] (bond-dipole read-out).
-    is_charge = hp.get('les_readout', 'sum') in ('edge', 'edge_basis')
-    les_dip = bool(hp.get('les_dipole', False))
     with torch.no_grad():
         _, l0 = model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
                                   return_embeddings=True, l0_only=True)
-        les_module(l0, pos, cell=cell, l0_is_charge=is_charge,
-                   les_dipole=les_dip)          # materialise the lazy head...
-        les_module = les_module.to(device=device, dtype=dtype)
-        les_module.load_state_dict(les_state)   # ...then load the trained one
-        les_module.eval()
         e_lr, q = les_module(l0, pos, cell=cell, return_charges=True,
-                             l0_is_charge=is_charge, les_dipole=les_dip)
+                             **model.les_flags)
 
     out = {
         'symbols': np.array(symbols),
@@ -115,7 +105,7 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
         'charges': q.cpu().numpy().reshape(-1),
         'e_lr': float(e_lr.sum()),
     }
-    if les_dip:
+    if model.les_dipole:
         out['dipoles'] = l0[:, 1:4].cpu().numpy()
     if 'q' in atoms.arrays:
         out['charges_ref'] = np.asarray(atoms.arrays['q'], dtype=np.float64)
