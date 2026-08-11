@@ -292,8 +292,22 @@ materialise it with one throwaway forward before the DDP wrap / optimiser /
 checkpoint restore. LES checkpoints carry a top-level `les` dict;
 `ECENetCalculator.from_checkpoint` **refuses** them rather than silently
 dropping the long-range term (`ignore_les=True` loads the short-range part
-deliberately). An LES-aware calculator and joint training in the MPtrj
-trainer are not yet ported.
+deliberately). For MD and single-point use, **`ECENetLESCalculator`** loads a
+joint checkpoint and evaluates `E = E_sr + E_lr` on one autograd graph —
+forces from the joint backward, and stress from a strain pass that strains
+positions, shift vectors, *and the cell*, so the Ewald term's explicit cell
+dependence is included (verified against finite differences). Non-periodic
+systems use the isolated pairwise path, periodic ones reciprocal-space
+Ewald; `examples/run_md_xyz.py` picks the right calculator automatically:
+
+```python
+from ecenet.calculator import ECENetLESCalculator
+atoms.calc = ECENetLESCalculator.from_checkpoint('water_les.mdl')
+print(atoms.get_potential_energy())   # E_sr + E_lr, eV
+```
+
+It refuses short-range checkpoints (symmetric with `ECENetCalculator`
+refusing LES ones). Joint training in the MPtrj trainer is not yet ported.
 
 > **IP / licensing.** The `les` package is CC BY-NC 4.0 (**non-commercial**);
 > it is an optional dependency and none of its code is included in this

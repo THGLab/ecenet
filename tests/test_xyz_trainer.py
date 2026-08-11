@@ -237,6 +237,109 @@ def test_calculator_rejects_les_checkpoint():
     print("  rejected without ignore_les, loads (SR-only) with it\n")
 
 
+def test_les_calculator():
+    """ECENetLESCalculator: energy/forces equal the manual joint graph
+    (E_sr + E_lr + Σe_ref), analytic stress matches FD through the strained
+    cell (the Ewald term's cell dependence included), pbc=False takes the
+    isolated path, and a short-range checkpoint is refused (symmetric with
+    ECENetCalculator refusing LES ones)."""
+    if not _has_les():
+        print("=== SKIP: LES calculator (optional `les` package not installed) ===\n")
+        return
+    print("=== ECENetLESCalculator: E_sr + E_lr, forces, stress FD ===")
+    from ase import Atoms
+
+    from ecenet.calculator import ECENetLESCalculator
+
+    with tempfile.TemporaryDirectory() as td:
+        ckpt = os.path.join(td, 'les_calc.mdl')
+        train_ecenet_xyz(
+            train_structures=make_structures(8, seed=11), n_val=2,
+            use_les=True, les_readout='edge_basis', les_dipole=True,
+            checkpoint_path=ckpt, n_epochs=2, batch_size=4, lr=5e-3, **COMMON)
+        calc = ECENetLESCalculator.from_checkpoint(ckpt, device='cpu')
+
+        s = make_structures(1, seed=12, box=(8.5, 9.0))[0]   # MIC-safe box
+        atoms = Atoms(numbers=s['numbers'], positions=s['positions'],
+                      cell=s['cell'], pbc=True)
+        atoms.calc = calc
+        e_calc = atoms.get_potential_energy()
+        f_calc = atoms.get_forces()
+
+        # manual joint graph, same weights + same (MIC) topology
+        types = torch.tensor(
+            [calc.element_to_type[sym] for sym in atoms.get_chemical_symbols()],
+            dtype=torch.long)
+        pos = torch.tensor(s['positions'], dtype=DTYPE).requires_grad_(True)
+        ei, ej, she = calc._gpu_neighbor_list(pos.detach(), s['cell'],
+                                              calc.model.r_cut_edge)
+        ni, nj, shn = calc._gpu_neighbor_list(pos.detach(), s['cell'],
+                                              calc.model.r_cut_neighbor)
+        e_sr, l0 = calc.model.forward_pbc(pos, types, ei, ej, she, ni, nj, shn,
+                                          return_embeddings=True, l0_only=True)
+        cell_t = torch.tensor(s['cell'], dtype=DTYPE)
+        e_man = e_sr + calc.les_module(l0, pos, cell=cell_t, l0_is_charge=True,
+                                       les_dipole=True).sum()
+        f_man = -torch.autograd.grad(e_man, pos)[0].numpy()
+        e_ref_sum = sum(calc.energy_reference[sym]
+                        for sym in atoms.get_chemical_symbols())
+        de = abs(e_calc - (e_man.item() + e_ref_sum))
+        df = np.abs(f_calc - f_man).max()
+        assert de < 1e-10, f"calculator energy != manual joint graph: {de:.3e}"
+        assert df < 1e-10, f"calculator forces != manual joint graph: {df:.3e}"
+        # E_lr is actually in the number (dipoles were perturbed by training)
+        e_lr = calc.les_module(l0.detach(), pos.detach(), cell=cell_t,
+                               l0_is_charge=True, les_dipole=True).sum()
+        assert abs(float(e_lr)) > 0, "E_lr is identically zero in the test"
+
+        # analytic stress vs FD: deform positions AND cell (x → x·(1+ε)),
+        # which is exactly what the strain pass differentiates
+        stress_v = atoms.get_stress()   # Voigt [xx, yy, zz, yz, xz, xy]
+        V = abs(np.linalg.det(s['cell']))
+        eps = 1e-6
+        max_err = 0.0
+        for (a, b), vi in [((0, 0), 0), ((2, 2), 2), ((0, 1), 5)]:
+            E = np.zeros((3, 3)); E[a, b] = eps
+            es = []
+            for sign in (+1, -1):
+                F = np.eye(3) + sign * E
+                at = Atoms(numbers=s['numbers'],
+                           positions=s['positions'] @ F,
+                           cell=s['cell'] @ F, pbc=True)
+                at.calc = calc
+                es.append(at.get_potential_energy())
+            fd = (es[0] - es[1]) / (2 * eps) / V
+            max_err = max(max_err, abs(fd - stress_v[vi]))
+        assert max_err < 1e-7, f"stress FD mismatch (incl. Ewald): {max_err:.2e}"
+
+        # pbc=False → isolated path
+        atoms_free = Atoms(numbers=s['numbers'], positions=s['positions'])
+        atoms_free.calc = calc
+        e_free = atoms_free.get_potential_energy()
+        pos_f = torch.tensor(s['positions'], dtype=DTYPE)
+        with torch.no_grad():
+            e_sr_f, l0_f = calc.model(pos_f, types, return_embeddings=True,
+                                      l0_only=True)
+            e_man_f = e_sr_f + calc.les_module(l0_f, pos_f, l0_is_charge=True,
+                                               les_dipole=True).sum()
+        dfree = abs(e_free - (float(e_man_f) + e_ref_sum))
+        assert dfree < 1e-10, f"isolated path mismatch: {dfree:.3e}"
+
+        # a short-range checkpoint is refused
+        ckpt_sr = os.path.join(td, 'sr.mdl')
+        train_ecenet_xyz(
+            train_structures=make_structures(6, seed=13), n_val=2,
+            use_les=False, checkpoint_path=ckpt_sr,
+            n_epochs=1, batch_size=4, lr=5e-3, **COMMON)
+        try:
+            ECENetLESCalculator.from_checkpoint(ckpt_sr, device='cpu')
+            raise AssertionError("LES calculator should refuse an SR checkpoint")
+        except ValueError as e:
+            assert 'les' in str(e).lower()
+    print(f"  energy/forces == manual joint graph (dE={de:.1e}, dF={df:.1e}); "
+          f"stress FD {max_err:.1e}; isolated path {dfree:.1e}; SR refused\n")
+
+
 def test_tensorize_keeps_cell():
     print("=== tensorize: cell kept for periodic, None otherwise ===")
     structs = make_structures(2, seed=5)
@@ -257,4 +360,5 @@ if __name__ == '__main__':
     test_les_force_fd()
     test_smoke_train_les()
     test_calculator_rejects_les_checkpoint()
+    test_les_calculator()
     print("ALL TESTS PASSED")

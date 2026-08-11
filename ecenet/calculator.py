@@ -129,8 +129,9 @@ class ECENetCalculator(Calculator):
                 "Checkpoint was trained jointly with LES long-range "
                 "electrostatics; ECENetCalculator computes only the "
                 "short-range energy and would silently drop the E_lr term. "
-                "An LES-aware calculator is not yet available. Pass "
-                "ignore_les=True to load the short-range part anyway."
+                "Use ECENetLESCalculator.from_checkpoint for the full "
+                "E_sr + E_lr, or pass ignore_les=True to load the "
+                "short-range part deliberately."
             )
 
         hp = ckpt.get('hparams')
@@ -293,14 +294,35 @@ class ECENetCalculator(Calculator):
         self._sync()
         return time.perf_counter()
 
+    # ── Energy seams (overridden by ECENetLESCalculator) ────────────────────
+
+    def _energy_free(self, pos, types):
+        """Total energy of a non-periodic system (model units)."""
+        return self.model.forward(pos, types)
+
+    def _energy_pbc(self, pos, types, edge_i, edge_j, shift_vecs_edge,
+                    nb_src, nb_dst, shift_vecs_nb, cell=None):
+        """Total energy of a periodic system (model units).
+
+        ``cell`` is the (possibly strained) (3, 3) cell tensor on the autograd
+        graph; the short-range model does not use it (PBC enters through the
+        shift vectors), but the LES subclass's Ewald term does.
+        """
+        return self.model.forward_pbc(
+            pos, types, edge_i, edge_j, shift_vecs_edge,
+            nb_src, nb_dst, shift_vecs_nb)
+
     def _compute_stress(self, pos, types, edge_i, edge_j, shift_vecs_edge,
-                        nb_src, nb_dst, shift_vecs_nb): # Prototype, mainly implemented by Claude
+                        nb_src, nb_dst, shift_vecs_nb, cell_np): # Prototype, mainly implemented by Claude
         """Strain-based energy / forces / stress for a periodic system.
 
-        Applies an infinitesimal symbolic strain to the positions and the PBC
-        shift vectors (``x → x + x·ε``, linear and exact at ε = 0), then takes a
-        single backward pass for both forces (−dE/dpos) and dE/dε. The neighbor
-        topology is frozen across the strain (standard MLIP approximation).
+        Applies an infinitesimal symbolic strain to the positions, the PBC
+        shift vectors, and the cell (``x → x + x·ε``, linear and exact at
+        ε = 0), then takes a single backward pass for both forces (−dE/dpos)
+        and dE/dε. The neighbor topology is frozen across the strain (standard
+        MLIP approximation). The strained cell only matters for subclasses
+        whose energy uses it (LES Ewald); the short-range model sees the
+        strain through positions and shifts.
 
         Returns ``(energy_tensor, forces_tensor, stress_grad)`` where
         ``stress_grad`` is the (3, 3) dE/dε.
@@ -310,8 +332,11 @@ class ECENetCalculator(Calculator):
         pos_s      = pos + pos @ strain
         shift_e_s  = shift_vecs_edge + shift_vecs_edge @ strain
         shift_nb_s = shift_vecs_nb   + shift_vecs_nb   @ strain
-        energy_tensor = self.model.forward_pbc(
-            pos_s, types, edge_i, edge_j, shift_e_s, nb_src, nb_dst, shift_nb_s)
+        cell_t = torch.tensor(cell_np, dtype=self.dtype, device=self.device)
+        cell_s = cell_t + cell_t @ strain
+        energy_tensor = self._energy_pbc(
+            pos_s, types, edge_i, edge_j, shift_e_s, nb_src, nb_dst,
+            shift_nb_s, cell=cell_s)
         grads = torch.autograd.grad(energy_tensor, [pos_s, strain])
         return energy_tensor, -grads[0], grads[1]
 
@@ -349,11 +374,12 @@ class ECENetCalculator(Calculator):
         if need_stress:
             energy_tensor, forces_tensor, stress_grad = self._compute_stress(
                 pos, types, edge_i, edge_j, shift_vecs_edge,
-                nb_src, nb_dst, shift_vecs_nb)
+                nb_src, nb_dst, shift_vecs_nb, cell)
         else:
-            energy_tensor = self.model.forward_pbc(
+            cell_t = torch.tensor(cell, dtype=self.dtype, device=self.device)
+            energy_tensor = self._energy_pbc(
                 pos, types, edge_i, edge_j, shift_vecs_edge,
-                nb_src, nb_dst, shift_vecs_nb)
+                nb_src, nb_dst, shift_vecs_nb, cell=cell_t)
             forces_tensor = -torch.autograd.grad(energy_tensor, pos)[0]
             stress_grad   = None
 
@@ -390,7 +416,7 @@ class ECENetCalculator(Calculator):
             else:
                 n_edges = '—'
                 t1 = self._t() if self.log_timings else None
-                energy_tensor = self.model.forward(pos, types)
+                energy_tensor = self._energy_free(pos, types)
                 forces_tensor = -torch.autograd.grad(energy_tensor, pos)[0]
                 stress_grad   = None
 
@@ -425,3 +451,98 @@ class ECENetCalculator(Calculator):
                 stress_mat[0, 0], stress_mat[1, 1], stress_mat[2, 2],
                 stress_mat[1, 2], stress_mat[0, 2], stress_mat[0, 1],
             ])
+
+
+class ECENetLESCalculator(ECENetCalculator):
+    """ASE calculator for checkpoints trained jointly with LES.
+
+    Evaluates ``E = E_sr + E_lr`` on one autograd graph, so forces and stress
+    need no extra code: forces come from the joint backward, and the strain
+    pass strains positions, shift vectors, AND the cell, covering the Ewald
+    term's explicit cell dependence (exactly the xyz trainer's convention).
+    Non-periodic systems use the isolated pairwise path (``cell=None``);
+    periodic ones the reciprocal-space Ewald.
+
+    Construct via ``from_checkpoint`` (a checkpoint with a top-level ``les``
+    dict — this class refuses short-range checkpoints, symmetrically with
+    ECENetCalculator refusing LES ones). The upstream charge head is
+    materialised and its trained state loaded here; edge-mode read-outs
+    (``les_readout='edge'/'edge_basis'``) carry the charge (and with
+    ``les_dipole`` the bond dipoles) inside the model itself, so the LES
+    module is then parameter-free.
+    """
+
+    def __init__(self, model, les_module, les_is_charge=False,
+                 les_dipole=False, **kwargs):
+        super().__init__(model, **kwargs)
+        self.les_module = les_module
+        self.les_module.eval()
+        self.les_is_charge = bool(les_is_charge)
+        self.les_dipole = bool(les_dipole)
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path, device=None, dtype=None,
+                        energy_reference=None, element_to_type=None,
+                        energy_units=None, log_timings=False):
+        """Load model + LES module from a joint checkpoint (see base class)."""
+        ckpt = torch.load(checkpoint_path, map_location='cpu',
+                          weights_only=False)
+        if 'les' not in ckpt:
+            raise ValueError(
+                "Checkpoint carries no 'les' dict — it is a short-range "
+                "model; use ECENetCalculator.from_checkpoint instead.")
+
+        base = ECENetCalculator.from_checkpoint(
+            checkpoint_path, device=device, dtype=dtype,
+            energy_reference=energy_reference, element_to_type=element_to_type,
+            energy_units=energy_units, log_timings=log_timings,
+            ignore_les=True)
+
+        from ecenet.les import LESLongRange
+        model = base.model
+        les_is_charge = getattr(model, 'les_readout', 'sum') in ('edge', 'edge_basis')
+        les_dipole = bool(getattr(model, 'les_dipole', False))
+        les_module = LESLongRange(ckpt['les'].get('arguments'))
+        # Upstream builds its charge head lazily on the first forward (it
+        # infers the descriptor width then) — materialise with a probe of the
+        # model's l0 width, then load the trained state. Edge modes bypass the
+        # head (parameter-free); the probe is still harmless.
+        with torch.no_grad():
+            l0_probe = torch.zeros(2, model._l0_dim, dtype=base.dtype,
+                                   device=base.device)
+            pos_probe = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                                     dtype=base.dtype, device=base.device)
+            les_module(l0_probe, pos_probe, l0_is_charge=les_is_charge,
+                       les_dipole=les_dipole)
+        les_module = les_module.to(device=base.device, dtype=base.dtype)
+        les_module.load_state_dict(ckpt['les'].get('best_state')
+                                   or ckpt['les']['state_dict'])
+
+        calc = cls(model, les_module,
+                   les_is_charge=les_is_charge, les_dipole=les_dipole,
+                   device=base.device, dtype=base.dtype,
+                   energy_reference=base.energy_reference,
+                   element_to_type=base.element_to_type,
+                   log_timings=log_timings)
+        # unit metadata was resolved by the base loader; copy it verbatim
+        calc._to_ev = base._to_ev
+        calc._energy_mean_ev = base._energy_mean_ev
+        return calc
+
+    # ── Energy seams: add E_lr on the same graph ────────────────────────────
+
+    def _energy_free(self, pos, types):
+        e_sr, l0 = self.model.forward(pos, types, return_embeddings=True,
+                                      l0_only=True)
+        return e_sr + self.les_module(l0, pos, l0_is_charge=self.les_is_charge,
+                                      les_dipole=self.les_dipole).sum()
+
+    def _energy_pbc(self, pos, types, edge_i, edge_j, shift_vecs_edge,
+                    nb_src, nb_dst, shift_vecs_nb, cell=None):
+        e_sr, l0 = self.model.forward_pbc(
+            pos, types, edge_i, edge_j, shift_vecs_edge,
+            nb_src, nb_dst, shift_vecs_nb,
+            return_embeddings=True, l0_only=True)
+        return e_sr + self.les_module(l0, pos, cell=cell,
+                                      l0_is_charge=self.les_is_charge,
+                                      les_dipole=self.les_dipole).sum()

@@ -65,10 +65,18 @@ def run_md_xyz(checkpoint, xyz, frame_idx=-1, seed=0, ensemble='nvt',
     print(f"PBC: {atoms.pbc.tolist()}")
 
     # ── Calculator ─────────────────────────────────────────────────────────
+    # Joint-LES checkpoints (top-level 'les' dict) get the LES-aware
+    # calculator so MD runs on the trained PES (E_sr + E_lr).
     print(f"Loading checkpoint: {checkpoint}")
-    calc = ECENetCalculator.from_checkpoint(
-        checkpoint, device=device, dtype=dtype,
-        energy_units=energy_units)
+    if 'les' in torch.load(checkpoint, map_location='cpu', weights_only=False):
+        from ecenet.calculator import ECENetLESCalculator
+        print("[les] joint-LES checkpoint — using ECENetLESCalculator "
+              "(E_sr + E_lr)")
+        calc = ECENetLESCalculator.from_checkpoint(
+            checkpoint, device=device, dtype=dtype, energy_units=energy_units)
+    else:
+        calc = ECENetCalculator.from_checkpoint(
+            checkpoint, device=device, dtype=dtype, energy_units=energy_units)
     atoms.calc = calc
 
     # Fused kernels (opt-in). MD is forces-only (single backward), so both are

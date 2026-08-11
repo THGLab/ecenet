@@ -697,6 +697,7 @@ def train_ecenet_mptrj(
     film_shift=False,
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
+    les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     # Optimiser
     lr=1e-3,
     weight_decay=1e-5,
@@ -930,6 +931,7 @@ def train_ecenet_mptrj(
         film_per_m=film_per_m, film_shift=film_shift,
         les_readout=les_readout,
         les_charge_scale=les_charge_scale,
+        les_dipole=les_dipole,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -1064,6 +1066,7 @@ def train_ecenet_mptrj(
                 film_per_m=film_per_m, film_shift=film_shift,
                 les_readout=les_readout,
                 les_charge_scale=les_charge_scale,
+                les_dipole=les_dipole,
             ),
             'element_to_type': elements.to_element_to_type(type_map),  # {symbol: type_idx}
             'e_ref': e_ref,             # per-element reference energies (eV)

@@ -180,7 +180,9 @@ def train_ecenet(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
-    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax'
+    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
+    les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
+    les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     # Batching
     use_graph_batch=True,
     # Optimiser
@@ -273,6 +275,8 @@ def train_ecenet(
         film_n_rbf=film_n_rbf, film_hidden=film_hidden,
         film_per_m=film_per_m, film_shift=film_shift,
         les_readout=les_readout,
+        les_charge_scale=les_charge_scale,
+        les_dipole=les_dipole,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -419,6 +423,8 @@ def train_ecenet(
                 film_n_rbf=film_n_rbf, film_hidden=film_hidden,
                 film_per_m=film_per_m, film_shift=film_shift,
                 les_readout=les_readout,
+                les_charge_scale=les_charge_scale,
+                les_dipole=les_dipole,
             ),
             # molecule-specific element mapping: {symbol: type_index}
             'element_to_type': elements.to_element_to_type(type_to_idx),
