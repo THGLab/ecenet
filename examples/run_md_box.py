@@ -26,7 +26,7 @@ from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
-from ecenet.calculator import ECENetCalculator
+from ecenet.calculator import load_calculator
 
 
 def run_md_box(checkpoint, box, cell=None, frame_idx=-1, seed=0,
@@ -71,9 +71,14 @@ def run_md_box(checkpoint, box, cell=None, frame_idx=-1, seed=0,
 
     # ── Calculator ─────────────────────────────────────────────────────────
     print(f"Loading checkpoint: {checkpoint}")
-    calc = ECENetCalculator.from_checkpoint(
+    # load_calculator dispatches: joint-LES checkpoints get the LES-aware
+    # calculator so MD runs on the trained PES (E_sr + E_lr).
+    calc = load_calculator(
         checkpoint, device=device, dtype=dtype,
         log_timings=log_timings)
+    if getattr(calc, 'les_module', None) is not None:
+        print("[les] joint-LES checkpoint — using ECENetLESCalculator "
+              "(E_sr + E_lr)")
     atoms.calc = calc
 
     # Fused kernels (opt-in). MD is forces-only (single backward), so both are
