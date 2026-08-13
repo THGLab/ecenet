@@ -137,15 +137,10 @@ def run_md_spice(checkpoint, xyz='test_large_neut_all.xyz', config_type=None,
     print(f"Loading checkpoint: {checkpoint}")
     # Newer checkpoints store their own element mapping; pass the SPICE mapping
     # as a fallback so checkpoints saved before that still load here.
-    # load_calculator dispatches: joint-LES checkpoints get the LES-aware
-    # calculator so MD runs on the trained PES (E_sr + E_lr).
     calc = load_calculator(
         checkpoint, device=device, dtype=dtype,
         element_to_type=ELEMENT_TO_TYPE,
         log_timings=log_timings)
-    if getattr(calc, 'les_module', None) is not None:
-        print("[les] joint-LES checkpoint — using ECENetLESCalculator "
-              "(E_sr + E_lr)")
     atoms.calc = calc
 
     # Fused kernels (opt-in). MD is forces-only (single backward), so both are

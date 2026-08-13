@@ -772,6 +772,25 @@ class ECENet(nn.Module):
 
     # ── Forward ────────────────────────────────────────────────────────────
 
+    def _edgeless_result(self, types, device, dtype, return_embeddings, l0_only):
+        """Zero-edge result for forward / forward_pbc.
+
+        Keeps the per-element constants: the with-edges paths add atomic_energy
+        for every atom (edgeless ones included), and forward_batch_multi does
+        the same for zero-edge structures — a bare 0 here would make the energy
+        jump by Σ atomic_energy when the last edge crosses r_cut. Embeddings
+        are zero rows (an edgeless atom scatter-sums no edge invariants).
+        """
+        energy = self.atomic_energy[types].sum()
+        if not return_embeddings:
+            return energy
+        N = len(types)
+        l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
+        if l0_only:
+            return energy, l0
+        l1 = torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype)
+        return energy, l0, l1
+
     def forward(self, positions: torch.Tensor, types: torch.Tensor,
                 return_embeddings: bool = False, l0_only: bool = False):
         """Compute total energy, and optionally per-atom embeddings.
@@ -796,20 +815,8 @@ class ECENet(nn.Module):
         # ── Edges ─────────────────────────────────────────────────────────
         edge_i_undir, edge_j_undir = find_edges(positions, self.r_cut_edge)
         if len(edge_i_undir) == 0:
-            # Keep the per-element constants: the with-edges path below adds
-            # atomic_energy for every atom (edgeless ones included), and
-            # forward_batch_multi does the same for zero-edge structures —
-            # returning bare 0 here would make the energy jump by
-            # Σ atomic_energy when the last edge crosses r_cut.
-            energy = self.atomic_energy[types].sum()
-            if return_embeddings:
-                N = len(types)
-                l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
-                if l0_only:
-                    return energy, l0
-                l1 = torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype)
-                return energy, l0, l1
-            return energy
+            return self._edgeless_result(types, device, dtype,
+                                         return_embeddings, l0_only)
 
         edge_i = torch.cat([edge_i_undir, edge_j_undir])
         edge_j = torch.cat([edge_j_undir, edge_i_undir])
@@ -882,17 +889,8 @@ class ECENet(nn.Module):
         n_edges = len(edge_i)
 
         if n_edges == 0:
-            # Same as forward(): keep Σ atomic_energy so the zero-edge limit
-            # is continuous and matches forward_batch_multi.
-            energy = self.atomic_energy[types].sum()
-            if return_embeddings:
-                N = len(types)
-                l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
-                if l0_only:
-                    return energy, l0
-                l1 = torch.zeros(N, 2 * self.embed_dim, 3, device=device, dtype=dtype)
-                return energy, l0, l1
-            return energy
+            return self._edgeless_result(types, device, dtype,
+                                         return_embeddings, l0_only)
 
         # ── Edges with PBC shifts ──────────────────────────────────────────
         diff_ij = (positions[edge_j] - positions[edge_i]
@@ -932,6 +930,23 @@ class ECENet(nn.Module):
         return energy
 
     @torch.no_grad()
+    def _local_topology(self, pos):
+        """Edge + neighbour indices of one structure (directed, LOCAL, no grad).
+
+        The single source of the nonzero recipe: build_topology and the
+        on-the-fly branch of forward_batch_multi both call it, so precomputed
+        and per-step topologies cannot drift apart. no_grad keeps dist_mat's
+        sub/sqrt from spawning dead nodes into the force double-backward graph
+        (the energy's distances are recomputed from the positions downstream).
+        """
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)              # (N, N, 3)
+        dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)      # (N, N)
+        ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+        nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor)
+                          & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+        return ei, ej, nb_src, nb_dst
+
+    @torch.no_grad()
     def build_topology(self, positions_list):
         """Precompute per-structure (edge_i, edge_j, nb_src, nb_dst) LOCAL indices,
         matching forward_batch_multi's nonzero output exactly.
@@ -943,16 +958,7 @@ class ECENet(nn.Module):
         structure's own device. (Distinct from forward_batch's topology dict,
         which is one topology shared by every structure of the same molecule.)
         """
-        topo = []
-        for pos in positions_list:
-            diff = pos.unsqueeze(0) - pos.unsqueeze(1)
-            dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)
-            ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
-            nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor)
-                              & (dist_mat > 1e-10)).nonzero(as_tuple=True)
-            topo.append((ei.contiguous(), ej.contiguous(),
-                         nb_src.contiguous(), nb_dst.contiguous()))
-        return topo
+        return [self._local_topology(pos) for pos in positions_list]
 
     def forward_batch_multi(self, positions_list, types_list,
                             return_embeddings=False, l0_only=False,
@@ -1000,31 +1006,17 @@ class ECENet(nn.Module):
         # structures, so the single batched basis is block-diagonal == per-frame.
         for b, (pos, types) in enumerate(zip(positions_list, types_list)):
             N_b = pos.shape[0]
-            # Topology (edge/neighbour indices) is non-differentiable. Either it
-            # was precomputed once and passed in (topology=... — from
-            # build_topology; skips the O(N²) dist_mat + per-structure nonzero
-            # syncs entirely, valid for fixed positions) or it is built here
-            # under no_grad so dist_mat's sub/sqrt don't spawn dead nodes into
-            # the force double-backward graph (the energy's distances are
-            # recomputed below from the concatenated positions). atomic_e
-            # (param-grad) stays OUTSIDE the no_grad.
-            if topology is not None:
-                ei, ej, nb_src, nb_dst = topology[b]
-            else:
-                with torch.no_grad():
-                    diff = pos.unsqueeze(0) - pos.unsqueeze(1)              # (N_b, N_b, 3)
-                    dist_mat = torch.sqrt((diff ** 2).sum(-1) + 1e-30)      # (N_b, N_b)
-                    ei, ej = ((dist_mat < self.r_cut_edge) & (dist_mat > 1e-10)).nonzero(as_tuple=True)
+            # Topology is non-differentiable: precomputed (see build_topology)
+            # or built now by the same helper, whose no_grad keeps dead nodes
+            # out of the force double-backward graph. atomic_e (param-grad)
+            # stays OUTSIDE it.
+            ei, ej, nb_src, nb_dst = (topology[b] if topology is not None
+                                      else self._local_topology(pos))
 
             atomic_e_list.append(self.atomic_energy[types].sum())
             if len(ei) == 0:
                 atom_offset += N_b
                 continue
-
-            if topology is None:
-                with torch.no_grad():
-                    nb_src, nb_dst = ((dist_mat < self.r_cut_neighbor)
-                                      & (dist_mat > 1e-10)).nonzero(as_tuple=True)
 
             edge_i_list.append(ei + atom_offset)
             edge_j_list.append(ej + atom_offset)
@@ -1136,10 +1128,12 @@ class ECENet(nn.Module):
             # Variable-topology fallback: forward_batch_multi subsumes this case
             # (shared types is just every structure carrying the same type
             # vector). It builds topology per-structure and runs the expensive
-            # ops once on the merged flat edge set — identical result.
+            # ops once on the merged flat edge set — identical result. A
+            # build_topology LIST is forwarded rather than silently dropped.
             return self.forward_batch_multi(
                 positions_list, [types] * len(positions_list),
-                return_embeddings=return_embeddings, l0_only=l0_only)
+                return_embeddings=return_embeddings, l0_only=l0_only,
+                topology=topology if isinstance(topology, list) else None)
 
         # ── Fixed topology: vectorized over B ─────────────────────────────
         B = len(positions_list)

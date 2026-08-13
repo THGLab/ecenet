@@ -88,13 +88,8 @@ def run_md_rmd17_langevin(checkpoint, molecule='aspirin', data_dir=None,
 
     # ── Calculator ─────────────────────────────────────────────────────────
     print(f"Loading checkpoint: {checkpoint}")
-    # load_calculator dispatches: joint-LES checkpoints get the LES-aware
-    # calculator so MD runs on the trained PES (E_sr + E_lr).
     calc = load_calculator(
         checkpoint, device=device, dtype=dtype, energy_units=energy_units)
-    if getattr(calc, 'les_module', None) is not None:
-        print("[les] joint-LES checkpoint — using ECENetLESCalculator "
-              "(E_sr + E_lr)")
     atoms.calc = calc
 
     # Fused kernels (opt-in). MD is forces-only (single backward), so both are

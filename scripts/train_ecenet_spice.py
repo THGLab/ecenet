@@ -839,9 +839,8 @@ def train_ecenet_spice(
 
             pos_rg   = [pos_train[i].detach().clone().requires_grad_(True) for i in batch_indices]
             typ_b    = [typ_train[i] for i in batch_indices]
-            # Precomputed neighbour lists for this batch (positions are fixed, so
-            # topo_train[i] matches the freshly re-leafed pos_rg). None → build
-            # topology on the fly inside forward_batch_multi.
+            # Precomputed neighbour lists for this batch (positions are fixed,
+            # so topo_train[i] matches the freshly re-leafed pos_rg).
             topo_b = ([topo_train[i] for i in batch_indices]
                       if topo_train is not None else None)
             eng_pred = train_model(pos_rg, typ_b, topology=topo_b)   # DDP syncs gradients here

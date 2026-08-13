@@ -542,15 +542,20 @@ class ECENetLESCalculator(ECENetCalculator):
                                       **self.les_flags).sum()
 
 
-def load_calculator(checkpoint_path, **kwargs):
+def load_calculator(checkpoint_path, verbose=True, **kwargs):
     """Load the right calculator for a checkpoint, whatever it was trained with.
 
     One deserialisation, one dispatch: joint-LES checkpoints (top-level
     ``les`` dict) get :class:`ECENetLESCalculator` so MD and single points
     run on the trained PES; short-range ones get :class:`ECENetCalculator`.
     Every driver/example should load through here rather than re-implementing
-    the peek. ``kwargs`` are forwarded to ``from_checkpoint``.
+    the peek; ``verbose`` announces the LES dispatch, so callers need not
+    either. ``kwargs`` are forwarded to ``from_checkpoint``.
     """
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    cls = ECENetLESCalculator if 'les' in ckpt else ECENetCalculator
+    use_les = 'les' in ckpt
+    if verbose and use_les:
+        print("[les] joint-LES checkpoint — using ECENetLESCalculator "
+              "(E_sr + E_lr)")
+    cls = ECENetLESCalculator if use_les else ECENetCalculator
     return cls.from_checkpoint(checkpoint_path, ckpt=ckpt, **kwargs)

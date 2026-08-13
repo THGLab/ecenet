@@ -54,7 +54,7 @@ atoms.set_pbc(True)
 # load_calculator dispatches: a joint-LES checkpoint yields the LES-aware
 # calculator with the module already materialised and loaded, so the E_lr
 # cost is profiled too (flags read off the model — the single source).
-calc   = load_calculator(args.checkpoint, dtype=dtype)
+calc   = load_calculator(args.checkpoint, dtype=dtype, verbose=False)  # prints its own [les] line
 model  = calc.model
 device = calc.device
 

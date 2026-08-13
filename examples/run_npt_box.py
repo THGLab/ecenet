@@ -79,15 +79,11 @@ def run_npt_box(checkpoint, box, cell=None, frame_idx=-1, seed=0,
 
     # ── Calculator ─────────────────────────────────────────────────────────
     print(f"\nLoading checkpoint: {checkpoint}")
-    # load_calculator dispatches: joint-LES checkpoints get the LES-aware
-    # calculator so MD runs on the trained PES (E_sr + E_lr); its stress
-    # includes the Ewald term, so NPT is covered too.
+    # Joint-LES checkpoints: the LES calculator's stress includes the Ewald
+    # term, so NPT is covered too.
     calc = load_calculator(
         checkpoint, device=device, dtype=dtype,
         log_timings=log_timings)
-    if getattr(calc, 'les_module', None) is not None:
-        print("[les] joint-LES checkpoint — using ECENetLESCalculator "
-              "(E_sr + E_lr)")
     atoms.calc = calc
 
     # Fused kernels (opt-in). MD is forces-only (single backward), so both are
