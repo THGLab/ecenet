@@ -796,7 +796,12 @@ class ECENet(nn.Module):
         # ── Edges ─────────────────────────────────────────────────────────
         edge_i_undir, edge_j_undir = find_edges(positions, self.r_cut_edge)
         if len(edge_i_undir) == 0:
-            energy = torch.zeros(1, device=device, dtype=dtype).squeeze()
+            # Keep the per-element constants: the with-edges path below adds
+            # atomic_energy for every atom (edgeless ones included), and
+            # forward_batch_multi does the same for zero-edge structures —
+            # returning bare 0 here would make the energy jump by
+            # Σ atomic_energy when the last edge crosses r_cut.
+            energy = self.atomic_energy[types].sum()
             if return_embeddings:
                 N = len(types)
                 l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
@@ -877,7 +882,9 @@ class ECENet(nn.Module):
         n_edges = len(edge_i)
 
         if n_edges == 0:
-            energy = torch.zeros(1, device=device, dtype=dtype).squeeze()
+            # Same as forward(): keep Σ atomic_energy so the zero-edge limit
+            # is continuous and matches forward_batch_multi.
+            energy = self.atomic_energy[types].sum()
             if return_embeddings:
                 N = len(types)
                 l0 = torch.zeros(N, self._l0_dim, device=device, dtype=dtype)
