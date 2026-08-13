@@ -300,29 +300,35 @@ def test_from_checkpoint_missing_hparams_raises():
     raise AssertionError("expected ValueError when no hparams are stored")
 
 
-# ── real committed checkpoint (trained weights, not synthetic) ───────────────
-
-_ETHANOL_MDL = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'examples', 'ethanol.mdl')
-
-
 def test_legacy_edge_mp_checkpoint_raises():
-    """The committed ethanol checkpoint was trained with the removed
-    mp_type='edge' message passing (n_mp=2, with mp_layers.*.W_msg weights).
-    Loading it must fail loudly: those weights have no counterpart in the current
-    MP layer, so a tolerant load would silently run a randomly initialised MP
-    layer and return wrong energies."""
-    if not os.path.exists(_ETHANOL_MDL):
-        print(f"  [skip] {_ETHANOL_MDL} not present")
-        return
-    try:
-        ECENetCalculator.from_checkpoint(_ETHANOL_MDL)
-    except ValueError as e:
-        assert 'W_msg' in str(e) and 'edge' in str(e), f"unhelpful message: {e}"
-        print(f"  legacy edge-MP ethanol.mdl rejected: {str(e)[:64]}…")
-    else:
-        raise AssertionError("expected a ValueError for a legacy edge-MP checkpoint")
+    """Checkpoints trained with the removed mp_type='edge' message passing
+    (identifiable by mp_layers.*.W_msg weights) must fail loudly: those weights
+    have no counterpart in the current MP layers, so a tolerant load would
+    silently run a randomly initialised MP layer and return wrong energies.
+
+    The fixture mirrors the layout of a real dev-era edge-MP checkpoint
+    (hparams incl. the removed n_dist_embed/n_dist_basis keys, W_msg in the
+    state dict); the 8.6 MB real one this replaced was dropped from examples/.
+    The rejection fires on the W_msg key before the model is built, so a
+    minimal state dict exercises the same path."""
+    hp = dict(n_types=3, r_cut_edge=6.0, r_cut_neighbor=5.0, l_max=2, n_max=4,
+              embed_dim=8, n_layers=2, n_max_d=4, n_grid=None,
+              cutoff_type='cosine', activation='silu', use_nonlinearity=True,
+              output_hidden_dims=None, analytic_ace_basis=True,
+              n_dist_embed=0, n_mp=2, n_dist_basis=8)
+    state = {'mp_layers.0.W_msg': torch.zeros(3, 3, 8, dtype=torch.float64)}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'legacy_edge_mp.mdl')
+        torch.save({'model': state, 'hparams': hp,
+                    'element_to_type': {'H': 0, 'C': 1, 'O': 2},
+                    'energy_units': 'kcal/mol'}, path)
+        try:
+            ECENetCalculator.from_checkpoint(path)
+        except ValueError as e:
+            assert 'W_msg' in str(e) and 'edge' in str(e), f"unhelpful message: {e}"
+            print(f"  legacy edge-MP checkpoint rejected: {str(e)[:64]}…")
+        else:
+            raise AssertionError("expected a ValueError for a legacy edge-MP checkpoint")
 
 
 def test_trainers_save_every_architecture_hparam():

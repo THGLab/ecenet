@@ -31,10 +31,8 @@ scripts/               training / data entry points (run from the repo root)
   prepare_mptrj.py       tensorise raw MPtrj JSON → .pt shards
   eval_spice.py          evaluate a SPICE checkpoint on the test set
 
-examples/              runnable examples + a small example checkpoint
+examples/              runnable examples
   run_md_*.py            ASE MD drivers (NVT/NPT); importable or CLI
-  ethanol.mdl            legacy rMD17 ethanol model (edge MP; now rejected on load —
-                         kept as the fixture for the legacy-checkpoint test)
 
 tests/                 test suite (test_*.py, run from the repo root)
 tools/                 developer utilities (run from the repo root)
