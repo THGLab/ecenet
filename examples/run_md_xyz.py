@@ -7,8 +7,11 @@ Usage:
 
 The input is read with ASE, so extended-xyz headers (Lattice="..." and
 pbc="...") are honoured automatically; a plain xyz is treated as a
-non-periodic cluster. For a multi-frame file, pick the starting frame with
---frame_idx (default: last frame, ASE convention).
+non-periodic cluster. For a periodic box whose header lost its Lattice
+field, pass --cell <side_length_angstrom> to set a cubic cell (and PBC)
+by hand — check the printed "PBC:" line to confirm which case you got.
+For a multi-frame file, pick the starting frame with --frame_idx
+(default: last frame, ASE convention).
 
 --ensemble nvt  -> Langevin thermostat at --temperature (uses --friction)
 --ensemble nve  -> VelocityVerlet at constant energy (--temperature only
@@ -35,10 +38,10 @@ from ase.md.verlet import VelocityVerlet
 from ecenet.calculator import load_calculator
 
 
-def run_md_xyz(checkpoint, xyz, frame_idx=-1, seed=0, ensemble='nvt',
+def run_md_xyz(checkpoint, xyz, cell=None, frame_idx=-1, seed=0, ensemble='nvt',
                temperature=300, timestep=0.5, friction=0.01, n_steps=10000,
                log_every=100, output='traj.xyz', log='md.log', device=None,
-               float32=False, energy_units=None,
+               float32=False, energy_units=None, log_timings=False,
                fuse_nonlin=False, edge_frame_fused=False, tf32=False):
     """Run NVT/NVE MD from an arbitrary xyz file.
 
@@ -60,14 +63,19 @@ def run_md_xyz(checkpoint, xyz, frame_idx=-1, seed=0, ensemble='nvt',
 
     # ── Load starting frame ────────────────────────────────────────────────
     atoms = read(xyz, index=frame_idx)
+    if cell is not None:
+        atoms.set_cell([cell, cell, cell])
+        atoms.set_pbc(True)
     print(f"Loaded {xyz} (frame {frame_idx}): {len(atoms)} atoms")
     print(f"Elements: {sorted(set(atoms.get_chemical_symbols()))}")
     print(f"PBC: {atoms.pbc.tolist()}")
+    if atoms.pbc.any():
+        print(f"Cell: {atoms.cell.lengths()} Å")
 
     # ── Calculator ─────────────────────────────────────────────────────────
     print(f"Loading checkpoint: {checkpoint}")
     calc = load_calculator(checkpoint, device=device, dtype=dtype,
-                           energy_units=energy_units)
+                           energy_units=energy_units, log_timings=log_timings)
     atoms.calc = calc
 
     # Fused kernels (opt-in). MD is forces-only (single backward), so both are
@@ -153,6 +161,9 @@ def main():
                         help='Input structure (xyz / extended-xyz)')
     parser.add_argument('--checkpoint',   required=True,
                         help='Path to trained .mdl checkpoint')
+    parser.add_argument('--cell',         type=float, default=None,
+                        help='Cubic cell side length in Å; sets the cell and PBC '
+                             'for a box file missing its Lattice header')
     parser.add_argument('--frame_idx',    type=int, default=-1,
                         help='Frame index to start from for multi-frame files '
                              '(default: -1, the last frame)')
@@ -182,6 +193,8 @@ def main():
                         help='Override unit conversion (auto-detected from checkpoint '
                              'if not set). Use kcal/mol for train_ecenet.py models, '
                              'eV for train_ecenet_spice.py models.')
+    parser.add_argument('--log_timings',  action='store_true',
+                        help='Print per-step calculator timings')
     parser.add_argument('--fuse_nonlin',  action='store_true',
                         help='Fused RealSpaceNonlinearity (Triton on CUDA+silu)')
     parser.add_argument('--edge_frame_fused', action='store_true',
