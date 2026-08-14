@@ -1348,7 +1348,10 @@ def train_ecenet_mptrj(
             val_weighted_tensor = torch.tensor(float('inf'), device=device)
             if is_main:
                 tr_e, tr_f, tr_s = evaluate(train_data, max_samples=200)
-                va_e, va_f, va_s = evaluate(val_data)
+                # max_samples makes n_val exact in prepared mode too (the shard
+                # cap only rounds up to whole shards); legacy val_data is
+                # already ≤ n_val, so it's a no-op there.
+                va_e, va_f, va_s = evaluate(val_data, max_samples=n_val)
                 # Weighted selection metric (mirrors the training-loss weighting);
                 # stress only contributes when it's part of the loss (else va_s may be NaN).
                 va_weighted = energy_weight * va_e + force_weight * va_f
@@ -1398,7 +1401,7 @@ def train_ecenet_mptrj(
         if best_state is not None:
             raw_model.load_state_dict(best_state, strict=False)
         tr = evaluate(train_data, max_samples=500)
-        va = evaluate(val_data)
+        va = evaluate(val_data, max_samples=n_val)
         te = evaluate(test_data) if test_data else (float('nan'),)*3
         print_flush("\nFinal Results (MAE):")
         print_flush(f"  Train: E={tr[0]:.4f} eV/atom F={tr[1]:.4f} eV/Å S={tr[2]:.4e} eV/Å³")
