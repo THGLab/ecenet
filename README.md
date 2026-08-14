@@ -406,6 +406,27 @@ batches share a round, so per-step work is aligned across ranks and the
 molecule-size straggler disappears — the biggest win multi-node. Measured spread
 in per-rank total atoms at `world_size=8`: 3.4% bucketed, 0.9% atom-budget.
 
+The MPtrj trainer's prepared-shard mode takes the atom budget too:
+
+```python
+train_ecenet_mptrj(..., prepared_dir='mptrj_prepared', max_atoms_per_batch=250)
+```
+
+Shards stream with no random access, so there is no global sort; instead each
+shard (~10k frames — an i.i.d. sample of the dataset, thanks to the
+prepare-time global shuffle) is packed independently, with `bucket_sort` and
+`max_batch_count` meaning the same as above. The DDP invariant is restored by
+round alignment at the shard level: shards are grouped into rounds of
+`world_size` (rank r owns the r-th shard of each round), every rank *plans*
+every shard's packing from per-frame atom counts alone — packing depends only
+on counts and the shared seed, never on the tensors — and all ranks truncate
+to the round's minimum batch count. A seeded permutation decides which batches
+are dropped, so with `bucket_sort` the largest-structure tail is not
+systematically the part lost; the truncation loss is well under 1% at 10k
+frames/shard. The counts live in an `atom_counts.pt` sidecar written by
+`prepare_mptrj.py`; prepared dirs that predate it are back-filled
+automatically on first use (one pass over the shards, then cached).
+
 `precompute_topology=True` (SPICE trainer) builds every training structure's
 neighbour lists once at startup and reuses them each step. Training positions
 are fixed, so the topology never changes — yet the on-the-fly path recomputes
@@ -467,6 +488,7 @@ python tests/test_les.py                     # LES: l0/l1 read-out SO(3) + batch
 python tests/test_edge_frame_kernel.py       # fused edge-frame/e2n: gradchecks, model on/off equality (Triton legs need CUDA)
 python tests/test_realspace_kernel.py        # fused nonlinearity: backward equivalence, DFT precision (Triton legs need CUDA)
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
+python tests/test_mptrj_shard_batching.py    # shard atom-budget batching: DDP count alignment, sidecar
 python tests/test_xyz_trainer.py             # small-dataset trainer: smoke, LES resume, force-FD through E_lr
 ```
 

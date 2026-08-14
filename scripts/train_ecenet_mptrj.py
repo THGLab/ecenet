@@ -70,6 +70,7 @@ from ecenet import ECENet, elements
 from ecenet.datasets.mptrj import (
     MPtrjShardDataset,
     collate_keep_list,
+    ensure_atom_counts,
     load_manifest,
     split_shards,
 )
@@ -650,6 +651,15 @@ def train_ecenet_mptrj(
     # type_map/e_ref/r_cut_*/dtype come from the prepared manifest.
     prepared_dir=None,
     num_workers=0,           # DataLoader workers (prepared mode only)
+    # Size-aware batching (prepared mode only): pack each shard's frames into
+    # batches of at most this many total atoms, so memory/compute per step is
+    # roughly uniform and several large crystals can no longer OOM one batch.
+    # DDP-safe: per-round min-truncation keeps the batch count identical on
+    # every rank (see MPtrjShardDataset). batch_size is ignored for training
+    # when set (eval keeps eval_batch_size).
+    max_atoms_per_batch=None,
+    max_batch_count=None,    # optional cap on frames per packed batch
+    bucket_sort=True,        # sort each shard by atom count before packing
     # Pre-loaded structures (bypass file loading; used by tests)
     train_structures=None,
     test_structures=None,
@@ -739,6 +749,11 @@ def train_ecenet_mptrj(
     verbose = verbose and is_main
     use_stress = stress_weight > 0
 
+    if max_atoms_per_batch is not None and prepared_dir is None:
+        raise ValueError(
+            "max_atoms_per_batch is only supported with prepared_dir (per-shard "
+            "size-aware batching); the in-memory path still batches by batch_size")
+
     if device is None:
         device = torch.device(f'cuda:{local_rank}') if torch.cuda.is_available() else torch.device('cpu')
     elif isinstance(device, str):
@@ -798,8 +813,26 @@ def train_ecenet_mptrj(
         n_types = len(type_map)
         n_train_actual = len(train_shard_paths) * ssz
         n_val_actual   = len(val_shard_paths) * ssz
+        train_atom_counts = None
+        if max_atoms_per_batch is not None:
+            # Per-frame atom counts (metadata sidecar): every rank derives every
+            # shard's packing — hence the aligned per-round batch counts — from
+            # these alone, without loading shards. Rank 0 back-fills the file
+            # for prepared dirs that predate it; the others wait, then read.
+            if is_main:
+                counts_by_shard = ensure_atom_counts(prepared_dir)
+            if is_ddp:
+                dist.barrier()
+            if not is_main:
+                counts_by_shard = ensure_atom_counts(prepared_dir)
+            train_atom_counts = [counts_by_shard[os.path.basename(p)]
+                                 for p in train_shard_paths]
         train_data = MPtrjShardDataset(train_shard_paths, rank=rank,
-                                       world_size=world_size, seed=seed, shuffle=True)
+                                       world_size=world_size, seed=seed, shuffle=True,
+                                       max_atoms_per_batch=max_atoms_per_batch,
+                                       max_batch_count=max_batch_count,
+                                       bucket_sort=bucket_sort,
+                                       atom_counts=train_atom_counts)
         val_data   = MPtrjShardDataset(val_shard_paths,   rank=0,
                                        world_size=1, seed=seed, shuffle=False)
         test_data  = []   # external benchmark (WBM); not stored in prepared dir
@@ -813,6 +846,11 @@ def train_ecenet_mptrj(
                         f" | Test: 0 frames (external)")
             print_flush(f"n_types={n_types}: {elems}")
             print_flush(f"Device: {device} | stress={'on' if use_stress else 'off'}")
+            if max_atoms_per_batch is not None:
+                cap = f", ≤{max_batch_count} frames" if max_batch_count else ""
+                print_flush(f"Size-aware batching: ≤{max_atoms_per_batch} atoms/batch"
+                            f"{cap}, bucket_sort={bucket_sort} → "
+                            f"{len(train_data)} batches/rank at epoch 0")
         # Skip the entire load/split/tensorize block below.
 
     # ── Load data ─────────────────────────────────────────────────────────
@@ -1223,13 +1261,31 @@ def train_ecenet_mptrj(
         # per-frame dicts already on the compute device.
         if use_prepared:
             train_data.set_epoch(epoch)
-            loader = DataLoader(train_data, batch_size=batch_size,
-                                collate_fn=collate_keep_list, num_workers=num_workers,
-                                pin_memory=True)
-            n_batches_target = (rank_epoch_size + batch_size - 1) // batch_size
+            if max_atoms_per_batch is not None:
+                # The dataset yields ready-packed batches whose per-rank count
+                # is already DDP-aligned; batch_size does not apply.
+                loader = DataLoader(train_data, batch_size=None,
+                                    num_workers=num_workers, pin_memory=True)
+                if n_per_epoch is not None:
+                    # Approximate frame budget → batch cap. ANY shared cap is
+                    # DDP-safe (per-rank totals are equal, so every rank stops
+                    # at the same batch index); only the frames/epoch is
+                    # approximate.
+                    mean_atoms = float(np.mean([c.mean() for c in train_atom_counts]))
+                    est = max(1.0, max_atoms_per_batch / mean_atoms)
+                    if max_batch_count:
+                        est = min(est, float(max_batch_count))
+                    n_batches_target = max(1, int(round(rank_epoch_size / est)))
+                else:
+                    n_batches_target = None
+            else:
+                loader = DataLoader(train_data, batch_size=batch_size,
+                                    collate_fn=collate_keep_list, num_workers=num_workers,
+                                    pin_memory=True)
+                n_batches_target = (rank_epoch_size + batch_size - 1) // batch_size
             def _batches():
                 for b, raw in enumerate(loader):
-                    if b >= n_batches_target:
+                    if n_batches_target is not None and b >= n_batches_target:
                         return
                     yield _batch_to_device(raw, device)
         else:
