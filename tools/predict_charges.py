@@ -16,6 +16,10 @@ Usage (from the repo root):
     python tools/predict_charges.py --checkpoint electrolyte_les.mdl \
         --data ../imports/data/electrolyte.xyz --frame 0
     python tools/predict_charges.py ... --save charges.npz   # positions+q to npz
+    python tools/predict_charges.py ... --frame 0:1000 --save traj.npz
+        # RANGE mode (ASE slice syntax: ':', '100:200', '::10'): model loaded
+        # once, arrays stacked per frame — charges (n_frames, N), dipoles
+        # (n_frames, N, 3) — for e.g. IR from an MD trajectory
 """
 
 import argparse
@@ -65,16 +69,10 @@ def load_les_model(checkpoint_path, device):
     return model, les_module, hparams, ckpt['element_to_type'], dtype
 
 
-def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
-    """Latent charges + E_lr for one frame. Returns a dict of numpy arrays."""
-    from ase.io import read
+def _predict_frame(model, les_module, hp, elem_to_type, dtype, atoms, device):
+    """Latent charges (+ dipoles) for one ASE Atoms with an already-loaded model."""
     from train_ecenet_mptrj import build_topology
 
-    device = torch.device(device)
-    model, les_module, hp, elem_to_type, dtype = load_les_model(
-        checkpoint_path, device)
-
-    atoms = read(data_path, index=frame)
     symbols = atoms.get_chemical_symbols()
     missing = sorted({s for s in symbols if s not in elem_to_type})
     if missing:
@@ -112,19 +110,102 @@ def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
     return out
 
 
+def predict_charges(checkpoint_path, data_path, frame=0, device='cpu'):
+    """Latent charges + E_lr for one frame. Returns a dict of numpy arrays."""
+    from ase.io import read
+
+    device = torch.device(device)
+    model, les_module, hp, elem_to_type, dtype = load_les_model(
+        checkpoint_path, device)
+    atoms = read(data_path, index=frame)
+    return _predict_frame(model, les_module, hp, elem_to_type, dtype,
+                          atoms, device)
+
+
+def predict_charges_frames(checkpoint_path, data_path, index=':', device='cpu',
+                           verbose=False):
+    """Latent charges (+ dipoles) for a RANGE of frames.
+
+    ``index`` uses ASE slice syntax: ``':'`` (all), ``'0:1000'``, ``'::10'``.
+    The model is loaded once and reused. When every frame shares one
+    composition (an MD trajectory) the per-frame arrays are stacked —
+    charges (n_frames, N), dipoles (n_frames, N, 3), ... — otherwise they
+    come back as object arrays of per-frame results (np.load needs
+    allow_pickle=True for those).
+    """
+    from ase.io import read
+
+    device = torch.device(device)
+    model, les_module, hp, elem_to_type, dtype = load_les_model(
+        checkpoint_path, device)
+    frames = read(data_path, index=index)
+    if not isinstance(frames, list):
+        frames = [frames]
+
+    per = []
+    for k, atoms in enumerate(frames):
+        per.append(_predict_frame(model, les_module, hp, elem_to_type, dtype,
+                                  atoms, device))
+        if verbose and ((k + 1) % 50 == 0 or k + 1 == len(frames)):
+            print(f"  frame {k + 1}/{len(frames)}", flush=True)
+
+    out = {'e_lr': np.array([r['e_lr'] for r in per])}
+    keys = [k for k in ('positions', 'charges', 'dipoles', 'charges_ref')
+            if all(k in r for r in per)]
+    if all(np.array_equal(r['symbols'], per[0]['symbols']) for r in per):
+        out['symbols'] = per[0]['symbols']
+        for k in keys:
+            out[k] = np.stack([r[k] for r in per])
+    else:
+        def _ragged(vals):
+            a = np.empty(len(vals), dtype=object)
+            a[:] = vals
+            return a
+        out['symbols'] = _ragged([r['symbols'] for r in per])
+        for k in keys:
+            out[k] = _ragged([r[k] for r in per])
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--checkpoint', required=True,
                     help='.mdl from train_ecenet_xyz(use_les=True)')
     ap.add_argument('--data', required=True, help='ASE-readable file (extxyz, ...)')
-    ap.add_argument('--frame', type=int, default=0, help='frame index (default 0)')
+    ap.add_argument('--frame', default='0',
+                    help="frame index (default 0), or an ASE-style range: "
+                         "':' (all), '0:1000', '::10'")
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--save', default=None, help='write results to this .npz')
     ap.add_argument('--per_atom', action='store_true',
-                    help='print every atom, not just the summary')
+                    help='print every atom, not just the summary (single frame only)')
     args = ap.parse_args()
 
-    r = predict_charges(args.checkpoint, args.data, args.frame, args.device)
+    try:
+        frame = int(args.frame)
+    except ValueError:
+        r = predict_charges_frames(args.checkpoint, args.data, args.frame,
+                                   args.device, verbose=True)
+        q, e_lr = r['charges'], r['e_lr']
+        n = len(e_lr)
+        print(f"Frames {args.frame!r}: {n} frames | "
+              f"E_lr mean = {e_lr.mean():+.6f} eV (min {e_lr.min():+.6f}, "
+              f"max {e_lr.max():+.6f})")
+        if q.dtype != object:
+            print(f"Latent charges: per-frame sum mean = {q.sum(1).mean():+.4f}, "
+                  f"min = {q.min():+.4f}, max = {q.max():+.4f}"
+                  + (" | dipoles saved too" if 'dipoles' in r else ""))
+        else:
+            print("(mixed compositions — object arrays; np.load with "
+                  "allow_pickle=True)")
+        if args.per_atom:
+            print("--per_atom applies to a single frame only; ignored.")
+        if args.save:
+            np.savez(args.save, **r)
+            print(f"Saved to {args.save}")
+        return
+
+    r = predict_charges(args.checkpoint, args.data, frame, args.device)
     q = r['charges']
 
     print(f"Frame {args.frame}: {len(q)} atoms | E_lr = {r['e_lr']:+.6f} eV")
