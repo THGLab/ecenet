@@ -111,6 +111,32 @@ def test_ecenet_mp():
     print(f"  ECENet(n_mp=2) runs: E={e.item():.4f}, SO(3) err {err:.1e}")
 
 
+def test_forward_batch_topology_list_formats():
+    """forward_batch's variable-topology fallback must consume BOTH
+    per-structure list formats — build_topology tuples AND
+    scripts/train_ecenet-style dicts — bit-identically to the on-the-fly
+    path. Regression: forwarding a dict list used to unpack the dicts as
+    tuples (i.e. their KEYS) and crash with a str + int TypeError."""
+    model = ECENet(**COMMON).double()
+    g = torch.Generator().manual_seed(3)
+    types = torch.randint(0, N_TYPES, (6,), generator=g)
+    pos_list = [torch.randn(6, 3, generator=g, dtype=DTYPE) * 1.8
+                for _ in range(3)]     # same composition, different geometries
+
+    tuples = model.build_topology(pos_list)
+    dicts = [{'edge_i': t[0], 'edge_j': t[1], 'nb_src': t[2], 'nb_dst': t[3]}
+             for t in tuples]
+
+    e_fly = model.forward_batch(pos_list, types)
+    e_tup = model.forward_batch(pos_list, types, topology=tuples)
+    e_dic = model.forward_batch(pos_list, types, topology=dicts)
+    d = max((e_fly - e_tup).abs().max().item(),
+            (e_fly - e_dic).abs().max().item())
+    assert d == 0.0, f"topology-list formats diverge from on-the-fly: {d:.3e}"
+    print(f"  forward_batch consumes tuple AND dict topology lists "
+          f"(d={d:.1e} vs on-the-fly)")
+
+
 def test_zero_edge_energy_is_atomic_and_consistent():
     """A structure with no edges keeps Σ atomic_energy: forward and
     forward_batch_multi must agree, and the energy must be continuous across
@@ -152,5 +178,6 @@ if __name__ == "__main__":
     test_forces_finite_difference()
     test_training_path_forward_batch_multi()
     test_ecenet_mp()
+    test_forward_batch_topology_list_formats()
     test_zero_edge_energy_is_atomic_and_consistent()
     print("All tests passed.")

@@ -1129,11 +1129,21 @@ class ECENet(nn.Module):
             # (shared types is just every structure carrying the same type
             # vector). It builds topology per-structure and runs the expensive
             # ops once on the merged flat edge set — identical result. A
-            # build_topology LIST is forwarded rather than silently dropped.
+            # per-structure topology LIST is forwarded rather than silently
+            # dropped; dict-format entries (scripts/train_ecenet's
+            # precompute_topology) are normalized to the (ei, ej, nb_src,
+            # nb_dst) tuples forward_batch_multi unpacks.
+            if isinstance(topology, list):
+                topology = [
+                    (t['edge_i'], t['edge_j'], t['nb_src'], t['nb_dst'])
+                    if isinstance(t, dict) else t
+                    for t in topology]
+            else:
+                topology = None
             return self.forward_batch_multi(
                 positions_list, [types] * len(positions_list),
                 return_embeddings=return_embeddings, l0_only=l0_only,
-                topology=topology if isinstance(topology, list) else None)
+                topology=topology)
 
         # ── Fixed topology: vectorized over B ─────────────────────────────
         B = len(positions_list)
