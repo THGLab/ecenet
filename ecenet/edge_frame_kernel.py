@@ -391,15 +391,20 @@ if _HAS_TRITON:
 _EF_TABLES: dict = {}
 
 
-def _next16(x: int) -> int:
-    return ((x + 15) // 16) * 16
+def _next_pow2(x: int) -> int:
+    """Smallest power of two ≥ x, floored at 16. tl.arange REQUIRES a power
+    of two (a multiple of 16 like 48 or 96 compiles to "arange's range must
+    be a power of 2"), and tl.dot needs each dim ≥ 16; every kernel load and
+    store masks the padding (offs < R/S/P), so the rounding is free of
+    correctness effects."""
+    return max(16, 1 << (max(x, 1) - 1).bit_length())
 
 
 def _ef_block_r(n_rows: int) -> int:
     """Row-tile size: cover all rows of one edge in a single program when
     reasonable (≤128), so D and the column tables are loaded once per edge —
     with BLOCK_R < n_rows each edge pays for them per row-block."""
-    return min(128, max(16, _next16(n_rows)))
+    return min(128, _next_pow2(n_rows))
 
 
 def _ef_tables(n_sph: int, n_ang: int, device):
@@ -487,7 +492,7 @@ def _e2n_forward_triton(g_cos, g_sin, edge_dst, D_block, n_atoms, n_base):
             g_cos.contiguous(), g_sin.contiguous(), D_block.contiguous(),
             perm, aptr, srcoff, okc, oks, Delta,
             n_base, S, P,
-            SP=_next16(S), RB=_next16(n_base))
+            SP=_next_pow2(S), RB=_next_pow2(n_base))
         return Delta
 
     # Per-edge: pack+unrotate is exactly the dx backward kernel's math
@@ -503,7 +508,7 @@ def _e2n_forward_triton(g_cos, g_sin, edge_dst, D_block, n_atoms, n_base):
         g_cos.contiguous(), g_sin.contiguous(), D_block.contiguous(),
         cos_col, cos_ok, sin_col, sin_ok, h_global,
         n_base, n_base, S, P,
-        SP=_next16(S), P16=_next16(P), BLOCK_R=block_r)
+        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
     Delta = torch.zeros(n_atoms, n_base, S, dtype=g_cos.dtype,
                         device=g_cos.device)
     Delta.index_add_(0, edge_dst, h_global)
@@ -534,7 +539,7 @@ def _ef_forward_triton(A_emb, edge_i, edge_j, D_block, n_ch, n_ang):
         cos_col, cos_ok, sin_col, sin_ok,
         A_cos, A_sin,
         C, R, S, P,
-        SP=_next16(S), P16=_next16(P), BLOCK_R=block_r)
+        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
     return A_cos, A_sin
 
 
@@ -553,7 +558,7 @@ def _ef_backward_triton(dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block,
     A_emb_c = A_emb.contiguous()
     args = (cos_col, cos_ok, sin_col, sin_ok)
     block_r = _ef_block_r(R)
-    kw = dict(SP=_next16(S), P16=_next16(P), BLOCK_R=block_r)
+    kw = dict(SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
 
     def _scatter(dA_both):
         # scatter back to atoms (torch: well-optimized, visible to compile)
@@ -790,7 +795,7 @@ class EdgeToNodeFused(torch.autograd.Function):
         n_base = n_ch // (int(round(n_sph ** 0.5)))
         with torch.no_grad():
             if (_ef_triton_ok(g_cos, edge_dst.shape[0])
-                    and _next16(n_base) <= 128):
+                    and _next_pow2(n_base) <= 128):
                 Delta = _e2n_forward_triton(g_cos, g_sin, edge_dst, D_block,
                                             n_atoms, n_base)
             else:
@@ -833,7 +838,7 @@ class EdgeToNodeFused(torch.autograd.Function):
                     g_cos.contiguous(), g_sin.contiguous(),
                     cos_col, cos_ok, sin_col, sin_ok, dD,
                     n_base, n_base, n_sph, P,
-                    SP=_next16(n_sph), P16=_next16(P), BLOCK_R=block_r)
+                    SP=_next_pow2(n_sph), P16=_next_pow2(P), BLOCK_R=block_r)
             return dg_cos, dg_sin, None, dD, None, None, None, None, None
 
         # Eager (double-differentiable) path.
@@ -873,7 +878,7 @@ class PackUnrotateFused(torch.autograd.Function):
         S = D_block.shape[-1]
         n_base = n_ch // (int(round(S ** 0.5)))
         with torch.no_grad():
-            if _ef_triton_ok(m_cos, E) and _next16(n_base) <= 128:
+            if _ef_triton_ok(m_cos, E) and _next_pow2(n_base) <= 128:
                 cos_col, cos_ok, sin_col, sin_ok = _ef_tables(S, n_ang, m_cos.device)
                 P = (n_ch // n_base) * n_ang
                 h_global = torch.empty(E, n_base, S, dtype=m_cos.dtype,
@@ -888,7 +893,7 @@ class PackUnrotateFused(torch.autograd.Function):
                     D_block.contiguous(),
                     cos_col, cos_ok, sin_col, sin_ok, h_global,
                     n_base, n_base, S, P,
-                    SP=_next16(S), P16=_next16(P), BLOCK_R=block_r)
+                    SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
             else:
                 h = _pack_grads(m_cos, m_sin, cos_flat_idx, sin_flat_idx,
                                 cos_valid, sin_valid,
@@ -914,7 +919,7 @@ class PackUnrotateFused(torch.autograd.Function):
             P = (n_ch // n_base) * n_ang
             block_r = _ef_block_r(n_base)
             tabs = _ef_tables(S, n_ang, dh.device)
-            kw = dict(SP=_next16(S), P16=_next16(P), BLOCK_R=block_r)
+            kw = dict(SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
 
             # Merged path: dh (the dominant read) loaded once → dm AND dD.
             if need_dm and need_dd and block_r >= n_base:
