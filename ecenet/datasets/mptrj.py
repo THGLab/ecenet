@@ -106,13 +106,24 @@ def ensure_atom_counts(prepared_dir):
                 f"{path} holds {len(counts)} shards but the manifest lists "
                 f"{len(shards)}; delete the file to rebuild it")
     else:
+        # One-time back-fill: unpickles every shard once (≈ one epoch's worth
+        # of shard reads), then the file is cached for all later runs.
+        import time
+        print(f"[atom_counts] {path} missing — building it from "
+              f"{len(shards)} shards (one-time; ~one epoch of shard reads)...",
+              flush=True)
+        t0 = time.time()
         counts = []
-        for s in shards:
+        for k, s in enumerate(shards):
             shard = torch.load(prepared_dir / s, map_location='cpu',
                                weights_only=False)
             counts.append(torch.tensor([int(fr['n_atoms']) for fr in shard],
                                        dtype=torch.int64))
+            if (k + 1) % 10 == 0 or k + 1 == len(shards):
+                print(f"[atom_counts]   {k + 1}/{len(shards)} shards "
+                      f"({time.time() - t0:.0f}s)", flush=True)
         torch.save(counts, path)
+        print(f"[atom_counts] saved {path} ({time.time() - t0:.0f}s)", flush=True)
     return {s: np.asarray(c, dtype=np.int64) for s, c in zip(shards, counts)}
 
 
