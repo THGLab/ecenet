@@ -1385,9 +1385,11 @@ def train_ecenet_mptrj(
                 save_checkpoint(epoch)
                 lr_now = optimizer.param_groups[0]['lr']
                 ssfx = f" S={va_s:.4f}" if use_stress else ""
+                tr_ssfx = f" S={tr_s:.4f}" if use_stress else ""
                 print_flush(
                     f"  Epoch {epoch+1:3d}: loss={epoch_loss:.4f} | "
-                    f"train E={tr_e:.4f} F={tr_f:.4f} | val E={va_e:.4f} F={va_f:.4f}{ssfx} | "
+                    f"train E={tr_e:.4f} F={tr_f:.4f}{tr_ssfx} | "
+                    f"val E={va_e:.4f} F={va_f:.4f}{ssfx} | "
                     f"lr={lr_now:.1e} | {time.time()-t_start:.0f}s | "
                     f"best val [weighted]={best_val_weighted:.4f} "
                     f"[test E={best_test[0]:.4f} F={best_test[1]:.4f} S={best_test[2]:.4f}]")
