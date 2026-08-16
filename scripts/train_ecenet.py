@@ -183,6 +183,14 @@ def train_ecenet(
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
+    # Joint LES long-range training: E = E_sr + E_lr on one autograd graph
+    # (isolated pairwise path — rMD17/MD22 molecules have no cell). NOTE on
+    # units: these datasets are in kcal/mol while the LES Coulomb constant is
+    # eV·Å-based, so the latent charges absorb the scale factor — they are
+    # not in units of e (they are latent regardless; on eV datasets they
+    # come out closer to physical).
+    use_les=False,
+    les_arguments=None,    # extra kwargs for upstream les.Les (see ecenet/les.py)
     # Batching
     use_graph_batch=True,
     # Optimiser
@@ -282,22 +290,38 @@ def train_ecenet(
         model = model.double()
     model = model.to(device)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # ── LES long-range module (optional) ──────────────────────────────────
+    # Upstream builds its charge MLP lazily on the first forward, so it is
+    # materialised NOW (synthetic probe via the shared load_les_module dance):
+    # the optimiser and any checkpoint restore below need the parameters to
+    # exist. Edge-mode read-outs bypass the head (module is parameter-free).
+    les_module = None
+    if use_les:
+        from ecenet.les import load_les_module
+        les_module = load_les_module({'arguments': les_arguments}, model,
+                                     device, dtype, load_state=False)
+        les_module.train()
+
+    all_params = list(model.parameters())
+    if les_module is not None:
+        all_params += list(les_module.parameters())
+    n_params = sum(p.numel() for p in all_params if p.requires_grad)
     if verbose:
         model_name = "ECENet"
         print_flush(f"\n{model_name}: n_mp={n_mp}, {n_layers} layers/stage, l_max={l_max}, n_max={n_max}, "
                     f"embed_dim={embed_dim}, n_max_d={n_max_d}")
         print_flush(f"  n_features_per_m: {model.n_features_per_m}")
         print_flush(f"  r_cut_edge={r_cut_edge}, r_cut_neighbor={r_cut_neighbor}")
-        print_flush(f"  Trainable parameters: {n_params}")
+        print_flush(f"  Trainable parameters: {n_params}"
+                    + (" (incl. LES charge head)" if use_les else ""))
 
     # ── Optimiser ─────────────────────────────────────────────────────────
     if optimizer_type == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
     elif optimizer_type == 'adam':
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(all_params, lr=lr, weight_decay=weight_decay)
     else:   # 'sgd'
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay,
+        optimizer = torch.optim.SGD(all_params, lr=lr, weight_decay=weight_decay,
                                     momentum=0.9)
     # LR schedule. 'plateau' (default): ReduceLROnPlateau on the val metric.
     # 'cosine': linear warmup over warmup_epochs, then cosine decay to
@@ -356,9 +380,17 @@ def train_ecenet(
     best_test_e_mae = float('nan')
     best_test_f_mae = float('nan')
     best_state = None
+    best_les_state = None
     if checkpoint_path is not None and __import__('os').path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(ckpt['model'], strict=False)
+        if use_les != ('les' in ckpt):
+            raise ValueError(
+                f"Checkpoint at {checkpoint_path} was trained with "
+                f"use_les={'les' in ckpt}, but this run has use_les={use_les}.")
+        if les_module is not None:
+            les_module.load_state_dict(ckpt['les']['state_dict'])
+            best_les_state = ckpt['les'].get('best_state')
         if not reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
             # Open-loop schedules have no state (the LR is a function of the
@@ -393,7 +425,13 @@ def train_ecenet(
     def save_checkpoint(epoch):
         if checkpoint_path is None:
             return
+        out_les = (None if les_module is None else {
+            'arguments': les_arguments,
+            'state_dict': les_module.state_dict(),
+            'best_state': best_les_state,
+        })
         torch.save({
+            **({'les': out_les} if out_les is not None else {}),
             'epoch': epoch,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -461,6 +499,31 @@ def train_ecenet(
             return [topo_split[i] for i in batch_indices]
         return None
 
+    def batch_energies(pos_b, topo):
+        """Total energies for a batch: E_sr, plus E_lr under use_les.
+
+        The LES call is batched (SPICE's recipe): one call over the
+        concatenated atoms with a structure-index vector, cell=None → the
+        vectorized isolated pairwise path. Everything stays on one autograd
+        graph, so the force grads below cover E_lr with no extra code.
+        """
+        if les_module is None:
+            return model.forward_batch(pos_b, atom_types, topology=topo)
+        e_sr, l0_list = model.forward_batch(pos_b, atom_types, topology=topo,
+                                            return_embeddings=True, l0_only=True)
+        l0 = torch.cat(l0_list, dim=0)
+        pos = torch.cat(pos_b, dim=0)
+        batch_vec = torch.cat([
+            torch.full((p.shape[0],), b, dtype=torch.long, device=p.device)
+            for b, p in enumerate(pos_b)])
+        return e_sr + les_module(l0, pos, batch=batch_vec,
+                                 n_struct=len(pos_b), **model.les_flags)
+
+    def _train_mode(train):
+        model.train(train)
+        if les_module is not None:
+            les_module.train(train)
+
     # ── Evaluation ────────────────────────────────────────────────────────
     def evaluate(pos_list, frc_list, eng_target, topo_split=None, max_samples=None):
         """Returns (energy_MAE, force_MAE, loss) on the given set.
@@ -470,7 +533,7 @@ def train_ecenet(
           + force_weight · mean_structures[ mean((-grad - F)²) ]
         (MSE, per-atom energy), so it can be used as the 'weighted' best metric.
         """
-        model.eval()
+        _train_mode(False)
         idx = (list(np.random.choice(len(pos_list), min(max_samples, len(pos_list)), replace=False))
                if max_samples is not None else list(range(len(pos_list))))
         energy_mae = 0.0
@@ -483,7 +546,7 @@ def train_ecenet(
             pos_b = [pos_list[i].detach().clone().requires_grad_(True) for i in batch]
             topo  = pick_topology(topo_split, batch)
             with torch.enable_grad():
-                eng_b = model.forward_batch(pos_b, atom_types, topology=topo)
+                eng_b = batch_energies(pos_b, topo)
                 grads = torch.autograd.grad(eng_b.sum(), pos_b)
             for k, i in enumerate(batch):
                 e_err = eng_b[k] - eng_target[i]
@@ -493,7 +556,7 @@ def train_ecenet(
                 force_count  += frc_list[i].numel()
                 energy_se_pa += loss_fn(eng_b[k] / n_atoms, eng_target[i] / n_atoms).item()
                 force_se     += loss_fn(-grads[k], frc_list[i]).item()
-        model.train()
+        _train_mode(True)
         n = len(idx)
         loss = energy_weight * (energy_se_pa / n) + force_weight * (force_se / n)
         return energy_mae / n, force_mae / force_count, loss
@@ -512,7 +575,7 @@ def train_ecenet(
         if scheduler is None:
             for pg in optimizer.param_groups:
                 pg['lr'] = open_loop_lr(epoch)
-        model.train()
+        _train_mode(True)
         epoch_loss = 0.0
         perm = np.random.permutation(n_train)
         n_batches = (n_train + batch_size - 1) // batch_size
@@ -525,7 +588,7 @@ def train_ecenet(
             eng_tgt = torch.stack([eng_train[i] for i in batch_indices])
             topo    = pick_topology(train_topo, batch_indices)
 
-            eng_pred = model.forward_batch(pos_b, atom_types, topology=topo)
+            eng_pred = batch_energies(pos_b, topo)
 
             energy_loss = loss_fn(eng_pred / n_atoms, eng_tgt / n_atoms)
 
@@ -542,7 +605,7 @@ def train_ecenet(
             loss.backward()
 
             if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=grad_clip)
             optimizer.step()
             epoch_loss += loss.item()
 
@@ -569,6 +632,9 @@ def train_ecenet(
             if cur_val_metric < best_val_metric:
                 best_val_metric = cur_val_metric
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                if les_module is not None:
+                    best_les_state = {k: v.clone()
+                                      for k, v in les_module.state_dict().items()}
                 epochs_without_improvement = 0
                 best_test_e_mae, best_test_f_mae, _ = evaluate(pos_test, frc_test, eng_test,
                                                                topo_split=test_topo)
@@ -595,6 +661,8 @@ def train_ecenet(
     # ── Final evaluation ──────────────────────────────────────────────────
     if best_state is not None:
         model.load_state_dict(best_state, strict=False)
+        if les_module is not None and best_les_state is not None:
+            les_module.load_state_dict(best_les_state)
 
     train_e_mae, train_f_mae, _ = evaluate(pos_train, frc_train, eng_train, topo_split=train_topo)
     val_e_mae,   val_f_mae,   _ = evaluate(pos_val,   frc_val,   eng_val,   topo_split=val_topo)
@@ -613,4 +681,5 @@ def train_ecenet(
         'val_energy_mae':   val_e_mae,   'val_force_mae':   val_f_mae,
         'test_energy_mae':  test_e_mae,  'test_force_mae':  test_f_mae,
         'n_params': n_params, 'time': total_time,
+        'les_module': les_module,   # None unless use_les
     }
