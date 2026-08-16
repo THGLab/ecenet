@@ -43,6 +43,9 @@ tools/                 developer utilities (run from the repo root)
                          (ChengUCB/les_fit SPICE test slices, downloaded separately)
   eval_spice_bec.py      zero-shot Born effective charges (dP/dr via autograd,
                          charge-flow terms included) vs the same slices' references
+  eval_wbm.py            WBM / Matbench-Discovery evaluation: `relax` (job-array
+                         MLIP relaxations of WBM initial structures, resumable)
+                         and `score` (e_form + hull metrics: F1, DAF, MAE)
 ```
 
 ## Install
@@ -501,6 +504,7 @@ python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (s
 python tests/test_mptrj_shard_batching.py    # shard atom-budget batching: DDP count alignment, sidecar
 python tests/test_xyz_trainer.py             # small-dataset trainer: smoke, LES resume, force-FD through E_lr
 python tests/test_trainer_les.py             # use_les in the rMD17 + MPtrj trainers; stress-FD through the Ewald cell strain
+python tests/test_wbm_eval.py                # WBM relax+score pipeline: slicing/resume, e_form + hull metrics exact on a perfect model
 ```
 
 ## License
