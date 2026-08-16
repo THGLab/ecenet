@@ -239,11 +239,16 @@ def _find_col(columns, must, prefer):
     return max(cands, key=lambda c: sum(p in c.lower() for p in prefer))
 
 
-def load_wbm_summary(path):
+def load_wbm_summary(path, unique_only=False):
     """{material_id: (e_form_dft, e_hull_dft)} from the WBM summary CSV,
     auto-detecting the id / formation-energy / hull-distance columns
     (preferring the MP2020-corrected variants). Plain csv module — the
-    score stage deliberately needs nothing beyond numpy."""
+    score stage deliberately needs nothing beyond numpy.
+
+    unique_only: keep only rows flagged in the ``unique_prototype`` column —
+    the ~215k deduplicated subset the Matbench-Discovery leaderboard's
+    headline numbers are computed on (the full set double-counts repeated
+    prototypes and is slightly easier)."""
     import csv
     with _open_auto(path) as f:
         reader = csv.reader(f)
@@ -253,8 +258,14 @@ def load_wbm_summary(path):
                                         ['mp2020', 'corrected']))
         eh_col = header.index(_find_col(header, ['e_above_hull'],
                                         ['mp2020', 'corrected', 'ppd']))
+        uq_col = None
+        if unique_only:
+            uq_col = header.index(_find_col(header, ['unique', 'prototype'], []))
         out = {}
         for row in reader:
+            if uq_col is not None and row[uq_col].strip().lower() not in (
+                    'true', '1'):
+                continue
             try:
                 out[row[id_col]] = (float(row[ef_col]), float(row[eh_col]))
             except (ValueError, IndexError):
@@ -274,7 +285,8 @@ def run_score(args):
     n_skip = sum(1 for r in preds.values() if 'skipped' in r)
 
     refs = load_elemental_refs(args.ref)
-    summary = load_wbm_summary(args.summary)
+    summary = load_wbm_summary(args.summary,
+                               unique_only=args.unique_prototypes)
 
     rows = []      # (id, e_form_pred, e_form_dft, e_hull_dft, converged)
     for mid, r in preds.items():
@@ -308,6 +320,7 @@ def run_score(args):
     prevalence = float(st.mean())
     metrics = {
         'n_scored': len(rows),
+        'unique_prototypes_only': bool(args.unique_prototypes),
         'n_pred_total': len(preds), 'n_errors': n_err, 'n_skipped': n_skip,
         'n_unconverged': int((~converged).sum()),
         'e_form_mae': float(np.abs(err).mean()),
@@ -322,7 +335,8 @@ def run_score(args):
         'daf': float(prec / max(prevalence, 1e-12)),
         'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
     }
-    print(f"scored {metrics['n_scored']:,} structures "
+    uq = " [unique prototypes]" if args.unique_prototypes else ""
+    print(f"scored {metrics['n_scored']:,} structures{uq} "
           f"({n_err} errors, {n_skip} skipped, "
           f"{metrics['n_unconverged']} unconverged)")
     print(f"  e_form  MAE {metrics['e_form_mae']*1e3:7.1f} meV/atom | "
@@ -374,6 +388,9 @@ def main(argv=None):
     ps.add_argument('--csv', default=None, help='per-structure csv dump')
     ps.add_argument('--threshold', type=float, default=0.0,
                     help='stability threshold on e_hull (eV/atom)')
+    ps.add_argument('--unique_prototypes', action='store_true',
+                    help="score only the summary's unique_prototype subset "
+                         "(~215k rows — the leaderboard's headline split)")
 
     args = p.parse_args(argv)
     if args.cmd == 'relax':

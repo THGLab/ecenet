@@ -102,13 +102,15 @@ def test_wbm_eval():
 
         rng = np.random.RandomState(3)
         rows = ['material_id,e_form_per_atom_mp2020_corrected,'
-                'e_above_hull_mp2020_correct_ppd']
+                'e_above_hull_mp2020_correct_ppd,unique_prototype']
         e_hull = {}
+        dup_id = sorted(done)[-1]           # one non-unique-prototype row
         for mid, r in done.items():
             mu = sum(n * refs[s] for s, n in r['composition'].items())
             ef = (r['energy'] - mu) / r['n_atoms']
             e_hull[mid] = float(rng.uniform(-0.05, 0.1))
-            rows.append(f"{mid},{ef!r},{e_hull[mid]!r}")
+            rows.append(f"{mid},{ef!r},{e_hull[mid]!r},"
+                        f"{mid != dup_id}")
         summary_path = os.path.join(tmp, 'wbm-summary.csv')
         with open(summary_path, 'w') as f:
             f.write('\n'.join(rows))
@@ -124,6 +126,13 @@ def test_wbm_eval():
         assert m['f1'] == 1.0 and m['recall'] == 1.0 and m['precision'] == 1.0
         n_stable = sum(1 for v in e_hull.values() if v <= 0)
         assert abs(m['daf'] - len(done) / n_stable) < 1e-9, (m['daf'], n_stable)
+
+        # unique-prototype filter drops exactly the flagged-False row
+        main(['score', '--pred', out, '--summary', summary_path,
+              '--ref', ref_path, '--out', metrics_path, '--unique_prototypes'])
+        with open(metrics_path) as f:
+            mu_ = json.load(f)
+        assert mu_['n_scored'] == 5 and mu_['unique_prototypes_only'], mu_
 
         # 5. shift one stable prediction far above the hull → recall drops
         with gzip.open(out, 'rt') as f:
