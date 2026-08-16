@@ -138,11 +138,23 @@ def test_wbm_eval():
         # (dup_id flagged False; 'wbm-1-bad' absent from the summary)
         out_uq = os.path.join(tmp, 'wbm_uq.json.gz')
         main(common[:5] + ['--out', out_uq] + common[7:]
-             + ['--summary', summary_path, '--unique_prototypes'])
+             + ['--summary', summary_path, '--unique_prototypes',
+                '--save_structures'])
         with gzip.open(out_uq, 'rt') as f:
             uq_shard = json.load(f)['results']
         assert len(uq_shard) == 5 and dup_id not in uq_shard \
             and 'wbm-1-bad' not in uq_shard, sorted(uq_shard)
+        # --save_structures: relaxed geometry stored with consistent shapes
+        for v in uq_shard.values():
+            st = v['structure']
+            assert len(st['symbols']) == len(st['positions']) == v['n_atoms']
+            assert np.asarray(st['positions']).shape == (v['n_atoms'], 3)
+            assert np.asarray(st['cell']).shape == (3, 3)
+        # scoring ignores the extra field
+        main(['score', '--pred', out_uq, '--summary', summary_path,
+              '--ref', ref_path, '--out', metrics_path])
+        with open(metrics_path) as f:
+            assert json.load(f)['n_scored'] == 5
 
         # 5. shift one stable prediction far above the hull → recall drops
         with gzip.open(out, 'rt') as f:

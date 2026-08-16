@@ -215,6 +215,16 @@ def run_relax(args):
                 'n_steps': int(opt.nsteps),
                 'volume': float(atoms.get_volume()),
             }
+            if args.save_structures:
+                # Final geometry (for RMSD-vs-DFT scoring / re-use); 1e-6 Å
+                # rounding keeps the shards compact.
+                results[mid]['structure'] = {
+                    'symbols': syms,
+                    'positions': [[round(x, 6) for x in p]
+                                  for p in atoms.get_positions().tolist()],
+                    'cell': [[round(x, 6) for x in v]
+                             for v in atoms.get_cell().tolist()],
+                }
         except Exception as e:                     # keep the shard going
             results[mid] = {'error': f"{type(e).__name__}: {e}"}
         if len(results) % args.flush_every == 0:
@@ -410,6 +420,10 @@ def main(argv=None):
     pr.add_argument('--unique_prototypes', action='store_true',
                     help="relax only the summary's unique_prototype subset "
                          "(--slice then indexes the filtered id list)")
+    pr.add_argument('--save_structures', action='store_true',
+                    help='also store each relaxed geometry (symbols, '
+                         'positions, cell) in the shard — needed for later '
+                         'RMSD-vs-DFT scoring')
 
     ps = sub.add_parser('score', help='score relax shards against DFT')
     ps.add_argument('--pred', nargs='+', required=True,
