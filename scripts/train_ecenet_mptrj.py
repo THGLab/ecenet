@@ -526,41 +526,9 @@ def compute_energy_reference(structures, type_map):
 # Topology (PBC neighbor lists with Cartesian shift vectors)
 # ---------------------------------------------------------------------------
 
-def torch_neighbor_list(pos, cell, r_cut):
-    """Vectorized all-images neighbor list (matches ASE neighbor_list('ijS')).
-
-    Fast torch O(N²·n_shift) replacement for ASE's per-pair Python loop, runs on
-    whatever device `pos` is on (GPU on the cluster). Unlike the minimum-image
-    list in ecenet.calculator._gpu_neighbor_list, this enumerates *every* periodic
-    image within the cutoff and includes self-image edges (i==j, S≠0) — essential
-    for MPtrj's small cells where r_cut > L/2 is the norm.
-
-    Args:
-        pos:   (N, 3) tensor of Cartesian positions
-        cell:  (3, 3) tensor (rows = lattice vectors), or None for non-periodic
-        r_cut: cutoff radius (Å)
-    Returns:
-        i, j:  (M,) long tensors (directed pairs)
-        shift: (M, 3) tensor of Cartesian shifts, with
-               diff = pos[j] - pos[i] + shift,  0 < |diff| < r_cut
-    """
-    device, dtype = pos.device, pos.dtype
-    if cell is None:                              # non-periodic → only the zero shift
-        shift_cart = torch.zeros(1, 3, dtype=dtype, device=device)
-    else:
-        # cells to replicate per axis: ceil-ish bound from reciprocal widths.
-        recip = torch.linalg.inv(cell).transpose(0, 1)            # rows = reciprocal vecs b_i
-        n_rep = (torch.floor(r_cut * recip.norm(dim=1)).to(torch.long) + 1).tolist()
-        rng = [torch.arange(-n, n + 1, device=device) for n in n_rep]
-        S = torch.cartesian_prod(*rng).to(dtype).reshape(-1, 3)   # (n_shift, 3) integer shifts
-        shift_cart = S @ cell                                      # (n_shift, 3) Cartesian
-
-    rel = pos.unsqueeze(0) - pos.unsqueeze(1)                      # rel[i,j] = pos[j] - pos[i]  (N,N,3)
-    D   = rel.unsqueeze(2) + shift_cart.view(1, 1, -1, 3)         # (N, N, n_shift, 3)
-    d2  = (D * D).sum(-1)                                          # (N, N, n_shift)
-    mask = (d2 < r_cut * r_cut) & (d2 > 1e-10)                     # drops the S=0 self term
-    i, j, sidx = mask.nonzero(as_tuple=True)
-    return i, j, shift_cart[sidx]
+# torch_neighbor_list now lives in ecenet.radial (the calculator needs it too
+# for small cells); re-exported here so existing imports keep working.
+from ecenet.radial import torch_neighbor_list  # noqa: E402, F401
 
 
 def build_topology(positions, cell, pbc, r_cut_edge, r_cut_nb, device, dtype):

@@ -418,8 +418,77 @@ def test_architecture_mismatch_raises():
             raise AssertionError("expected a ValueError for mismatched weights")
 
 
+def _direct_all_images(model, pos, cell, types_list):
+    """Reference: forward_pbc on the all-images topology (the lists are
+    themselves ASE-verified in test_mptrj_trainer.py)."""
+    from ecenet.radial import torch_neighbor_list
+    pt = torch.tensor(pos, dtype=torch.float64, requires_grad=True)
+    ct = torch.tensor(cell, dtype=torch.float64)
+    types = torch.tensor(types_list, dtype=torch.long)
+    ei, ej, she = torch_neighbor_list(pt.detach(), ct, model.r_cut_edge)
+    ni, nj, shn = torch_neighbor_list(pt.detach(), ct, model.r_cut_neighbor)
+    e = model.forward_pbc(pt, types, ei, ej, she, ni, nj, shn)
+    f = -torch.autograd.grad(e, pt)[0]
+    return e.item(), f.numpy(), len(ei), pt
+
+
+def test_pbc_small_cell_uses_all_images_topology():
+    """Small crystal cells (cutoff > half the minimum perpendicular width —
+    ~97% of MPtrj/WBM frames): the calculator must build the same all-images
+    topology the trainers train on, self-image edges included. The
+    minimum-image shortcut drops periodic-image edges there — this pins the
+    automatic dispatch by matching a direct forward_pbc evaluation."""
+    model = _tiny_model(2)
+    rng = np.random.RandomState(0)
+    cell = np.array([[4.0, 0.3, 0.0], [0.0, 4.2, 0.4], [0.0, 0.0, 3.8]])
+    pos = rng.uniform(0, 1, (4, 3)) @ cell
+    atoms = Atoms(symbols=['H', 'C', 'H', 'C'], positions=pos, cell=cell,
+                  pbc=True)
+    atoms.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                  dtype=torch.float64,
+                                  element_to_type={'H': 0, 'C': 1})
+    e_calc = atoms.get_potential_energy()
+    f_calc = atoms.get_forces()
+
+    e_ref, f_ref, n_edges, pt = _direct_all_images(model, pos, cell,
+                                                   [0, 1, 0, 1])
+    assert abs(e_ref - e_calc) < 1e-10, (e_ref, e_calc)
+    assert np.abs(f_ref - f_calc).max() < 1e-10
+    # the regression: MIC finds strictly fewer edges in this cell, so the old
+    # minimum-image path could not have produced this energy
+    mi, _, _ = atoms.calc._gpu_neighbor_list(pt.detach(), cell,
+                                             model.r_cut_edge)
+    assert n_edges > len(mi), (n_edges, len(mi))
+    print(f"  small cell: all-images topology dispatched "
+          f"({n_edges} edges vs {len(mi)} under MIC), E/F match direct")
+
+
+def test_pbc_large_cell_paths_agree():
+    """Where MIC is valid (cutoff ≤ half the cell width) the two list
+    flavours are identical, so the fast minimum-image path must reproduce
+    the all-images reference exactly."""
+    model = _tiny_model(2)
+    rng = np.random.RandomState(1)
+    cell = np.diag([12.0, 12.5, 13.0])
+    pos = rng.uniform(0, 1, (6, 3)) @ cell
+    atoms = Atoms(symbols=['H', 'C', 'H', 'C', 'H', 'C'], positions=pos,
+                  cell=cell, pbc=True)
+    atoms.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                  dtype=torch.float64,
+                                  element_to_type={'H': 0, 'C': 1})
+    e_calc = atoms.get_potential_energy()
+    f_calc = atoms.get_forces()
+    e_ref, f_ref, _, _ = _direct_all_images(model, pos, cell,
+                                            [0, 1, 0, 1, 0, 1])
+    assert abs(e_ref - e_calc) < 1e-10, (e_ref, e_calc)
+    assert np.abs(f_ref - f_calc).max() < 1e-10
+    print("  large cell: MIC fast path == all-images reference")
+
+
 if __name__ == '__main__':
     print("ECENetCalculator behaviour")
+    test_pbc_small_cell_uses_all_images_topology()
+    test_pbc_large_cell_paths_agree()
     test_energy_units_kcal_vs_ev_scaling()
     test_energy_reference_added_per_atom()
     test_energy_mean_added_in_ev()

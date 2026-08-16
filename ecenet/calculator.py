@@ -60,7 +60,6 @@ class ECENetCalculator(Calculator):
                  energy_units='eV', energy_mean=0.0,
                  log_timings=False, **kwargs):
         super().__init__(**kwargs)
-        self._mic_warned = False
         self.model = model
         self.model.eval()
         # Ensure the analytic ACE basis is used (no SH in the backward graph).
@@ -356,31 +355,35 @@ class ECENetCalculator(Calculator):
     def _compute_pbc(self, atoms, pos, types, need_stress):
         """Energy / forces (+ optional stress) for a periodic system.
 
-        Builds the edge and neighbour lists under the minimum-image convention,
-        then evaluates the model (with strain-based stress if requested).
+        Builds the edge and neighbour lists, then evaluates the model (with
+        strain-based stress if requested). The list flavour is chosen per
+        cell: the fast minimum-image list when the cutoff sphere fits inside
+        half the cell's minimum perpendicular width (typical MD boxes), and
+        the all-images list — every periodic copy within the cutoff,
+        self-image edges included, exactly the topology the trainers build —
+        when it does not (small crystal cells: ~97% of MPtrj/WBM frames).
+        The two are identical wherever MIC is valid.
 
         Returns ``(energy_tensor, forces_tensor, stress_grad, n_edges, t_nl)``;
         ``stress_grad`` is None when stress was not requested and ``t_nl`` is the
         post-neighbour-list timestamp (None unless ``log_timings``).
         """
+        from ecenet.radial import min_perpendicular_width, torch_neighbor_list
+
         cell = atoms.get_cell().array  # (3, 3), rows = lattice vectors
 
-        # Minimum image convention: cutoff must be <= L/2 in each direction.
-        lengths = atoms.cell.lengths()
         max_cut = max(self.model.r_cut_edge, self.model.r_cut_neighbor)
-        if not self._mic_warned and any(max_cut > l / 2 for l in lengths):
-            import warnings
-            warnings.warn(
-                f"Cutoff ({max_cut:.2f} Å) exceeds half the box size "
-                f"({lengths.min():.2f} Å). Minimum image convention violated. "
-                f"Use a larger box (L > {2*max_cut:.1f} Å in all dimensions)."
-            )
-            self._mic_warned = True
-
-        edge_i, edge_j, shift_vecs_edge = self._gpu_neighbor_list(
-            pos.detach(), cell, self.model.r_cut_edge)
-        nb_src, nb_dst, shift_vecs_nb = self._gpu_neighbor_list(
-            pos.detach(), cell, self.model.r_cut_neighbor)
+        if max_cut > 0.5 * min_perpendicular_width(cell):
+            cell_t = torch.tensor(cell, dtype=self.dtype, device=self.device)
+            edge_i, edge_j, shift_vecs_edge = torch_neighbor_list(
+                pos.detach(), cell_t, self.model.r_cut_edge)
+            nb_src, nb_dst, shift_vecs_nb = torch_neighbor_list(
+                pos.detach(), cell_t, self.model.r_cut_neighbor)
+        else:
+            edge_i, edge_j, shift_vecs_edge = self._gpu_neighbor_list(
+                pos.detach(), cell, self.model.r_cut_edge)
+            nb_src, nb_dst, shift_vecs_nb = self._gpu_neighbor_list(
+                pos.detach(), cell, self.model.r_cut_neighbor)
 
         t_nl = self._t() if self.log_timings else None
 
