@@ -134,6 +134,16 @@ def test_wbm_eval():
             mu_ = json.load(f)
         assert mu_['n_scored'] == 5 and mu_['unique_prototypes_only'], mu_
 
+        # relax-side filter: only unique-prototype ids get relaxed at all
+        # (dup_id flagged False; 'wbm-1-bad' absent from the summary)
+        out_uq = os.path.join(tmp, 'wbm_uq.json.gz')
+        main(common[:5] + ['--out', out_uq] + common[7:]
+             + ['--summary', summary_path, '--unique_prototypes'])
+        with gzip.open(out_uq, 'rt') as f:
+            uq_shard = json.load(f)['results']
+        assert len(uq_shard) == 5 and dup_id not in uq_shard \
+            and 'wbm-1-bad' not in uq_shard, sorted(uq_shard)
+
         # 5. shift one stable prediction far above the hull → recall drops
         with gzip.open(out, 'rt') as f:
             blob = json.load(f)

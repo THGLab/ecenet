@@ -140,6 +140,18 @@ def run_relax(args):
 
     structures = load_wbm_structures(args.structures)
     ids = sorted(structures)
+    if args.unique_prototypes:
+        # Skip structures outside the leaderboard's deduplicated split up
+        # front (~16% of the set). NOTE: --slice indexes the FILTERED id
+        # list, so slice ranges are not interchangeable between runs with
+        # and without this flag.
+        if not args.summary:
+            raise SystemExit("--unique_prototypes needs --summary "
+                             "(the unique_prototype flag lives there)")
+        keep = load_wbm_summary(args.summary, unique_only=True)
+        ids = [m for m in ids if m in keep]
+        print(f"unique-prototype filter: {len(ids)} of {len(structures)} "
+              "structures kept", flush=True)
     if args.slice:
         a, b = args.slice.split(':')
         ids = ids[int(a or 0):int(b) if b else None]
@@ -158,7 +170,8 @@ def run_relax(args):
         with gzip.open(args.out, 'wt') as f:
             json.dump({'meta': {'checkpoint': os.path.abspath(args.checkpoint),
                                 'structures': os.path.abspath(args.structures),
-                                'fmax': args.fmax, 'max_steps': args.max_steps},
+                                'fmax': args.fmax, 'max_steps': args.max_steps,
+                                'unique_prototypes': bool(args.unique_prototypes)},
                        'results': results}, f)
 
     t0, done0 = time.time(), len(results)
@@ -377,6 +390,12 @@ def main(argv=None):
     pr.add_argument('--device', default=None)
     pr.add_argument('--tf32', action='store_true')
     pr.add_argument('--flush_every', type=int, default=500)
+    pr.add_argument('--summary', default=None,
+                    help='WBM summary csv[.gz]; only needed with '
+                         '--unique_prototypes')
+    pr.add_argument('--unique_prototypes', action='store_true',
+                    help="relax only the summary's unique_prototype subset "
+                         "(--slice then indexes the filtered id list)")
 
     ps = sub.add_parser('score', help='score relax shards against DFT')
     ps.add_argument('--pred', nargs='+', required=True,
