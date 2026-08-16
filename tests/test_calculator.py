@@ -485,10 +485,38 @@ def test_pbc_large_cell_paths_agree():
     print("  large cell: MIC fast path == all-images reference")
 
 
+def test_zero_edge_forces_and_stress_zero():
+    """Systems where every pair sits beyond the cutoff (e.g. a weak model
+    relaxing a WBM cell past dissociation — found in the wild by exactly
+    that): the energy is the per-atom offsets, positions never enter the
+    graph, and forces/stress must come back exactly zero rather than
+    autograd's 'tensor not used in graph' error."""
+    model = _tiny_model(2)
+    pos = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    # periodic, MIC branch (box ≫ 2·r_cut) — energy, forces, and stress
+    atoms = Atoms(symbols=['H', 'C'], positions=pos,
+                  cell=np.diag([20.0, 20.0, 20.0]), pbc=True)
+    atoms.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                  dtype=torch.float64,
+                                  element_to_type={'H': 0, 'C': 1})
+    assert np.isfinite(atoms.get_potential_energy())
+    assert np.all(atoms.get_forces() == 0.0)
+    assert np.all(atoms.get_stress() == 0.0)
+    # non-periodic path too
+    mol = Atoms(symbols=['H', 'C'], positions=pos)
+    mol.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                dtype=torch.float64,
+                                element_to_type={'H': 0, 'C': 1})
+    assert np.isfinite(mol.get_potential_energy())
+    assert np.all(mol.get_forces() == 0.0)
+    print("  zero-edge: finite energy, exact-zero forces/stress (PBC + free)")
+
+
 if __name__ == '__main__':
     print("ECENetCalculator behaviour")
     test_pbc_small_cell_uses_all_images_topology()
     test_pbc_large_cell_paths_agree()
+    test_zero_edge_forces_and_stress_zero()
     test_energy_units_kcal_vs_ev_scaling()
     test_energy_reference_added_per_atom()
     test_energy_mean_added_in_ev()

@@ -158,12 +158,18 @@ def run_relax(args):
     print(f"{len(ids)} structures in this slice "
           f"(of {len(structures)} loaded)", flush=True)
 
-    # Resume: keep prior results, skip their ids.
+    # Resume: keep prior successes/skips, but RETRY prior errors (they are
+    # usually environment or since-fixed-bug artifacts, not properties of
+    # the structure).
     results = {}
     if os.path.exists(args.out):
         with _open_auto(args.out) as f:
             results = json.load(f).get('results', {})
-        print(f"resuming: {len(results)} already done in {args.out}", flush=True)
+        n_prev_err = sum(1 for r in results.values() if 'error' in r)
+        results = {m: r for m, r in results.items() if 'error' not in r}
+        print(f"resuming: {len(results)} already done in {args.out}"
+              + (f" ({n_prev_err} prior errors will be retried)"
+                 if n_prev_err else ""), flush=True)
 
     def flush():
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
