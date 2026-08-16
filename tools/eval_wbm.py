@@ -27,8 +27,8 @@ that is the MP2020-corrected scale — compare against the summary's
 
 Data files (once, e.g. via the matbench-discovery package or its figshare
 links — https://matbench-discovery.materialsproject.org):
-  * WBM initial structures  (json/json.bz2/json.gz; plain ``{id: structure}``
-    or the pandas column form ``{"initial_structure": {id: structure}}``)
+  * WBM initial structures  (jsonl[.gz] — the current release format — or
+    json[.bz2|.gz] as a plain ``{id: structure}`` mapping / pandas column form)
   * WBM summary CSV         (DFT e_form + e_above_hull per id)
   * MP elemental reference energies (json; entry dicts or ``{symbol: eV/atom}``)
 
@@ -66,12 +66,39 @@ def _open_auto(path, mode='rt'):
     return open(path, mode)
 
 
+def _load_jsonl_structures(f):
+    """JSON Lines (the current matbench-discovery release format): one record
+    per line, e.g. {"material_id": ..., "initial_structure": {...}}."""
+    out = {}
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        mid = rec.get('material_id') or rec.get('id')
+        struct = next((v for k, v in rec.items()
+                       if isinstance(v, dict) and 'sites' in v), None)
+        if mid is None or struct is None:
+            raise ValueError(f"jsonl record without id/structure: {list(rec)}")
+        out[mid] = struct
+    return out
+
+
 def load_wbm_structures(path):
-    """Return {material_id: pymatgen-style structure dict}, either from a
-    plain mapping or from a pandas column-oriented dump (the single column
-    whose values hold 'lattice'/'sites' dicts is taken)."""
+    """Return {material_id: pymatgen-style structure dict}. Accepts JSON Lines
+    (one {"material_id": ..., "initial_structure": {...}} record per line —
+    the current matbench-discovery format), a plain ``{id: structure}``
+    mapping, or a pandas column-oriented dump (the single column whose values
+    hold 'lattice'/'sites' dicts is taken)."""
+    if '.jsonl' in path.lower():
+        with _open_auto(path) as f:
+            return _load_jsonl_structures(f)
     with _open_auto(path) as f:
-        obj = json.load(f)
+        try:
+            obj = json.load(f)
+        except json.JSONDecodeError:                  # jsonl in .json clothing
+            f.seek(0)
+            return _load_jsonl_structures(f)
     if not isinstance(obj, dict) or not obj:
         raise ValueError(f"{path}: expected a non-empty JSON mapping")
     probe = next(iter(obj.values()))
@@ -196,7 +223,10 @@ def load_elemental_refs(path):
         n = sum(comp.values()) if comp else entry.get('nsites', 1)
         if 'energy_per_atom' in entry:
             return float(entry['energy_per_atom'])
-        return float(entry['energy']) / n
+        # ComputedEntry serialization keeps the correction separate from the
+        # raw energy; pymatgen's entry.energy is their sum (zero for all
+        # current MP elemental refs, but honor it).
+        return (float(entry['energy']) + float(entry.get('correction', 0.0))) / n
     return {sym: per_atom(entry) for sym, entry in obj.items()}
 
 

@@ -66,6 +66,12 @@ def test_wbm_eval():
         with open(struct_path, 'w') as f:
             json.dump({'initial_structure': wbm}, f)            # column form
         assert set(load_wbm_structures(struct_path)) == set(wbm)
+        jsonl_path = os.path.join(tmp, 'wbm-initial-structures.jsonl')
+        with open(jsonl_path, 'w') as f:                        # current format
+            for mid, st in wbm.items():
+                f.write(json.dumps({'material_id': mid, 'formula_from_cse': 'X',
+                                    'initial_structure': st}) + '\n')
+        assert load_wbm_structures(jsonl_path) == load_wbm_structures(struct_path)
 
         # 3. relax — first a slice, then resume the rest into the same shard
         out = os.path.join(tmp, 'wbm_000.json.gz')
