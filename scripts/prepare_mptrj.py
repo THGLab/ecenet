@@ -165,6 +165,7 @@ def tensorize_frame(fr, mp_id, type_map, e_ref, args, dtype, compute_device):
 
     return {
         'pos':     torch.tensor(positions, dtype=dtype, device='cpu'),
+        'cell':    torch.tensor(cell, dtype=dtype, device='cpu'),  # LES Ewald needs it
         'types':   torch.tensor(types_np, dtype=torch.long, device='cpu'),
         'energy':  torch.tensor(float(energy) - ref, dtype=dtype, device='cpu'),
         'forces':  torch.tensor(forces, dtype=dtype, device='cpu'),

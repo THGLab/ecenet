@@ -23,10 +23,10 @@ unrestricted). ECENet's own license covers only the code in this repository.
 Integration status: the model exposes the per-atom embeddings —
 ``forward(..., return_embeddings=True[, l0_only=True])``, with the same flags
 on ``forward_pbc`` / ``forward_batch`` / ``forward_batch_multi`` (the batched
-paths return per-structure lists). Joint training is available for small
-datasets via ``scripts/train_ecenet_xyz.py`` and, under DDP, via
-``scripts/train_ecenet_spice.py`` (``use_les=True`` on either); the LES-aware
-calculator and joint training in the MPtrj trainer are not yet ported.
+paths return per-structure lists). All four trainers take ``use_les=True``
+(xyz and rMD17 single-process; SPICE and MPtrj under DDP — MPtrj on the
+periodic Ewald path, with cells stored in the prepared shards), and
+``ECENetLESCalculator`` serves joint checkpoints for MD/single-point use.
 
     lr = LESLongRange()
     E_sr, l0 = model(pos, types, return_embeddings=True, l0_only=True)

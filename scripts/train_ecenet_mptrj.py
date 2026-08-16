@@ -97,21 +97,51 @@ class _PBCMultiForwardWrapper(nn.Module):
     DDP intercepts this module's forward so the subsequent loss.backward syncs
     gradients. Inputs are already strain-transformed by the caller (so stress
     can be obtained by differentiating the returned energies w.r.t. the strain
-    leaves); this module only evaluates energies.
+    leaves — including the CELLS, which the LES Ewald term depends on
+    explicitly); this module only evaluates energies.
+
+    With a LES module attached, also computes the long-range energy from the
+    per-structure ``l0`` embeddings and returns ``E_sr + E_lr``. Registering
+    the LES module HERE (not just in the optimizer) puts its parameters
+    inside DDP's bucket reduction, and the head runs on every step, so
+    ``find_unused_parameters=False`` stays valid (same pattern as the SPICE
+    trainer). The LES call is batched: one call over the concatenated atoms
+    with a structure-index vector and the stacked ``(B, 3, 3)`` cells →
+    upstream's reciprocal-space Ewald path, per structure.
     """
-    def __init__(self, model):
+    def __init__(self, model, les_module=None):
         super().__init__()
         self.model = model
+        self.les = les_module
+        # l0 convention (l0_is_charge / les_dipole) read off the model.
+        self.les_flags = model.les_flags
 
     def forward(self, pos_list, types_list, edge_i_list, edge_j_list,
-                shift_e_list, nb_src_list, nb_dst_list, shift_nb_list):
-        energies = []
+                shift_e_list, nb_src_list, nb_dst_list, shift_nb_list,
+                cell_list=None):
+        energies, l0_list = [], []
         for k in range(len(pos_list)):
-            energies.append(self.model.forward_pbc(
-                pos_list[k], types_list[k],
-                edge_i_list[k], edge_j_list[k], shift_e_list[k],
-                nb_src_list[k], nb_dst_list[k], shift_nb_list[k]))
-        return torch.stack(energies)
+            args = (pos_list[k], types_list[k],
+                    edge_i_list[k], edge_j_list[k], shift_e_list[k],
+                    nb_src_list[k], nb_dst_list[k], shift_nb_list[k])
+            if self.les is None:
+                energies.append(self.model.forward_pbc(*args))
+            else:
+                e, l0 = self.model.forward_pbc(*args, return_embeddings=True,
+                                               l0_only=True)
+                energies.append(e)
+                l0_list.append(l0)
+        energies = torch.stack(energies)
+        if self.les is None:
+            return energies
+        l0 = torch.cat(l0_list, dim=0)
+        pos = torch.cat(pos_list, dim=0)
+        batch = torch.cat([
+            torch.full((p.shape[0],), b, dtype=torch.long, device=p.device)
+            for b, p in enumerate(pos_list)])
+        cells = torch.stack(cell_list)          # (B, 3, 3); guarded in predict()
+        return energies + self.les(l0, pos, cell=cells, batch=batch,
+                                   **self.les_flags)
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +619,9 @@ def to_device_tensors(structures, type_map, e_ref, r_cut_edge, r_cut_nb,
             ni, nj, shift_nb = ni.to(sdev), nj.to(sdev), shift_nb.to(sdev)
 
         cell = s['cell']
-        volume = abs(np.linalg.det(cell)) if (s['pbc'] and cell is not None) else 0.0
+        periodic = s['pbc'] and cell is not None
+        volume = abs(np.linalg.det(cell)) if periodic else 0.0
+        cell_t = torch.tensor(cell, dtype=dtype, device=sdev) if periodic else None
 
         stress_t = None
         if s['stress'] is not None and volume > 0:
@@ -598,6 +630,7 @@ def to_device_tensors(structures, type_map, e_ref, r_cut_edge, r_cut_nb,
 
         out.append({
             'pos':     torch.tensor(s['positions'], dtype=dtype, device=sdev),
+            'cell':    cell_t,   # (3,3) or None; LES Ewald needs it explicitly
             'types':   torch.tensor(types_np, dtype=torch.long, device=sdev),
             'energy':  torch.tensor(s['energy'] - ref, dtype=dtype, device=sdev),
             'forces':  torch.tensor(s['forces'], dtype=dtype, device=sdev),
@@ -616,7 +649,7 @@ def to_device_tensors(structures, type_map, e_ref, r_cut_edge, r_cut_nb,
 
 # Tensor fields we ship to the compute device each batch. Volume/n_atoms are
 # Python scalars and stay as-is.
-_BATCH_TENSOR_KEYS = ('pos', 'types', 'energy', 'forces', 'stress',
+_BATCH_TENSOR_KEYS = ('pos', 'types', 'energy', 'forces', 'stress', 'cell',
                       'edge_i', 'edge_j', 'shift_e',
                       'nb_src', 'nb_dst', 'shift_nb')
 
@@ -708,6 +741,13 @@ def train_ecenet_mptrj(
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
+    # Joint LES long-range training: E = E_sr + E_lr on one autograd graph.
+    # Periodic structures use upstream's reciprocal-space Ewald, so every
+    # frame needs its cell tensor — prepared shards written before cells were
+    # stored must be re-prepared. Stress covers E_lr too (the strain pass
+    # transforms the cell alongside positions and shifts).
+    use_les=False,
+    les_arguments=None,      # extra kwargs for upstream les.Les (see ecenet/les.py)
     # Optimiser
     lr=1e-3,
     weight_decay=1e-5,
@@ -753,6 +793,14 @@ def train_ecenet_mptrj(
         raise ValueError(
             "max_atoms_per_batch is only supported with prepared_dir (per-shard "
             "size-aware batching); the in-memory path still batches by batch_size")
+
+    # Under DDP every parameter must receive a gradient every step
+    # (find_unused_parameters=False); a non-'sum' les_readout without use_les
+    # would leave its read-out parameters unused and hang the reduction.
+    if is_ddp and les_readout != 'sum' and not use_les:
+        raise ValueError(f"les_readout={les_readout!r} without use_les=True "
+                         "is not supported under DDP: its read-out parameters "
+                         "would never receive gradients.")
 
     if device is None:
         device = torch.device(f'cuda:{local_rank}') if torch.cuda.is_available() else torch.device('cpu')
@@ -976,30 +1024,48 @@ def train_ecenet_mptrj(
     model = model.to(device)
     raw_model = model
 
+    # ── LES long-range module (optional) ──────────────────────────────────
+    # Upstream builds its charge MLP lazily on the first forward, so it is
+    # materialised BEFORE the DDP wrap / optimiser / checkpoint restore via
+    # the shared load_les_module dance (synthetic probe, no data needed).
+    les_module = None
+    if use_les:
+        from ecenet.les import load_les_module
+        les_module = load_les_module({'arguments': les_arguments}, model,
+                                     device, dtype, load_state=False)
+        les_module.train()
+
+    all_params = list(model.parameters())
+    if les_module is not None:
+        all_params += list(les_module.parameters())
+
     if is_ddp:
-        train_model = DDP(_PBCMultiForwardWrapper(model), device_ids=[local_rank],
+        train_model = DDP(_PBCMultiForwardWrapper(model, les_module),
+                          device_ids=[local_rank],
                           find_unused_parameters=False)
         # create_graph=True force/stress training yields non-contiguous grads →
         # DDP bucket-view stride mismatch. Make them contiguous (as in SPICE).
-        for p in model.parameters():
+        for p in all_params:
             if p.requires_grad:
                 p.register_hook(lambda g: g.contiguous())
     else:
-        train_model = _PBCMultiForwardWrapper(model)
+        train_model = _PBCMultiForwardWrapper(model, les_module)
 
     # Plain (non-DDP) wrapper for evaluation — rank 0 calls it alone, so it must
     # not be the DDP module (whose forward expects all ranks to participate).
-    eval_fwd = _PBCMultiForwardWrapper(raw_model)
+    eval_fwd = _PBCMultiForwardWrapper(raw_model, les_module)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_params = sum(p.numel() for p in all_params if p.requires_grad)
     if verbose:
         mname = "ECENet"
         print_flush(f"\n{mname}: {n_layers} layers, l_max={l_max}, n_max={n_max}, "
-                    f"embed_dim={embed_dim}, n_types={n_types}")
-        print_flush(f"  Trainable parameters: {n_params:,}")
+                    f"embed_dim={embed_dim}, n_types={n_types}"
+                    + (" | LES=on" if use_les else ""))
+        print_flush(f"  Trainable parameters: {n_params:,}"
+                    + (" (incl. LES charge head)" if use_les else ""))
 
     # ── Optimiser ─────────────────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(all_params, lr=lr, weight_decay=weight_decay)
     # LR schedule. 'plateau' (default): ReduceLROnPlateau on the val metric.
     # 'cosine': linear warmup over warmup_epochs, then cosine decay to
     # lr*lr_min_factor. 'multistep': the same warmup, then lr *= lr_gamma at each
@@ -1056,9 +1122,17 @@ def train_ecenet_mptrj(
     best_val_weighted = float('inf')
     best_test = (float('nan'), float('nan'), float('nan'))
     best_state = None
+    best_les_state = None
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt['model'], strict=False)
+        if use_les != ('les' in ckpt):
+            raise ValueError(
+                f"Checkpoint at {checkpoint_path} was trained with "
+                f"use_les={'les' in ckpt}, but this run has use_les={use_les}.")
+        if les_module is not None:
+            les_module.load_state_dict(ckpt['les']['state_dict'])
+            best_les_state = ckpt['les'].get('best_state')
         optimizer.load_state_dict(ckpt['optimizer'])
         # Open-loop schedules have no state (the LR is a function of the
         # epoch), and saved state may come from a different schedule.
@@ -1077,7 +1151,13 @@ def train_ecenet_mptrj(
     def save_checkpoint(epoch):
         if checkpoint_path is None or not is_main:
             return
+        out_les = (None if les_module is None else {
+            'arguments': les_arguments,
+            'state_dict': les_module.state_dict(),
+            'best_state': best_les_state,
+        })
         torch.save({
+            **({'les': out_les} if out_les is not None else {}),
             'epoch': epoch,
             'model': raw_model.state_dict(),
             'optimizer': optimizer.state_dict(),
@@ -1132,9 +1212,16 @@ def train_ecenet_mptrj(
         (training); set False for evaluation.
         """
         pos_leaf, strain_leaf = [], []
-        pos_in, shift_e_in, shift_nb_in = [], [], []
+        pos_in, shift_e_in, shift_nb_in, cell_in = [], [], [], []
         types_b, ei_b, ej_b, ni_b, nj_b = [], [], [], [], []
         for d in batch:
+            cell = d.get('cell')
+            if use_les and cell is None:
+                raise ValueError(
+                    "use_les=True needs every structure's cell tensor (the "
+                    "Ewald term depends on it explicitly), but this frame has "
+                    "none. Prepared shards written before cells were stored "
+                    "must be re-prepared (prepare_mptrj.py now includes them).")
             p = d['pos'].detach().clone().requires_grad_(True)
             pos_leaf.append(p)
             if use_stress:
@@ -1144,16 +1231,18 @@ def train_ecenet_mptrj(
                 pos_in.append(p + p @ eps)
                 shift_e_in.append(d['shift_e'] + d['shift_e'] @ eps)
                 shift_nb_in.append(d['shift_nb'] + d['shift_nb'] @ eps)
+                cell_in.append(cell + cell @ eps if cell is not None else None)
             else:
                 pos_in.append(p)
                 shift_e_in.append(d['shift_e'])
                 shift_nb_in.append(d['shift_nb'])
+                cell_in.append(cell)
             types_b.append(d['types'])
             ei_b.append(d['edge_i']); ej_b.append(d['edge_j'])
             ni_b.append(d['nb_src']); nj_b.append(d['nb_dst'])
 
         energies = fwd(pos_in, types_b, ei_b, ej_b, shift_e_in,
-                       ni_b, nj_b, shift_nb_in)
+                       ni_b, nj_b, shift_nb_in, cell_in)
 
         forces_list = stress_list = None
         if force_weight > 0 or use_stress:
@@ -1181,6 +1270,11 @@ def train_ecenet_mptrj(
                 ]
         return energies, forces_list, stress_list
 
+    def _train_mode(train):
+        raw_model.train(train)
+        if les_module is not None:
+            les_module.train(train)
+
     # ── Evaluation (rank 0) ───────────────────────────────────────────────
     def _eval_batches(data):
         """Yield (already-on-device) eval batches.
@@ -1202,7 +1296,7 @@ def train_ecenet_mptrj(
                 yield batch
 
     def evaluate(data, max_samples=None):
-        raw_model.eval()
+        _train_mode(False)
         # For list-of-dicts we can subsample randomly (cheap random access).
         # For streaming we just truncate to the first max_samples frames.
         if not isinstance(data, MPtrjShardDataset) and max_samples is not None \
@@ -1228,7 +1322,7 @@ def train_ecenet_mptrj(
                     s_abs += (stress_list[k] - d['stress']).abs().sum().item()
                     s_count += d['stress'].numel()
             n += len(batch)
-        raw_model.train()
+        _train_mode(True)
         f_mae = f_abs / f_count if f_count else float('nan')
         s_mae = s_abs / s_count if s_count else float('nan')
         return (e_abs / n if n else float('nan')), f_mae, s_mae
@@ -1251,7 +1345,7 @@ def train_ecenet_mptrj(
         if scheduler is None:
             for pg in optimizer.param_groups:
                 pg['lr'] = open_loop_lr(epoch)
-        raw_model.train()
+        _train_mode(True)
         epoch_loss = 0.0
 
         rank_epoch_size = (epoch_size + world_size - 1) // world_size
@@ -1367,6 +1461,9 @@ def train_ecenet_mptrj(
                 if va_weighted < best_val_weighted:
                     best_val_weighted = va_weighted
                     best_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
+                    if les_module is not None:
+                        best_les_state = {k: v.clone()
+                                          for k, v in les_module.state_dict().items()}
                     epochs_without_improvement = 0
                     best_test = evaluate(test_data) if test_data else best_test
                 else:
@@ -1402,6 +1499,8 @@ def train_ecenet_mptrj(
     if is_main:
         if best_state is not None:
             raw_model.load_state_dict(best_state, strict=False)
+            if les_module is not None and best_les_state is not None:
+                les_module.load_state_dict(best_les_state)
         tr = evaluate(train_data, max_samples=500)
         va = evaluate(val_data, max_samples=n_val)
         te = evaluate(test_data) if test_data else (float('nan'),)*3
@@ -1415,6 +1514,7 @@ def train_ecenet_mptrj(
             'val_energy_mae': va[0], 'val_force_mae': va[1], 'val_stress_mae': va[2],
             'test_energy_mae': te[0], 'test_force_mae': te[1], 'test_stress_mae': te[2],
             'n_params': n_params, 'n_types': n_types, 'type_map': type_map,
+            'les_module': les_module,   # None unless use_les
         }
 
     if is_ddp:

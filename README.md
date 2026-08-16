@@ -216,12 +216,11 @@ E = E_sr + lr(l0, pos).sum()      # one autograd graph → forces via autograd
 The batched paths (`forward_batch`, `forward_batch_multi`) return `l0` as a
 per-structure list.
 
-**Joint training** is available for small datasets:
-`scripts/train_ecenet_xyz.py` is a single-process, in-memory trainer for any
-ASE-readable file (extxyz etc.) that minimises `E = E_sr + E_lr` on one
-autograd graph when `use_les=True` — forces come from the same graph, and
-stress strain-transforms the cell alongside positions and shifts so the
-Ewald part is covered too:
+**Joint training** (`use_les=True`) is available on all four trainers —
+`E = E_sr + E_lr` minimised on one autograd graph, forces from the same
+graph. `scripts/train_ecenet_xyz.py` is the single-process, in-memory
+reference for any ASE-readable file (extxyz etc.); stress strain-transforms
+the cell alongside positions and shifts so the Ewald part is covered too:
 
 ```python
 from scripts.train_ecenet_xyz import train_ecenet_xyz
@@ -307,7 +306,18 @@ print(atoms.get_potential_energy())   # E_sr + E_lr, eV
 ```
 
 It refuses short-range checkpoints (symmetric with `ECENetCalculator`
-refusing LES ones). Joint training in the MPtrj trainer is not yet ported.
+refusing LES ones).
+
+The other two trainers take `use_les=True` as well. `train_ecenet_mptrj`
+runs the **periodic** path: one batched LES call per step over the
+concatenated atoms with the stacked cells (reciprocal-space Ewald per
+structure), the LES head inside the DDP-wrapped forward module (as in the
+SPICE trainer), and the stress strain pass covering the cell. Every frame
+needs its cell tensor, which `prepare_mptrj.py` now stores — prepared dirs
+written before that must be re-prepared for LES runs (a clear error says so).
+`train_ecenet` (rMD17/MD22) uses the isolated pairwise path; note those
+datasets are in kcal/mol while the LES Coulomb constant is eV·Å-based, so
+the latent charges absorb the unit scale.
 
 > **IP / licensing.** The `les` package is CC BY-NC 4.0 (**non-commercial**);
 > it is an optional dependency and none of its code is included in this
@@ -490,6 +500,7 @@ python tests/test_realspace_kernel.py        # fused nonlinearity: backward equi
 python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
 python tests/test_mptrj_shard_batching.py    # shard atom-budget batching: DDP count alignment, sidecar
 python tests/test_xyz_trainer.py             # small-dataset trainer: smoke, LES resume, force-FD through E_lr
+python tests/test_trainer_les.py             # use_les in the rMD17 + MPtrj trainers; stress-FD through the Ewald cell strain
 ```
 
 ## License
