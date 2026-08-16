@@ -118,9 +118,17 @@ def load_wbm_structures(path):
 # ---------------------------------------------------------------------------
 
 def run_relax(args):
+    import warnings
+
     import torch  # noqa: F401  (keeps the heavy import out of `score`)
     from ase import Atoms
     from ase.optimize import FIRE
+
+    # FrechetCellFilter parameterizes the cell via scipy's matrix logarithm,
+    # which reports its internal error estimate (~1e-13 — float64 roundoff)
+    # as a RuntimeWarning on every step. Benign, and 215k structures of it
+    # would flood the logs.
+    warnings.filterwarnings('ignore', message='logm result may be inaccurate')
     from train_ecenet_mptrj import _structure_dict_to_arrays
 
     from ecenet import elements
