@@ -246,6 +246,7 @@ def test_wbm_eval():
             spm = json.load(f)
         assert spm['n_scored'] == 6 and spm['energy_mae'] < 1e-10, spm
         assert np.isfinite(spm['force_rms']) and spm['force_rms'] > 0
+        assert 0 < spm['force_mae'] <= spm['force_rms'] + 1e-15
         # aggregate-only mode reproduces the same numbers from the shard
         main(['singlepoint', '--pred', sp_out2, '--summary', sp_sum,
               '--out', sp_metrics])

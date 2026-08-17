@@ -479,6 +479,10 @@ def _sp_aggregate(results):
     # these relaxed geometries, so this IS the force error)
     ncomp = np.array([3 * r['n_atoms'] for r in ok])
     f_ms = np.array([r['f_rms'] ** 2 for r in ok])
+    # f_mae was added after the first shards; older ones aggregate to NaN.
+    f_maes = [r.get('f_mae') for r in ok]
+    f_mae = (float((np.array(f_maes) * ncomp).sum() / ncomp.sum())
+             if all(v is not None for v in f_maes) else float('nan'))
     metrics = {
         'n_scored': len(ok),
         'n_errors': sum(1 for r in results.values() if 'error' in r),
@@ -486,6 +490,7 @@ def _sp_aggregate(results):
         'energy_mae': float(np.abs(de).mean()),          # eV/atom
         'energy_rmse': float(np.sqrt((de ** 2).mean())),
         'energy_me': float(de.mean()),                   # signed bias
+        'force_mae': f_mae,
         'force_rms': float(np.sqrt((f_ms * ncomp).sum() / ncomp.sum())),
         'force_max_mean': float(np.mean([r['f_max'] for r in ok])),
         'force_max_p95': float(np.percentile([r['f_max'] for r in ok], 95)),
@@ -495,7 +500,8 @@ def _sp_aggregate(results):
     print(f"  energy  MAE {metrics['energy_mae']*1e3:7.1f} meV/atom | "
           f"RMSE {metrics['energy_rmse']*1e3:7.1f} | "
           f"bias {metrics['energy_me']*1e3:+7.1f}")
-    print(f"  forces  RMS {metrics['force_rms']*1e3:7.1f} meV/Å "
+    print(f"  forces  MAE {metrics['force_mae']*1e3:7.1f} meV/Å | "
+          f"RMS {metrics['force_rms']*1e3:7.1f} "
           f"(DFT ref ≈ 0 at relaxed geometry) | "
           f"per-structure max: mean {metrics['force_max_mean']:.3f}, "
           f"p95 {metrics['force_max_p95']:.3f} eV/Å")
@@ -594,6 +600,7 @@ def run_singlepoint(args):
                 'e_pred': float(atoms.get_potential_energy()),
                 'e_dft': float(e_dft[mid]),
                 'n_atoms': len(atoms),
+                'f_mae': float(np.abs(fr).mean()),
                 'f_rms': float(np.sqrt((fr ** 2).mean())),
                 'f_max': float(np.abs(fr).max()),
             }
