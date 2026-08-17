@@ -532,6 +532,16 @@ def run_singlepoint(args):
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
 
+    if 'init' in os.path.basename(args.structures).lower():
+        # The summary's DFT energies belong to the RELAXED geometries; a
+        # single-point on the initial guesses would compare energies of two
+        # different structures. Heuristic (filename) but worth failing loud.
+        raise SystemExit(
+            f"--structures {args.structures} looks like the INITIAL "
+            "structures. singlepoint needs the DFT-relaxed geometries "
+            "(wbm-computed-structure-entries.jsonl.gz) — the summary's DFT "
+            "energies belong to those.")
+
     calc = load_calculator(args.checkpoint, device=args.device)
     known = set(calc.element_to_type)
 
