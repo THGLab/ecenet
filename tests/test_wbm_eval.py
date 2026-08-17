@@ -205,8 +205,23 @@ def test_wbm_eval():
                     'e_correction_per_atom_mp2020\n')
             for mid, s in zip(wbm, structs + [bad]):
                 f.write(f"{mid},{s['n_atoms']},0.0,0.0\n")
+        # the guard refuses initial-structures input (the summary's DFT
+        # energies belong to relaxed geometries)...
+        try:
+            main(['singlepoint', '--checkpoint', ckpt,
+                  '--structures', struct_path, '--summary', sp_sum,
+                  '--out', os.path.join(tmp, 'x.json.gz'), '--device', 'cpu'])
+            raise AssertionError('initial-structures input not refused')
+        except SystemExit as e:
+            assert 'INITIAL' in str(e)
+        # ...so the synthetic fixture gets a relaxed-style name here (in this
+        # test the summary is built from these structures, so the pairing is
+        # correct by construction)
+        relaxed_path = os.path.join(tmp, 'wbm-cse-structs.json')
+        os.link(struct_path, relaxed_path)
         sp_out = os.path.join(tmp, 'sp.json.gz')
-        main(['singlepoint', '--checkpoint', ckpt, '--structures', struct_path,
+        main(['singlepoint', '--checkpoint', ckpt,
+              '--structures', relaxed_path,
               '--summary', sp_sum, '--out', sp_out, '--device', 'cpu'])
         with gzip.open(sp_out, 'rt') as f:
             sp = json.load(f)['results']
@@ -223,7 +238,8 @@ def test_wbm_eval():
                         f"{v['e_pred'] - 0.05 * v['n_atoms']!r},0.05\n")
         sp_out2 = os.path.join(tmp, 'sp2.json.gz')
         sp_metrics = os.path.join(tmp, 'sp_metrics.json')
-        main(['singlepoint', '--checkpoint', ckpt, '--structures', struct_path,
+        main(['singlepoint', '--checkpoint', ckpt,
+              '--structures', relaxed_path,
               '--summary', sp_sum, '--out', sp_out2, '--device', 'cpu',
               '--out_metrics', sp_metrics])
         with open(sp_metrics) as f:
