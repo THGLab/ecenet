@@ -44,8 +44,9 @@ tools/                 developer utilities (run from the repo root)
   eval_spice_bec.py      zero-shot Born effective charges (dP/dr via autograd,
                          charge-flow terms included) vs the same slices' references
   eval_wbm.py            WBM / Matbench-Discovery evaluation: `relax` (job-array
-                         MLIP relaxations of WBM initial structures, resumable)
-                         and `score` (e_form + hull metrics: F1, DAF, MAE)
+                         MLIP relaxations of WBM initial structures, resumable),
+                         `score` (e_form + hull metrics: F1, DAF, MAE), and
+                         `rmsd` (geometry vs DFT-relaxed; needs pymatgen)
 ```
 
 ## Install

@@ -156,6 +156,47 @@ def test_wbm_eval():
         with open(metrics_path) as f:
             assert json.load(f)['n_scored'] == 5
 
+        # rmsd stage (needs pymatgen; skip cleanly without it)
+        try:
+            import pymatgen  # noqa: F401
+        except ImportError:
+            print('  (pymatgen missing — rmsd stage not tested)')
+            return
+        # reference = the saved geometries themselves, wrapped in the nested
+        # ComputedStructureEntry jsonl format → every RMSD must be exactly 0
+        def to_ref(st):
+            return {'lattice': {'matrix': st['cell']},
+                    'sites': [{'species': [{'element': s}], 'xyz': p}
+                              for s, p in zip(st['symbols'], st['positions'])]}
+        ref_structs = os.path.join(tmp, 'wbm-cse.jsonl')
+        with open(ref_structs, 'w') as f:
+            for mid, v in uq_shard.items():
+                f.write(json.dumps({
+                    'material_id': mid,
+                    'computed_structure_entry':
+                        {'structure': to_ref(v['structure'])}}) + '\n')
+        rmsd_out = os.path.join(tmp, 'rmsd.json')
+        main(['rmsd', '--pred', out_uq, '--ref', ref_structs,
+              '--out', rmsd_out])
+        with open(rmsd_out) as f:
+            rm = json.load(f)
+        assert rm['n_scored'] == 5 and rm['n_matched'] == 5, rm
+        assert rm['rmsd'] < 1e-10, rm['rmsd']
+        # perturb one reference → its RMSD becomes nonzero and lifts the mean
+        with open(ref_structs) as f:
+            lines = [json.loads(ln) for ln in f]
+        st = lines[0]['computed_structure_entry']['structure']
+        st['sites'][0]['xyz'] = [x + 0.15 for x in st['sites'][0]['xyz']]
+        with open(ref_structs, 'w') as f:
+            for rec in lines:
+                f.write(json.dumps(rec) + '\n')
+        main(['rmsd', '--pred', out_uq, '--ref', ref_structs,
+              '--out', rmsd_out])
+        with open(rmsd_out) as f:
+            rm2 = json.load(f)
+        assert 1e-4 < rm2['rmsd'] < 0.5, rm2['rmsd']
+        assert rm2['rmsd_matched_median'] < rm2['rmsd_matched_mean'], rm2
+
         # 5. shift one stable prediction far above the hull → recall drops
         with gzip.open(out, 'rt') as f:
             blob = json.load(f)

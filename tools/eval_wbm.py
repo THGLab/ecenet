@@ -10,6 +10,13 @@ Sliceable for a job array (``--slice``), resumable (already-done ids in an
 existing ``--out`` are skipped), and structures containing elements outside
 the checkpoint's type map are counted and skipped, not crashed on.
 
+``rmsd`` — geometry quality (needs pymatgen, plus shards written with
+``--save_structures``): Matbench-Discovery's exact recipe —
+``StructureMatcher(stol=1.0, scale=False).get_rms_dist(pred, dft)[0]``
+against the DFT-relaxed structures, unitless ((volume/atom)^(1/3)-
+normalized), unmatched structures filled with 1.0 and a plain mean —
+alongside matched-only mean/median for diagnostics.
+
 ``score`` — pure post-processing (numpy + stdlib csv, no torch). Merges relax
 shards, computes each structure's predicted formation energy per atom from
 MP elemental reference energies, shifts the DFT hull distance by the
@@ -66,39 +73,65 @@ def _open_auto(path, mode='rt'):
     return open(path, mode)
 
 
-def _load_jsonl_structures(f):
+def _find_structure(obj, depth=3):
+    """Depth-limited search for a pymatgen-style structure dict ('lattice' +
+    'sites') — handles both bare structures and ComputedStructureEntry
+    records, where it sits one level down under 'structure'."""
+    if isinstance(obj, dict):
+        if 'sites' in obj and 'lattice' in obj:
+            return obj
+        if depth:
+            for v in obj.values():
+                got = _find_structure(v, depth - 1)
+                if got is not None:
+                    return got
+    return None
+
+
+def _load_jsonl_structures(f, wanted=None):
     """JSON Lines (the current matbench-discovery release format): one record
-    per line, e.g. {"material_id": ..., "initial_structure": {...}}."""
+    per line, e.g. {"material_id": ..., "initial_structure": {...}} or a
+    ComputedStructureEntry record with the structure nested inside.
+
+    wanted: optional id set — other lines are skipped on a cheap regex id
+    probe instead of paying the full json parse (the records are large; this
+    turns a minutes-long scan into seconds when few ids are needed)."""
+    import re
+    id_probe = re.compile(r'"(?:material_)?id"\s*:\s*"([^"]+)"')
     out = {}
     for line in f:
         line = line.strip()
         if not line:
             continue
+        if wanted is not None:
+            m = id_probe.search(line[:200])
+            if m and m.group(1) not in wanted:
+                continue
         rec = json.loads(line)
         mid = rec.get('material_id') or rec.get('id')
-        struct = next((v for k, v in rec.items()
-                       if isinstance(v, dict) and 'sites' in v), None)
+        struct = _find_structure(rec)
         if mid is None or struct is None:
             raise ValueError(f"jsonl record without id/structure: {list(rec)}")
         out[mid] = struct
     return out
 
 
-def load_wbm_structures(path):
+def load_wbm_structures(path, wanted=None):
     """Return {material_id: pymatgen-style structure dict}. Accepts JSON Lines
     (one {"material_id": ..., "initial_structure": {...}} record per line —
     the current matbench-discovery format), a plain ``{id: structure}``
     mapping, or a pandas column-oriented dump (the single column whose values
-    hold 'lattice'/'sites' dicts is taken)."""
+    hold 'lattice'/'sites' dicts is taken). ``wanted`` (an id set) speeds up
+    the jsonl path by skipping other records."""
     if '.jsonl' in path.lower():
         with _open_auto(path) as f:
-            return _load_jsonl_structures(f)
+            return _load_jsonl_structures(f, wanted)
     with _open_auto(path) as f:
         try:
             obj = json.load(f)
         except json.JSONDecodeError:                  # jsonl in .json clothing
             f.seek(0)
-            return _load_jsonl_structures(f)
+            return _load_jsonl_structures(f, wanted)
     if not isinstance(obj, dict) or not obj:
         raise ValueError(f"{path}: expected a non-empty JSON mapping")
     probe = next(iter(obj.values()))
@@ -396,6 +429,152 @@ def run_score(args):
 
 
 # ---------------------------------------------------------------------------
+# rmsd
+# ---------------------------------------------------------------------------
+
+def _as_pmg_structure(struct_dict, Structure):
+    """pymatgen Structure from a structure dict, via our own site parsing
+    (pymatgen's from_dict is pickier about site keys than the data warrants)."""
+    lat = struct_dict['lattice']['matrix']
+    syms, coords, cart = [], [], True
+    for site in struct_dict['sites']:
+        syms.append(site['species'][0]['element'])
+        if 'xyz' in site:
+            coords.append(site['xyz'])
+        else:
+            coords.append(site['abc'])
+            cart = False
+    return Structure(lat, syms, coords, coords_are_cartesian=cart)
+
+
+_RMSD_MATCHER = None    # one StructureMatcher per worker process
+
+
+def _alarm_handler(signum, frame):
+    raise TimeoutError
+
+
+def _rmsd_worker(item):
+    """(material_id, pred_struct, ref_struct_dict, timeout) →
+    (material_id, rmsd|None).
+
+    Matbench-Discovery's exact recipe: StructureMatcher(stol=1.0,
+    scale=False).get_rms_dist(pred, ref)[0] — pymatgen normalizes the rms by
+    (volume/atom)^(1/3), so the value is unitless. None = no match found.
+
+    Two guards against pathological relaxations (a collapsed cell — e.g.
+    0.01 Å³ from a bad model — makes the matcher enumerate an astronomically
+    dense lattice-vector set and hang for hours):
+      * volume-ratio precheck: with scale=False and the default ltol=0.2, a
+        lattice match is impossible beyond ~1.7× volume, so >2× or <0.5×
+        returns unmatched immediately;
+      * a per-match SIGALRM timeout as a backstop (POSIX only; skipped where
+        unavailable).
+    """
+    global _RMSD_MATCHER
+    import signal
+
+    from pymatgen.analysis.structure_matcher import StructureMatcher
+    from pymatgen.core import Structure
+    if _RMSD_MATCHER is None:
+        _RMSD_MATCHER = StructureMatcher(stol=1.0, scale=False)
+    mid, pred, ref, timeout = item
+    try:
+        p = Structure(pred['cell'], pred['symbols'], pred['positions'],
+                      coords_are_cartesian=True)
+        r = _as_pmg_structure(ref, Structure)
+        if not 0.5 <= p.volume / r.volume <= 2.0:
+            return mid, None
+        use_alarm = hasattr(signal, 'SIGALRM') and timeout
+        if use_alarm:
+            old = signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.alarm(int(timeout))
+        try:
+            out = _RMSD_MATCHER.get_rms_dist(p, r)
+        finally:
+            if use_alarm:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+        return mid, (None if out is None else float(out[0]))
+    except Exception:
+        return mid, None                     # counted with the unmatched
+
+
+def run_rmsd(args):
+    try:
+        import pymatgen  # noqa: F401
+    except ImportError:
+        raise SystemExit("the rmsd stage needs pymatgen: pip install pymatgen")
+
+    preds = {}
+    for path in sorted(sum((glob.glob(p) for p in args.pred), [])):
+        with _open_auto(path) as f:
+            preds.update(json.load(f)['results'])
+    with_struct = {m: r['structure'] for m, r in preds.items()
+                   if 'structure' in r}
+    n_missing = sum(1 for r in preds.values()
+                    if 'energy' in r and 'structure' not in r)
+    if not with_struct:
+        raise SystemExit("no saved geometries in the shards — relax with "
+                         "--save_structures")
+    if args.unique_prototypes:
+        keep = load_wbm_summary(args.summary, unique_only=True)
+        with_struct = {m: s for m, s in with_struct.items() if m in keep}
+
+    print(f"loading DFT-relaxed references from {args.ref}...", flush=True)
+    refs = load_wbm_structures(args.ref, wanted=set(with_struct))
+    items = [(m, s, refs[m], args.match_timeout)
+             for m, s in with_struct.items() if m in refs]
+    n_no_ref = len(with_struct) - len(items)
+
+    t0 = time.time()
+    if args.nproc > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=args.nproc) as ex:
+            pairs = list(ex.map(_rmsd_worker, items, chunksize=16))
+    else:
+        pairs = []
+        for k, item in enumerate(items):
+            pairs.append(_rmsd_worker(item))
+            if (k + 1) % 500 == 0:
+                rate = (k + 1) / (time.time() - t0)
+                print(f"  {k + 1}/{len(items)} ({rate:.1f}/s)", flush=True)
+
+    rmsds = dict(pairs)
+    matched = np.array([v for v in rmsds.values() if v is not None])
+    n_unmatched = sum(1 for v in rmsds.values() if v is None)
+    # Leaderboard aggregation: unmatched filled with 1.0 (the stol), plain mean.
+    filled = np.array([1.0 if v is None else v for v in rmsds.values()])
+    metrics = {
+        'rmsd': float(filled.mean()) if len(filled) else float('nan'),
+        'rmsd_matched_mean': float(matched.mean()) if len(matched) else float('nan'),
+        'rmsd_matched_median': float(np.median(matched)) if len(matched) else float('nan'),
+        'n_scored': len(rmsds), 'n_matched': int(len(matched)),
+        'n_unmatched': n_unmatched, 'n_no_reference': n_no_ref,
+        'n_missing_structure': n_missing,
+        'unique_prototypes_only': bool(args.unique_prototypes),
+    }
+    print(f"RMSD over {metrics['n_scored']:,} structures "
+          f"({n_unmatched} unmatched → filled 1.0; {n_no_ref} without a DFT "
+          f"reference; {n_missing} shard entries lacked saved geometries)")
+    print(f"  rmsd (leaderboard fill) {metrics['rmsd']:.4f} | matched mean "
+          f"{metrics['rmsd_matched_mean']:.4f} | matched median "
+          f"{metrics['rmsd_matched_median']:.4f}")
+    if args.out:
+        with open(args.out, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"metrics → {args.out}")
+    if args.csv:
+        with open(args.csv, 'w') as f:
+            f.write("material_id,rmsd,matched\n")
+            for mid, v in rmsds.items():
+                f.write(f"{mid},{(1.0 if v is None else v)!r},"
+                        f"{int(v is not None)}\n")
+        print(f"per-structure table → {args.csv}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
@@ -439,11 +618,34 @@ def main(argv=None):
                     help="score only the summary's unique_prototype subset "
                          "(~215k rows — the leaderboard's headline split)")
 
+    pm = sub.add_parser('rmsd', help='geometry RMSD vs the DFT-relaxed '
+                                     'structures (needs pymatgen)')
+    pm.add_argument('--pred', nargs='+', required=True,
+                    help='relax shards written with --save_structures')
+    pm.add_argument('--ref', required=True,
+                    help='DFT-relaxed WBM structures (e.g. the '
+                         'computed-structure-entries jsonl[.gz])')
+    pm.add_argument('--out', default=None, help='metrics json')
+    pm.add_argument('--csv', default=None, help='per-structure csv dump')
+    pm.add_argument('--summary', default=None,
+                    help='WBM summary csv[.gz]; only with --unique_prototypes')
+    pm.add_argument('--unique_prototypes', action='store_true',
+                    help='restrict to the unique_prototype subset')
+    pm.add_argument('--nproc', type=int, default=1,
+                    help='worker processes for the structure matching')
+    pm.add_argument('--match_timeout', type=int, default=120,
+                    help='seconds per structure match before counting it '
+                         'unmatched (0 disables; POSIX only)')
+
     args = p.parse_args(argv)
     if args.cmd == 'relax':
         run_relax(args)
-    else:
+    elif args.cmd == 'score':
         run_score(args)
+    else:
+        if args.unique_prototypes and not args.summary:
+            raise SystemExit("--unique_prototypes needs --summary")
+        run_rmsd(args)
 
 
 if __name__ == '__main__':
