@@ -197,6 +197,45 @@ def test_wbm_eval():
         assert 1e-4 < rm2['rmsd'] < 0.5, rm2['rmsd']
         assert rm2['rmsd_matched_median'] < rm2['rmsd_matched_mean'], rm2
 
+        # ── singlepoint: E/F at fixed geometries ─────────────────────────
+        # pass 1 with placeholder DFT energies → shard of e_pred values
+        sp_sum = os.path.join(tmp, 'sp-summary.csv')
+        with open(sp_sum, 'w') as f:
+            f.write('material_id,n_sites,uncorrected_energy_from_cse,'
+                    'e_correction_per_atom_mp2020\n')
+            for mid, s in zip(wbm, structs + [bad]):
+                f.write(f"{mid},{s['n_atoms']},0.0,0.0\n")
+        sp_out = os.path.join(tmp, 'sp.json.gz')
+        main(['singlepoint', '--checkpoint', ckpt, '--structures', struct_path,
+              '--summary', sp_sum, '--out', sp_out, '--device', 'cpu'])
+        with gzip.open(sp_out, 'rt') as f:
+            sp = json.load(f)['results']
+        assert 'skipped' in sp['wbm-1-bad']
+        done_sp = {m: v for m, v in sp.items() if 'e_pred' in v}
+        assert len(done_sp) == 6
+        # pass 2: summary built FROM the predictions, with a nonzero
+        # correction split — pins the corrected-total reconstruction
+        with open(sp_sum, 'w') as f:
+            f.write('material_id,n_sites,uncorrected_energy_from_cse,'
+                    'e_correction_per_atom_mp2020\n')
+            for mid, v in done_sp.items():
+                f.write(f"{mid},{v['n_atoms']},"
+                        f"{v['e_pred'] - 0.05 * v['n_atoms']!r},0.05\n")
+        sp_out2 = os.path.join(tmp, 'sp2.json.gz')
+        sp_metrics = os.path.join(tmp, 'sp_metrics.json')
+        main(['singlepoint', '--checkpoint', ckpt, '--structures', struct_path,
+              '--summary', sp_sum, '--out', sp_out2, '--device', 'cpu',
+              '--out_metrics', sp_metrics])
+        with open(sp_metrics) as f:
+            spm = json.load(f)
+        assert spm['n_scored'] == 6 and spm['energy_mae'] < 1e-10, spm
+        assert np.isfinite(spm['force_rms']) and spm['force_rms'] > 0
+        # aggregate-only mode reproduces the same numbers from the shard
+        main(['singlepoint', '--pred', sp_out2, '--summary', sp_sum,
+              '--out', sp_metrics])
+        with open(sp_metrics) as f:
+            assert abs(json.load(f)['energy_mae'] - spm['energy_mae']) < 1e-15
+
         # 5. shift one stable prediction far above the hull → recall drops
         with gzip.open(out, 'rt') as f:
             blob = json.load(f)

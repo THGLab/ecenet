@@ -10,6 +10,14 @@ Sliceable for a job array (``--slice``), resumable (already-done ids in an
 existing ``--out`` are skipped), and structures containing elements outside
 the checkpoint's type map are counted and skipped, not crashed on.
 
+``singlepoint`` — E/F error at the DFT-relaxed geometries, no relaxation:
+separates pure PES accuracy from optimizer behavior. Energies compare to the
+MP2020-corrected DFT totals reconstructed from the summary
+(``uncorrected_energy_from_cse + n_sites·e_correction_per_atom_mp2020``);
+the reported force RMS is against the DFT reference of ≈0 at these relaxed
+geometries (an equilibrium-force error). Sliceable/resumable like ``relax``;
+``--pred`` aggregates existing shards instead of computing.
+
 ``rmsd`` — geometry quality (needs pymatgen, plus shards written with
 ``--save_structures``): Matbench-Discovery's exact recipe —
 ``StructureMatcher(stol=1.0, scale=False).get_rms_dist(pred, dft)[0]``
@@ -429,6 +437,173 @@ def run_score(args):
 
 
 # ---------------------------------------------------------------------------
+# singlepoint — E/F error at the DFT-relaxed geometries (no relaxation)
+# ---------------------------------------------------------------------------
+
+def load_wbm_dft_energies(path):
+    """{material_id: MP2020-corrected DFT total energy (eV)} from the summary.
+
+    The computed-structure-entries file stores uncorrected energies with
+    correction=0 — the corrections were applied in the summary pipeline — so
+    the corrected total is reconstructed as
+    ``uncorrected_energy_from_cse + n_sites * e_correction_per_atom_mp2020``.
+    """
+    import csv
+    with _open_auto(path) as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        id_col = header.index(_find_col(header, ['id'], ['material']))
+        e_col = header.index(_find_col(header, ['uncorrected_energy'], ['cse']))
+        c_col = header.index(_find_col(header, ['e_correction_per_atom'],
+                                       ['mp2020']))
+        n_col = header.index(_find_col(header, ['n_sites'], []))
+        out = {}
+        for row in reader:
+            try:
+                out[row[id_col]] = (float(row[e_col])
+                                    + float(row[n_col]) * float(row[c_col]))
+            except (ValueError, IndexError):
+                continue
+    return out
+
+
+def _sp_aggregate(results):
+    """Aggregate metrics over singlepoint shard entries (dicts with e_pred,
+    e_dft, n_atoms, f_rms, f_max)."""
+    ok = [r for r in results.values() if 'e_pred' in r]
+    if not ok:
+        raise SystemExit("no successful singlepoint entries")
+    de = np.array([(r['e_pred'] - r['e_dft']) / r['n_atoms'] for r in ok])
+    # global per-component force RMS: recombine per-structure RMS values
+    # weighted by their component counts (DFT reference forces are ~0 at
+    # these relaxed geometries, so this IS the force error)
+    ncomp = np.array([3 * r['n_atoms'] for r in ok])
+    f_ms = np.array([r['f_rms'] ** 2 for r in ok])
+    metrics = {
+        'n_scored': len(ok),
+        'n_errors': sum(1 for r in results.values() if 'error' in r),
+        'n_skipped': sum(1 for r in results.values() if 'skipped' in r),
+        'energy_mae': float(np.abs(de).mean()),          # eV/atom
+        'energy_rmse': float(np.sqrt((de ** 2).mean())),
+        'energy_me': float(de.mean()),                   # signed bias
+        'force_rms': float(np.sqrt((f_ms * ncomp).sum() / ncomp.sum())),
+        'force_max_mean': float(np.mean([r['f_max'] for r in ok])),
+        'force_max_p95': float(np.percentile([r['f_max'] for r in ok], 95)),
+    }
+    print(f"singlepoint over {metrics['n_scored']:,} DFT-relaxed structures "
+          f"({metrics['n_errors']} errors, {metrics['n_skipped']} skipped)")
+    print(f"  energy  MAE {metrics['energy_mae']*1e3:7.1f} meV/atom | "
+          f"RMSE {metrics['energy_rmse']*1e3:7.1f} | "
+          f"bias {metrics['energy_me']*1e3:+7.1f}")
+    print(f"  forces  RMS {metrics['force_rms']*1e3:7.1f} meV/Å "
+          f"(DFT ref ≈ 0 at relaxed geometry) | "
+          f"per-structure max: mean {metrics['force_max_mean']:.3f}, "
+          f"p95 {metrics['force_max_p95']:.3f} eV/Å")
+    return metrics
+
+
+def run_singlepoint(args):
+    if args.pred:                       # aggregate-only over existing shards
+        results = {}
+        for path in sorted(sum((glob.glob(p) for p in args.pred), [])):
+            with _open_auto(path) as f:
+                results.update(json.load(f)['results'])
+        metrics = _sp_aggregate(results)
+        target = args.out_metrics or args.out
+        if target:
+            with open(target, 'w') as f:
+                json.dump(metrics, f, indent=2)
+            print(f"metrics → {target}")
+        return metrics
+
+    for req in ('checkpoint', 'structures', 'out'):
+        if getattr(args, req) is None:
+            raise SystemExit(f"singlepoint compute mode needs --{req} "
+                             "(or pass --pred to aggregate existing shards)")
+    import torch  # noqa: F401
+    from ase import Atoms
+    from train_ecenet_mptrj import _structure_dict_to_arrays
+
+    from ecenet import elements
+    from ecenet.calculator import load_calculator
+
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+
+    calc = load_calculator(args.checkpoint, device=args.device)
+    known = set(calc.element_to_type)
+
+    e_dft = load_wbm_dft_energies(args.summary)
+    if args.unique_prototypes:
+        keep = load_wbm_summary(args.summary, unique_only=True)
+        e_dft = {m: v for m, v in e_dft.items() if m in keep}
+    structures = load_wbm_structures(args.structures)
+    ids = sorted(m for m in structures if m in e_dft)
+    if args.slice:
+        a, b = args.slice.split(':')
+        ids = ids[int(a or 0):int(b) if b else None]
+    print(f"{len(ids)} structures in this slice "
+          f"(of {len(structures)} loaded)", flush=True)
+
+    results = {}
+    if os.path.exists(args.out):
+        with _open_auto(args.out) as f:
+            results = json.load(f).get('results', {})
+        n_prev_err = sum(1 for r in results.values() if 'error' in r)
+        results = {m: r for m, r in results.items() if 'error' not in r}
+        print(f"resuming: {len(results)} already done"
+              + (f" ({n_prev_err} prior errors will be retried)"
+                 if n_prev_err else ""), flush=True)
+
+    def flush():
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with gzip.open(args.out, 'wt') as f:
+            json.dump({'meta': {'checkpoint': os.path.abspath(args.checkpoint),
+                                'structures': os.path.abspath(args.structures),
+                                'mode': 'singlepoint'},
+                       'results': results}, f)
+
+    t0, done0 = time.time(), len(results)
+    for mid in ids:
+        if mid in results:
+            continue
+        try:
+            numbers, positions, cell = _structure_dict_to_arrays(structures[mid])
+            syms = [elements.symbol(int(z)) for z in numbers]
+            unknown = sorted(set(syms) - known)
+            if unknown:
+                results[mid] = {'skipped': f"unknown elements: {unknown}"}
+                continue
+            atoms = Atoms(numbers=numbers, positions=positions, cell=cell,
+                          pbc=True)
+            atoms.calc = calc
+            fr = atoms.get_forces()
+            results[mid] = {
+                'e_pred': float(atoms.get_potential_energy()),
+                'e_dft': float(e_dft[mid]),
+                'n_atoms': len(atoms),
+                'f_rms': float(np.sqrt((fr ** 2).mean())),
+                'f_max': float(np.abs(fr).max()),
+            }
+        except Exception as e:
+            results[mid] = {'error': f"{type(e).__name__}: {e}"}
+        if len(results) % args.flush_every == 0:
+            flush()
+            rate = (len(results) - done0) / max(1e-9, time.time() - t0)
+            print(f"  {len(results)}/{len(ids)} done ({rate:.2f} struct/s)",
+                  flush=True)
+    flush()
+    metrics = _sp_aggregate({m: results[m] for m in ids if m in results})
+    if args.out_metrics:
+        with open(args.out_metrics, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f"metrics → {args.out_metrics}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 # rmsd
 # ---------------------------------------------------------------------------
 
@@ -637,11 +812,35 @@ def main(argv=None):
                     help='seconds per structure match before counting it '
                          'unmatched (0 disables; POSIX only)')
 
+    pp = sub.add_parser('singlepoint',
+                        help='E/F error at the DFT-relaxed geometries '
+                             '(no relaxation)')
+    pp.add_argument('--checkpoint', default=None)
+    pp.add_argument('--structures', default=None,
+                    help='DFT-relaxed structures (the computed-structure-'
+                         'entries jsonl[.gz])')
+    pp.add_argument('--summary', required=True,
+                    help='WBM summary csv[.gz] (supplies the corrected DFT '
+                         'total energies)')
+    pp.add_argument('--out', default=None, help='output shard (json.gz)')
+    pp.add_argument('--out_metrics', default=None, help='metrics json')
+    pp.add_argument('--pred', nargs='+', default=None,
+                    help='aggregate existing singlepoint shards instead of '
+                         'computing')
+    pp.add_argument('--slice', default=None,
+                    help='A:B slice of the sorted id list (job arrays)')
+    pp.add_argument('--device', default=None)
+    pp.add_argument('--tf32', action='store_true')
+    pp.add_argument('--flush_every', type=int, default=500)
+    pp.add_argument('--unique_prototypes', action='store_true')
+
     args = p.parse_args(argv)
     if args.cmd == 'relax':
         run_relax(args)
     elif args.cmd == 'score':
         run_score(args)
+    elif args.cmd == 'singlepoint':
+        run_singlepoint(args)
     else:
         if args.unique_prototypes and not args.summary:
             raise SystemExit("--unique_prototypes needs --summary")
