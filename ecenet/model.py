@@ -770,19 +770,6 @@ class ECENet(nn.Module):
                 mod.fused = enabled
         return self
 
-    def set_activation_compiled(self, enabled: bool = True):
-        """Toggle the torch.compile path on all RealSpaceNonlinearity modules
-        (broadcast-sum formulation — see realspace_kernel.realspace_broadcast).
-        Experimental A/B against set_activation_fused; takes precedence over it
-        where both are set. One shared compile covers every layer (first call
-        pays it, seconds); dynamic shapes, so the edge count doesn't recompile.
-        Returns self.
-        """
-        for mod in self.modules():
-            if hasattr(mod, 'compiled') and hasattr(mod, 'cos_synth'):
-                mod.compiled = enabled
-        return self
-
     # ── Forward ────────────────────────────────────────────────────────────
 
     def _edgeless_result(self, types, device, dtype, return_embeddings, l0_only):

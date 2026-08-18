@@ -69,56 +69,6 @@ def realspace_reference(A_cos, A_sin, cos_synth, sin_synth,
 
 
 # ---------------------------------------------------------------------------
-# 1b. torch.compile path (experimental A/B against the Triton kernels)
-# ---------------------------------------------------------------------------
-
-
-def realspace_broadcast(A_cos, A_sin, cos_synth, sin_synth,
-                        cos_analysis, sin_analysis, activation):
-    """``realspace_reference`` with the contractions written as broadcast-multiply
-    + sum instead of ``@``. Same math; the point is what Inductor sees: matmuls
-    lower to cuBLAS/template calls it cannot fuse across, while a pointwise/
-    reduction chain fuses into a single generated kernel (grid never in HBM —
-    the hand-written kernels' trick, derived automatically). The contracted dims
-    (n_ang 3-4, n_grid 9-13) are far too small for matmul hardware to matter."""
-    f = (A_cos.unsqueeze(-1) * cos_synth
-         + A_sin.unsqueeze(-1) * sin_synth).sum(-2)   # (n_e, F, n_grid)
-    f = activation(f)
-    return ((f.unsqueeze(-1) * cos_analysis).sum(-2),
-            (f.unsqueeze(-1) * sin_analysis).sum(-2))
-
-
-# Pass the functional, not the nn.Module: distinct module instances (one per
-# layer) would each install their own dynamo guards; a plain function is one
-# constant → one compile covers every layer.
-_ACT_FN = {torch.nn.SiLU: torch.nn.functional.silu,
-           torch.nn.ReLU: torch.nn.functional.relu,
-           torch.nn.Tanh: torch.tanh,
-           torch.nn.GELU: torch.nn.functional.gelu}
-
-
-def activation_fn(activation):
-    """Stateless functional for a RealSpaceNonlinearity activation module
-    (falls back to the module itself for anything unmapped)."""
-    return _ACT_FN.get(type(activation), activation)
-
-
-_compiled_realspace = None
-
-
-def compiled_realspace():
-    """Lazily-built, cached ``torch.compile`` of ``realspace_broadcast``
-    (``dynamic=True`` so the per-batch edge count doesn't recompile). Backward
-    comes from AOTAutograd; whether its partitioner saves the grid tensor or
-    recomputes it is a heuristic, not a contract — verify the memory win with
-    TORCH_LOGS=output_code or a peak-memory A/B before trusting it."""
-    global _compiled_realspace
-    if _compiled_realspace is None:
-        _compiled_realspace = torch.compile(realspace_broadcast, dynamic=True)
-    return _compiled_realspace
-
-
-# ---------------------------------------------------------------------------
 # 2. Triton kernels (CUDA + silu) — one program per row-tile, f_grid in SRAM.
 # ---------------------------------------------------------------------------
 #
