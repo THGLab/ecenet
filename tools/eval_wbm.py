@@ -10,13 +10,14 @@ Sliceable for a job array (``--slice``), resumable (already-done ids in an
 existing ``--out`` are skipped), and structures containing elements outside
 the checkpoint's type map are counted and skipped, not crashed on.
 
-``singlepoint`` — E/F error at the DFT-relaxed geometries, no relaxation:
-separates pure PES accuracy from optimizer behavior. Energies compare to the
-MP2020-corrected DFT totals reconstructed from the summary
+``singlepoint`` — E/F/stress error at the DFT-relaxed geometries, no
+relaxation: separates pure PES accuracy from optimizer behavior. Energies
+compare to the MP2020-corrected DFT totals reconstructed from the summary
 (``uncorrected_energy_from_cse + n_sites·e_correction_per_atom_mp2020``);
-the reported force RMS is against the DFT reference of ≈0 at these relaxed
-geometries (an equilibrium-force error). Sliceable/resumable like ``relax``;
-``--pred`` aggregates existing shards instead of computing.
+the reported force and stress errors are against the DFT reference of ≈0 at
+these relaxed geometries (equilibrium force/stress errors — WBM publishes
+neither). Sliceable/resumable like ``relax``; ``--pred`` aggregates existing
+shards instead of computing.
 
 ``rmsd`` — geometry quality (needs pymatgen, plus shards written with
 ``--save_structures``): Matbench-Discovery's exact recipe —
@@ -483,6 +484,9 @@ def _sp_aggregate(results):
     f_maes = [r.get('f_mae') for r in ok]
     f_mae = (float((np.array(f_maes) * ncomp).sum() / ncomp.sum())
              if all(v is not None for v in f_maes) else float('nan'))
+    s_maes = [r.get('s_mae') for r in ok]
+    s_mae = (float(np.mean(s_maes))          # 6 Voigt components each
+             if all(v is not None for v in s_maes) else float('nan'))
     metrics = {
         'n_scored': len(ok),
         'n_errors': sum(1 for r in results.values() if 'error' in r),
@@ -494,6 +498,7 @@ def _sp_aggregate(results):
         'force_rms': float(np.sqrt((f_ms * ncomp).sum() / ncomp.sum())),
         'force_max_mean': float(np.mean([r['f_max'] for r in ok])),
         'force_max_p95': float(np.percentile([r['f_max'] for r in ok], 95)),
+        'stress_mae': s_mae,                 # eV/Å³, Voigt components
     }
     print(f"singlepoint over {metrics['n_scored']:,} DFT-relaxed structures "
           f"({metrics['n_errors']} errors, {metrics['n_skipped']} skipped)")
@@ -505,6 +510,9 @@ def _sp_aggregate(results):
           f"(DFT ref ≈ 0 at relaxed geometry) | "
           f"per-structure max: mean {metrics['force_max_mean']:.3f}, "
           f"p95 {metrics['force_max_p95']:.3f} eV/Å")
+    print(f"  stress  MAE {metrics['stress_mae']*1e3:7.2f} meV/Å³ "
+          f"(= {metrics['stress_mae'] * 160.21766:.3f} GPa; DFT ref ≈ 0 — "
+          f"relaxed cells, up to Pulay residuals)")
     return metrics
 
 
@@ -595,6 +603,9 @@ def run_singlepoint(args):
             atoms = Atoms(numbers=numbers, positions=positions, cell=cell,
                           pbc=True)
             atoms.calc = calc
+            # stress first: that single call computes E, F, and σ in one
+            # strain-augmented evaluation; the later getters hit the cache
+            st = atoms.get_stress()          # Voigt 6, eV/Å³
             fr = atoms.get_forces()
             results[mid] = {
                 'e_pred': float(atoms.get_potential_energy()),
@@ -603,6 +614,8 @@ def run_singlepoint(args):
                 'f_mae': float(np.abs(fr).mean()),
                 'f_rms': float(np.sqrt((fr ** 2).mean())),
                 'f_max': float(np.abs(fr).max()),
+                's_mae': float(np.abs(st).mean()),
+                's_max': float(np.abs(st).max()),
             }
         except Exception as e:
             results[mid] = {'error': f"{type(e).__name__}: {e}"}
