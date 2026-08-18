@@ -253,6 +253,17 @@ def test_wbm_eval():
               '--out', sp_metrics])
         with open(sp_metrics) as f:
             assert abs(json.load(f)['energy_mae'] - spm['energy_mae']) < 1e-15
+        # batched forward (default) == per-structure ASE calculator path
+        sp_out3 = os.path.join(tmp, 'sp3.json.gz')
+        main(['singlepoint', '--checkpoint', ckpt,
+              '--structures', relaxed_path, '--summary', sp_sum,
+              '--out', sp_out3, '--device', 'cpu', '--batch_size', '1'])
+        with gzip.open(sp_out3, 'rt') as f:
+            sp1 = json.load(f)['results']
+        for mid, v in done_sp.items():
+            w = sp1[mid]
+            for key in ('e_pred', 'f_rms', 'f_mae', 's_mae'):
+                assert abs(w[key] - v[key]) < 1e-8, (mid, key, w[key], v[key])
 
         # 5. shift one stable prediction far above the hull → recall drops
         with gzip.open(out, 'rt') as f:

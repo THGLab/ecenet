@@ -977,10 +977,16 @@ class ECENet(nn.Module):
                                each as a list of B per-structure tensors
             l0_only:           with return_embeddings, skip the l=1 work
                                (returns (energies, l0_list))
-            topology:          optional list of B per-structure
-                               (edge_i, edge_j, nb_src, nb_dst) LOCAL index
-                               tuples from build_topology (fixed positions);
-                               skips the per-structure dist_mat + nonzero syncs
+            topology:          optional list of B per-structure LOCAL index
+                               tuples from build_topology (fixed positions):
+                               (edge_i, edge_j, nb_src, nb_dst) for
+                               non-periodic structures, or the 6-tuple
+                               (edge_i, edge_j, shift_e, nb_src, nb_dst,
+                               shift_nb) with Cartesian PBC shift vectors for
+                               periodic ones (the trainers' convention:
+                               diff = pos[j] − pos[i] + shift). Mixed batches
+                               are allowed; skips the per-structure dist_mat
+                               + nonzero syncs
 
         Returns:
             energies: (B,) tensor — or (energies, l0_list[, l1_list])
@@ -991,6 +997,8 @@ class ECENet(nn.Module):
 
         edge_i_list, edge_j_list = [], []   # flat atom indices with offsets (for MP)
         nb_src_list, nb_dst_list = [], []   # flat ACE neighbour indices (offset)
+        shift_e_list, shift_nb_list = [], []   # per-structure PBC shifts (or None)
+        any_pbc = False
         struct_ids = []
         atomic_e_list = []
         atom_offset = 0
@@ -1010,8 +1018,14 @@ class ECENet(nn.Module):
             # or built now by the same helper, whose no_grad keeps dead nodes
             # out of the force double-backward graph. atomic_e (param-grad)
             # stays OUTSIDE it.
-            ei, ej, nb_src, nb_dst = (topology[b] if topology is not None
-                                      else self._local_topology(pos))
+            entry = (topology[b] if topology is not None
+                     else self._local_topology(pos))
+            if len(entry) == 6:      # periodic: shifts interleaved (trainer order)
+                ei, ej, she, nb_src, nb_dst, shn = entry
+                any_pbc = True
+            else:
+                ei, ej, nb_src, nb_dst = entry
+                she = shn = None
 
             atomic_e_list.append(self.atomic_energy[types].sum())
             if len(ei) == 0:
@@ -1022,6 +1036,8 @@ class ECENet(nn.Module):
             edge_j_list.append(ej + atom_offset)
             nb_src_list.append(nb_src + atom_offset)
             nb_dst_list.append(nb_dst + atom_offset)
+            shift_e_list.append(she)
+            shift_nb_list.append(shn)
             struct_ids.append(torch.full((len(ei),), b, dtype=torch.long, device=device))
             atom_offset += N_b
 
@@ -1047,6 +1063,21 @@ class ECENet(nn.Module):
         nb_dst_flat = torch.cat(nb_dst_list)
         struct_idx  = torch.cat(struct_ids)
 
+        # PBC: concatenate the per-structure shift vectors (zeros for any
+        # non-periodic structures in a mixed batch). Shifts enter in exactly
+        # the two places forward_pbc uses them: the edge diff below and the
+        # ACE basis; everything downstream sees only diff/r_hat/dist.
+        shift_e_flat = shift_nb_flat = None
+        if any_pbc:
+            shift_e_flat = torch.cat([
+                s if s is not None else torch.zeros(len(e), 3, dtype=dtype,
+                                                    device=device)
+                for s, e in zip(shift_e_list, edge_i_list)])
+            shift_nb_flat = torch.cat([
+                s if s is not None else torch.zeros(len(n), 3, dtype=dtype,
+                                                    device=device)
+                for s, n in zip(shift_nb_list, nb_src_list)])
+
         # ── ACE basis + embed once on the whole concatenated atom set ──
         # The basis of a central atom depends only on its own neighbour list
         # (scattered by nb_src), and indices never cross structures, so a single
@@ -1057,13 +1088,16 @@ class ECENet(nn.Module):
         types_all = torch.cat(types_list, dim=0)            # (N_total,)
 
         A = self._compute_ace_basis(pos_all.unsqueeze(0), nb_src_flat, nb_dst_flat,
-                                    types_all).squeeze(0)
+                                    types_all,
+                                    shift_vecs_nb=shift_nb_flat).squeeze(0)
         A_emb = self._embed(A, types_all)                   # (N_total, embed_dim, n_sph)
 
         # Per-edge geometry computed flat from the concatenated positions
         # (gradients flow to the per-frame leaves through the cat → forces are
         # unchanged); features gathered from the per-atom embed in _edge_frame.
         diff_ij = pos_all[edge_j_flat] - pos_all[edge_i_flat]
+        if shift_e_flat is not None:
+            diff_ij = diff_ij + shift_e_flat.to(dtype=dtype)
         dist_ij = torch.sqrt((diff_ij ** 2).sum(-1) + 1e-30)
         r_hat   = diff_ij / dist_ij.unsqueeze(-1)
         type_i  = types_all[edge_i_flat]

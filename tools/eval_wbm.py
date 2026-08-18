@@ -589,37 +589,113 @@ def run_singlepoint(args):
                                 'mode': 'singlepoint'},
                        'results': results}, f)
 
-    t0, done0 = time.time(), len(results)
-    for mid in ids:
-        if mid in results:
-            continue
-        try:
-            numbers, positions, cell = _structure_dict_to_arrays(structures[mid])
-            syms = [elements.symbol(int(z)) for z in numbers]
-            unknown = sorted(set(syms) - known)
-            if unknown:
-                results[mid] = {'skipped': f"unknown elements: {unknown}"}
+    from ecenet.calculator import ECENetLESCalculator
+    batch_size = args.batch_size
+    if batch_size > 1 and isinstance(calc, ECENetLESCalculator):
+        print("[singlepoint] LES checkpoint → batched path not supported; "
+              "falling back to per-structure evaluation", flush=True)
+        batch_size = 1
+
+    def parse(mid):
+        """(syms, numbers, positions, cell) or a skip-record."""
+        numbers, positions, cell = _structure_dict_to_arrays(structures[mid])
+        syms = [elements.symbol(int(z)) for z in numbers]
+        unknown = sorted(set(syms) - known)
+        if unknown:
+            return {'skipped': f"unknown elements: {unknown}"}
+        return syms, numbers, positions, cell
+
+    def record(mid, syms, e_pred, fr, st_voigt):
+        results[mid] = {
+            'e_pred': float(e_pred),
+            'e_dft': float(e_dft[mid]),
+            'n_atoms': len(syms),
+            'f_mae': float(np.abs(fr).mean()),
+            'f_rms': float(np.sqrt((fr ** 2).mean())),
+            'f_max': float(np.abs(fr).max()),
+            's_mae': float(np.abs(st_voigt).mean()),
+            's_max': float(np.abs(st_voigt).max()),
+        }
+
+    def eval_one(mid):
+        parsed = parse(mid)
+        if isinstance(parsed, dict):
+            results[mid] = parsed
+            return
+        syms, numbers, positions, cell = parsed
+        atoms = Atoms(numbers=numbers, positions=positions, cell=cell, pbc=True)
+        atoms.calc = calc
+        # stress first: that single call computes E, F, and σ in one
+        # strain-augmented evaluation; the later getters hit the cache
+        st = atoms.get_stress()              # Voigt 6, eV/Å³
+        record(mid, syms, atoms.get_potential_energy(), atoms.get_forces(), st)
+
+    def eval_batch(chunk):
+        """One forward_batch_multi call over the chunk (SPICE-style batching:
+        ACE/embed/layers run once on the concatenated atoms, killing the
+        per-structure kernel-launch overhead). Per-structure position and
+        strain leaves give forces and stress from one backward; energies are
+        put on the calculator's scale (units, e_ref, mean) so this path is
+        numerically interchangeable with eval_one."""
+        import torch
+        model, device, mdt = calc.model, calc.device, calc.dtype
+        from train_ecenet_mptrj import build_topology as build_pbc_topology
+        metas, pos_in, types_l, topo, leaves, strains, vols = \
+            [], [], [], [], [], [], []
+        for mid in chunk:
+            parsed = parse(mid)
+            if isinstance(parsed, dict):
+                results[mid] = parsed
                 continue
-            atoms = Atoms(numbers=numbers, positions=positions, cell=cell,
-                          pbc=True)
-            atoms.calc = calc
-            # stress first: that single call computes E, F, and σ in one
-            # strain-augmented evaluation; the later getters hit the cache
-            st = atoms.get_stress()          # Voigt 6, eV/Å³
-            fr = atoms.get_forces()
-            results[mid] = {
-                'e_pred': float(atoms.get_potential_energy()),
-                'e_dft': float(e_dft[mid]),
-                'n_atoms': len(atoms),
-                'f_mae': float(np.abs(fr).mean()),
-                'f_rms': float(np.sqrt((fr ** 2).mean())),
-                'f_max': float(np.abs(fr).max()),
-                's_mae': float(np.abs(st).mean()),
-                's_max': float(np.abs(st).max()),
-            }
+            syms, numbers, positions, cell = parsed
+            ei, ej, she, ni, nj, shn = build_pbc_topology(
+                positions, cell, True, model.r_cut_edge,
+                model.r_cut_neighbor, device, mdt)
+            p = torch.tensor(positions, dtype=mdt, device=device,
+                             requires_grad=True)
+            eps = torch.zeros(3, 3, dtype=mdt, device=device,
+                              requires_grad=True)
+            pos_in.append(p + p @ eps)
+            topo.append((ei, ej, she + she @ eps, ni, nj, shn + shn @ eps))
+            types_l.append(torch.tensor(
+                [calc.element_to_type[s] for s in syms],
+                dtype=torch.long, device=device))
+            leaves.append(p)
+            strains.append(eps)
+            vols.append(abs(np.linalg.det(cell)))
+            metas.append((mid, syms))
+        if not metas:
+            return
+        e_b = model.forward_batch_multi(pos_in, types_l, topology=topo)
+        grads = torch.autograd.grad(e_b.sum(), leaves + strains,
+                                    allow_unused=True)
+        K = len(metas)
+        for k, (mid, syms) in enumerate(metas):
+            g_p, g_s = grads[k], grads[K + k]
+            fr = (-g_p if g_p is not None
+                  else torch.zeros_like(leaves[k])).detach().cpu().numpy()
+            sm = ((g_s if g_s is not None else torch.zeros(3, 3, dtype=mdt))
+                  .detach().cpu().numpy()) / vols[k]
+            st = np.array([sm[0, 0], sm[1, 1], sm[2, 2],
+                           sm[1, 2], sm[0, 2], sm[0, 1]]) * calc._to_ev
+            e_pred = (e_b[k].item() * calc._to_ev + calc._energy_mean_ev
+                      + sum(calc.energy_reference.get(s, 0.0) for s in syms))
+            record(mid, syms, e_pred, fr * calc._to_ev, st)
+
+    t0, done0 = time.time(), len(results)
+    todo = [m for m in ids if m not in results]
+    for start in range(0, len(todo), max(1, batch_size)):
+        chunk = todo[start:start + max(1, batch_size)]
+        try:
+            if batch_size > 1:
+                eval_batch(chunk)
+            else:
+                eval_one(chunk[0])
         except Exception as e:
-            results[mid] = {'error': f"{type(e).__name__}: {e}"}
-        if len(results) % args.flush_every == 0:
+            for mid in chunk:
+                if mid not in results:
+                    results[mid] = {'error': f"{type(e).__name__}: {e}"}
+        if len(results) // args.flush_every > (len(results) - len(chunk)) // args.flush_every:
             flush()
             rate = (len(results) - done0) / max(1e-9, time.time() - t0)
             print(f"  {len(results)}/{len(ids)} done ({rate:.2f} struct/s)",
@@ -863,6 +939,10 @@ def main(argv=None):
     pp.add_argument('--tf32', action='store_true')
     pp.add_argument('--flush_every', type=int, default=500)
     pp.add_argument('--unique_prototypes', action='store_true')
+    pp.add_argument('--batch_size', type=int, default=16,
+                    help='structures per batched forward (forward_batch_multi '
+                         'with periodic topology); 1 = per-structure ASE '
+                         'calculator path (LES checkpoints always use that)')
 
     args = p.parse_args(argv)
     if args.cmd == 'relax':

@@ -366,8 +366,78 @@ def test_torch_neighbor_list_matches_ase():
     print()
 
 
+def test_forward_batch_multi_pbc():
+    """forward_batch_multi with 6-tuple periodic topology (edge_i, edge_j,
+    shift_e, nb_src, nb_dst, shift_nb) must reproduce the per-structure
+    forward_pbc loop — energies, forces, and l0 embeddings — including a
+    zero-edge structure mid-batch and a non-periodic 4-tuple in the mix."""
+    print("=== forward_batch_multi: periodic topology == forward_pbc loop ===")
+    structs = make_structures(3, seed=21)
+    type_map = build_type_map(structs)
+    torch.manual_seed(3)
+    model = ECENet(n_types=len(type_map), r_cut_edge=4.0, r_cut_neighbor=3.5,
+                   l_max=2, n_max=2, embed_dim=8, n_layers=1, n_max_d=4,
+                   n_mp=2).double().to(DEVICE)
+    for p in model.parameters():
+        with torch.no_grad():
+            p.add_(0.05 * torch.randn_like(p))
+
+    pos_list, types_list, topo = [], [], []
+    for s in structs:
+        pos_list.append(torch.tensor(s['positions'], dtype=DTYPE, device=DEVICE))
+        types_list.append(torch.tensor([type_map[int(z)] for z in s['numbers']],
+                                       dtype=torch.long, device=DEVICE))
+        topo.append(build_topology(s['positions'], s['cell'], True,
+                                   4.0, 3.5, DEVICE, DTYPE))
+    # a zero-edge periodic structure mid-batch (2 atoms 10 Å apart, 20 Å box)
+    ze_pos = np.array([[0.0, 0, 0], [10.0, 0, 0]])
+    ze_cell = np.diag([20.0, 20.0, 20.0])
+    pos_list.insert(1, torch.tensor(ze_pos, dtype=DTYPE, device=DEVICE))
+    types_list.insert(1, torch.zeros(2, dtype=torch.long, device=DEVICE))
+    topo.insert(1, build_topology(ze_pos, ze_cell, True, 4.0, 3.5, DEVICE, DTYPE))
+    # and a non-periodic 4-tuple mixed in (a free molecule)
+    mol = torch.tensor([[0.0, 0, 0], [1.1, 0, 0], [0.0, 1.2, 0]],
+                       dtype=DTYPE, device=DEVICE)
+    pos_list.append(mol)
+    types_list.append(torch.zeros(3, dtype=torch.long, device=DEVICE))
+    topo.append(model.build_topology([mol])[0])
+
+    # reference: per-structure forward_pbc / forward
+    e_ref, f_ref, l0_ref = [], [], []
+    for pos, types, tp in zip(pos_list, types_list, topo):
+        p = pos.detach().clone().requires_grad_(True)
+        if len(tp) == 6:
+            e, l0 = model.forward_pbc(p, types, *tp, return_embeddings=True,
+                                      l0_only=True)
+        else:
+            e, l0 = model(p, types, return_embeddings=True, l0_only=True)
+        g = (torch.autograd.grad(e, p, allow_unused=True)[0]
+             if e.requires_grad else None)
+        e_ref.append(e.item())
+        f_ref.append(torch.zeros_like(p) if g is None else -g)
+        l0_ref.append(l0)
+
+    # batched: one forward_batch_multi call over the mixed topology
+    leaves = [p.detach().clone().requires_grad_(True) for p in pos_list]
+    e_b, l0_list = model.forward_batch_multi(leaves, types_list,
+                                             return_embeddings=True,
+                                             l0_only=True, topology=topo)
+    grads = torch.autograd.grad(e_b.sum(), leaves, allow_unused=True)
+    for k in range(len(pos_list)):
+        de = abs(e_b[k].item() - e_ref[k])
+        fb = (torch.zeros_like(leaves[k]) if grads[k] is None else -grads[k])
+        df = (fb - f_ref[k]).abs().max().item()
+        dl = (l0_list[k] - l0_ref[k]).abs().max().item()
+        assert de < 1e-10, (k, de)
+        assert df < 1e-10, (k, df)
+        assert dl < 1e-10, (k, dl)
+    print(f"  {len(pos_list)} structures (periodic + zero-edge + free molecule): "
+          "E/F/l0 match the per-structure loop\n")
+
+
 if __name__ == '__main__':
     test_torch_neighbor_list_matches_ase()
+    test_forward_batch_multi_pbc()
     test_wigner_pole_gradient()
     test_stress_and_force_fd()
     test_loss_decreases()
