@@ -6,8 +6,9 @@ system size, and kernel maturity all differ — so the credible comparison is
 this: one machine, one protocol, every model at its best settings.
 
 Scope: competitors trained on the SPICE MACE-OFF split, for a 1-to-1
-comparison — MACE-OFF (foundation shorthands or checkpoint paths) and DPA
-(DeePMD-kit, --head for multi-task branches); the custom module:function hook
+comparison — MACE-OFF (foundation shorthands or checkpoint paths), eSEN
+(fairchem, conserving checkpoints), and DPA (DeePMD-kit, --head for
+multi-task branches); the custom module:function hook
 covers anything else. Competitor packages pin conflicting torch versions: run
 each model in its own conda env and collate with --csv, which appends one
 identical row per run.
@@ -94,6 +95,22 @@ def _calc_mace(args):
     return MACECalculator(model_paths=args.checkpoint, **kw)
 
 
+def _calc_esen(args):
+    """eSEN via fairchem-core v2. --checkpoint: a local checkpoint file, or a
+    pretrained-model name known to fairchem's registry. For MD/benchmarking
+    use a *conserving* eSEN checkpoint (autograd forces — the like-for-like
+    comparison with ECENet/MACE), not a direct-force variant. Expect API
+    drift across fairchem majors (v1 was OCPCalculator) — adjust in its env;
+    some multi-task units also want task_name= on the calculator."""
+    from fairchem.core import FAIRChemCalculator, pretrained_mlip
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        from fairchem.core.units.mlip_unit import load_predict_unit
+        unit = load_predict_unit(args.checkpoint, device=_device(args))
+    else:
+        unit = pretrained_mlip.get_predict_unit(args.checkpoint, device=_device(args))
+    return FAIRChemCalculator(unit)
+
+
 def _calc_dpa(args):
     """DPA (DeePMD-kit). --checkpoint: the frozen model file; multi-task
     checkpoints need the SPICE branch selected via --head."""
@@ -110,10 +127,11 @@ def _calc_custom(args):
     return getattr(importlib.import_module(mod), fn)(args)
 
 
-FACTORIES = {'ecenet': _calc_ecenet, 'mace': _calc_mace, 'dpa': _calc_dpa,
-             'custom': _calc_custom}
+FACTORIES = {'ecenet': _calc_ecenet, 'mace': _calc_mace, 'esen': _calc_esen,
+             'dpa': _calc_dpa, 'custom': _calc_custom}
 
 INSTALL_HINT = {'mace': 'pip install mace-torch',
+                'esen': 'pip install fairchem-core',
                 'dpa': 'pip install deepmd-kit[torch]'}
 
 
