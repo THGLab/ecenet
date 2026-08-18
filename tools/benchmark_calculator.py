@@ -5,13 +5,17 @@ compared head-to-head. Paper timings are not commensurable — hardware, dtype,
 system size, and kernel maturity all differ — so the credible comparison is
 this: one machine, one protocol, every model at its best settings.
 
-Competitor packages pin conflicting torch/e3nn versions: run each model in its
-own conda env and collate with --csv, which appends one identical row per run.
+Scope: competitors trained on the SPICE MACE-OFF split, for a 1-to-1
+comparison — MACE-OFF (foundation shorthands or checkpoint paths) and DPA
+(DeePMD-kit, --head for multi-task branches); the custom module:function hook
+covers anything else. Competitor packages pin conflicting torch versions: run
+each model in its own conda env and collate with --csv, which appends one
+identical row per run.
 
 Usage (repo root):
-    python tools/benchmark_calculator.py --calc ecenet --checkpoint model.mdl \
+    python tools/benchmark_calculator.py --calc ecenet --checkpoint spice.mdl \
         --box water_box.xyz --float32 --fuse --csv bench.csv
-    python tools/benchmark_calculator.py --calc mace --checkpoint medium \
+    python tools/benchmark_calculator.py --calc mace --checkpoint off-medium \
         --box water_box.xyz --float32 --csv bench.csv         # mace-torch env
     python tools/benchmark_calculator.py --calc custom --factory mymod:make \
         --box water_box.xyz                                   # anything else
@@ -73,28 +77,29 @@ def _calc_ecenet(args):
 
 
 def _calc_mace(args):
-    from mace.calculators import MACECalculator, mace_mp
-    dt = 'float32' if args.float32 else 'float64'
-    if args.checkpoint in ('small', 'medium', 'large'):   # foundation shorthand
-        return mace_mp(model=args.checkpoint, device=_device(args), default_dtype=dt)
-    return MACECalculator(model_paths=args.checkpoint, device=_device(args),
-                          default_dtype=dt)
+    """MACE-family checkpoints (the SPICE-trained competitors are all in this
+    family): --checkpoint off-small/off-medium/off-large downloads the MACE-OFF
+    foundation models; a path loads any local .model file — a MACE-OFF download,
+    Egret-1's released checkpoints, or (inside their fork's env) MACELES-OFF."""
+    from mace.calculators import MACECalculator, mace_off
+    kw = {'device': _device(args),
+          'default_dtype': 'float32' if args.float32 else 'float64'}
+    if args.fuse:
+        # Load-time e3nn→cuEquivariance conversion — works on old checkpoints
+        # (it's a module swap, not a training-time property) but needs the
+        # cuequivariance wheels installed and a standard MACE architecture.
+        kw['enable_cueq'] = True
+    if args.checkpoint in ('off-small', 'off-medium', 'off-large'):
+        return mace_off(model=args.checkpoint[4:], **kw)
+    return MACECalculator(model_paths=args.checkpoint, **kw)
 
 
-def _calc_chgnet(args):
-    from chgnet.model.dynamics import CHGNetCalculator
-    return CHGNetCalculator(use_device=_device(args))
-
-
-def _calc_sevennet(args):
-    from sevenn.sevennet_calculator import SevenNetCalculator
-    return SevenNetCalculator(model=args.checkpoint or '7net-0', device=_device(args))
-
-
-def _calc_matgl(args):
-    import matgl
-    from matgl.ext.ase import PESCalculator
-    return PESCalculator(matgl.load_model(args.checkpoint or 'M3GNet-MP-2021.2.8-PES'))
+def _calc_dpa(args):
+    """DPA (DeePMD-kit). --checkpoint: the frozen model file; multi-task
+    checkpoints need the SPICE branch selected via --head."""
+    from deepmd.calculator import DP
+    kw = {'head': args.head} if args.head else {}
+    return DP(model=args.checkpoint, **kw)
 
 
 def _calc_custom(args):
@@ -105,11 +110,11 @@ def _calc_custom(args):
     return getattr(importlib.import_module(mod), fn)(args)
 
 
-FACTORIES = {'ecenet': _calc_ecenet, 'mace': _calc_mace, 'chgnet': _calc_chgnet,
-             'sevennet': _calc_sevennet, 'matgl': _calc_matgl, 'custom': _calc_custom}
+FACTORIES = {'ecenet': _calc_ecenet, 'mace': _calc_mace, 'dpa': _calc_dpa,
+             'custom': _calc_custom}
 
-INSTALL_HINT = {'mace': 'pip install mace-torch', 'chgnet': 'pip install chgnet',
-                'sevennet': 'pip install sevenn', 'matgl': 'pip install matgl'}
+INSTALL_HINT = {'mace': 'pip install mace-torch',
+                'dpa': 'pip install deepmd-kit[torch]'}
 
 
 # ── Timing utilities (profile_step conventions) ───────────────────────────────
@@ -138,6 +143,8 @@ def main():
     p.add_argument('--checkpoint', default=None)
     p.add_argument('--factory', default=None,
                    help="--calc custom: 'module:function', called as function(args)")
+    p.add_argument('--head', default=None,
+                   help='--calc dpa: model branch for multi-task checkpoints')
     p.add_argument('--box', required=True, help='any ASE-readable structure file')
     p.add_argument('--frame_idx', type=int, default=-1)
     p.add_argument('--repeat', type=int, nargs=3, default=None, metavar=('A', 'B', 'C'),
@@ -146,7 +153,8 @@ def main():
                    help='float32 where the factory supports it (state it in the table)')
     p.add_argument('--fuse', action='store_true',
                    help="enable the model's fast paths (ecenet: edge-frame + "
-                        'activation fusion; no-op for factories without a hook)')
+                        'activation fusion; mace: enable_cueq; no-op for '
+                        'factories without a hook)')
     p.add_argument('--device', default=None, help='default: cuda if available')
     p.add_argument('--n_warmup', type=int, default=5)
     p.add_argument('--n_time', type=int, default=20, help='timed single-point calls')
