@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ecenet.realspace_kernel import RealSpaceFused, is_fusible
+from ecenet.realspace_kernel import RealSpaceFused, activation_fn, compiled_realspace, is_fusible
 
 
 class EquivariantLinear(nn.Module):
@@ -101,6 +101,10 @@ class RealSpaceNonlinearity(nn.Module):
         # Opt-in fused path (recompute-in-backward; Triton on CUDA). Set via
         # ECENet.set_activation_fused. Off by default. See ecenet/realspace_kernel.
         self.fused = False
+        # Opt-in torch.compile path (broadcast-sum form; experimental A/B against
+        # the fused path — takes precedence over it where both are set). Set via
+        # ECENet.set_activation_compiled. See realspace_kernel.realspace_broadcast.
+        self.compiled = False
 
     def _build_bases(self):
         """Fill the DFT synthesis/analysis buffers, computing them in float64 and
@@ -158,6 +162,14 @@ class RealSpaceNonlinearity(nn.Module):
         Returns:
             A_cos_out, A_sin_out: (n_edges, n_features, n_angular)
         """
+        # Compiled path: Inductor fuses the broadcast-sum formulation into one
+        # generated kernel (backward via AOTAutograd). Checked before `fused`.
+        if self.compiled and is_fusible(self):
+            return compiled_realspace()(
+                A_cos, A_sin, self.cos_synth, self.sin_synth,
+                self.cos_analysis, self.sin_analysis,
+                activation_fn(self.activation))
+
         # Fused path: recompute the grid tensor in the backward instead of saving
         # it (drops the ~3x (n_e,F,n_grid) transient from the saved-for-backward
         # set). Only when grad is on (the win is the backward) and the config is

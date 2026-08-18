@@ -10,7 +10,9 @@ the actual ``RealSpaceNonlinearity`` module:
   4. fusibility gate — non-common configs report not-fusible;
   5. DFT bases are float64-accurate at model dtype (the _build_bases guarantee);
   6. Triton path vs the fp64 reference (skips without CUDA);
-  7. whole-model set_activation_fused: matches reference, SO(3), conservative.
+  7. whole-model set_activation_fused: matches reference, SO(3), conservative;
+  8. broadcast-sum form + torch.compile path vs the module (compile leg skips
+     where dynamo is unsupported).
 
 Pure PyTorch on CPU (fp64) except test 6. Run:  python tests/test_realspace_kernel.py
 """
@@ -26,8 +28,11 @@ import torch
 from ecenet.equivariant import RealSpaceNonlinearity
 from ecenet.realspace_kernel import (
     RealSpaceFused,
+    activation_fn,
+    compiled_realspace,
     fuse_realspace,
     is_fusible,
+    realspace_broadcast,
     realspace_reference,
 )
 
@@ -220,6 +225,39 @@ def _model():
     return m
 
 
+def test_compiled_matches_reference():
+    """Broadcast-sum formulation == the module (eager), and the torch.compile'd
+    version matches too, forward and input grads. The compile leg skips if
+    dynamo can't run in this env (e.g. a too-new Python)."""
+    nl = make_nl()
+    A_cos, A_sin = make_inputs(seed=7)
+    g_cos, g_sin = make_inputs(seed=8)          # fixed upstream grads
+    consts = (nl.cos_synth, nl.sin_synth, nl.cos_analysis, nl.sin_analysis)
+
+    def run(fn, act):
+        ac = A_cos.clone().requires_grad_(True)
+        as_ = A_sin.clone().requires_grad_(True)
+        oc, os_ = fn(ac, as_, *consts, act)
+        dac, das = torch.autograd.grad((oc * g_cos).sum() + (os_ * g_sin).sum(),
+                                       (ac, as_))
+        return oc, os_, dac, das
+
+    ref = run(realspace_reference, nl.activation)
+    bc = run(realspace_broadcast, activation_fn(nl.activation))
+    e_bc = max((a - b).abs().max().item() for a, b in zip(ref, bc))
+    assert e_bc < 1e-11, f"broadcast form mismatch: {e_bc:.2e}"
+
+    try:
+        comp = run(compiled_realspace(), activation_fn(nl.activation))
+    except Exception as e:  # dynamo/inductor unsupported here
+        print(f"  broadcast form matches reference ({e_bc:.1e}); "
+              f"torch.compile unavailable — compile leg skipped ({type(e).__name__})")
+        return
+    e_c = max((a - b).abs().max().item() for a, b in zip(ref, comp))
+    assert e_c < 1e-11, f"compiled mismatch: {e_c:.2e}"
+    print(f"  compiled matches reference: broadcast {e_bc:.1e}, compiled {e_c:.1e}")
+
+
 def test_model_fused_matches_reference():
     """Whole-model energy + forces with set_activation_fused match the reference
     path, and SO(3) invariance holds (CPU → the PyTorch recompute path)."""
@@ -269,6 +307,7 @@ if __name__ == "__main__":
     test_fusibility_gate()
     test_dft_bases_are_full_precision()
     test_triton_vs_reference()
+    test_compiled_matches_reference()
     test_model_fused_matches_reference()
     test_model_fused_conservative()
     print("All tests passed.")

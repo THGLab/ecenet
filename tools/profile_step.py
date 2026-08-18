@@ -31,6 +31,12 @@ parser.add_argument('--n_time',     type=int, default=10)
 parser.add_argument('--fuse_nonlin', action='store_true',
                     help='Enable the fused recompute-in-backward RealSpaceNonlinearity '
                          '(set_activation_fused; Triton on CUDA+silu, else PyTorch).')
+parser.add_argument('--compile_nonlin', action='store_true',
+                    help='Route RealSpaceNonlinearity through torch.compile '
+                         '(broadcast-sum form; experimental A/B against '
+                         '--fuse_nonlin, and takes precedence over it if both '
+                         'are set). First call pays the compile — keep '
+                         '--n_warmup at 3+.')
 parser.add_argument('--edge_frame_fused', action='store_true',
                     help='Enable the fused gather+Wigner-rotate+reshape edge-frame op '
                          '(set_edge_frame_fused; Triton on CUDA+float32, else eager '
@@ -68,6 +74,13 @@ if args.fuse_nonlin:
     model.set_activation_fused(True)
     n_set = sum(1 for m in model.modules() if getattr(m, 'fused', False))
     print(f"[fuse_nonlin] fused RealSpaceNonlinearity on {n_set} module(s)")
+
+if args.compile_nonlin:
+    model.set_activation_compiled(True)
+    n_set = sum(1 for m in model.modules() if getattr(m, 'compiled', False))
+    note = ' (takes precedence over --fuse_nonlin)' if args.fuse_nonlin else ''
+    print(f"[compile_nonlin] torch.compile'd RealSpaceNonlinearity on "
+          f"{n_set} module(s){note}; first call compiles")
 
 if args.edge_frame_fused:
     from ecenet.edge_frame_kernel import _HAS_TRITON as _ef_triton
