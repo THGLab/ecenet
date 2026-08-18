@@ -41,6 +41,8 @@ try:
 except ImportError:                       # CPU-only / no-triton env → PyTorch path
     _HAS_TRITON = False
 
+_RS_BLOCK = 128                           # rows (edge·feature) per program; tunable
+
 
 def is_fusible(nl):
     """True if a RealSpaceNonlinearity uses the common path the fused code covers:
@@ -87,26 +89,10 @@ def realspace_reference(A_cos, A_sin, cos_synth, sin_synth,
 
 if _HAS_TRITON:
 
-    # BLOCK only tiles the independent rows and the reductions are per-row, so
-    # every config computes the same values — the tuner picks latency, not math.
-    # Stores are plain (no atomics), so re-running configs on the live buffers
-    # during benchmarking is harmless. Keyed on the row count's magnitude
-    # (R_BUCKET = bit_length) rather than R itself: n_edges varies per batch,
-    # and re-benchmarking on every new R would swamp the win.
-    _RS_CONFIGS = [
-        triton.Config({'BLOCK': 128}, num_warps=2),
-        triton.Config({'BLOCK': 128}, num_warps=4),
-        triton.Config({'BLOCK': 256}, num_warps=4),
-        triton.Config({'BLOCK': 512}, num_warps=4),
-        triton.Config({'BLOCK': 512}, num_warps=8),
-        triton.Config({'BLOCK': 1024}, num_warps=8),
-    ]
-
-    @triton.autotune(configs=_RS_CONFIGS, key=['R_BUCKET', 'N_ANG', 'N_GRID'])
     @triton.jit
     def _rs_fwd_kernel(acos_ptr, asin_ptr, cs_ptr, ss_ptr, ca_ptr, sa_ptr,
                        oc_ptr, os_ptr,
-                       R, R_BUCKET, n_ang, n_grid, s_row, s_col,
+                       R, n_ang, n_grid, s_row, s_col,
                        BLOCK: tl.constexpr, N_ANG: tl.constexpr, N_GRID: tl.constexpr):
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)   # row = edge·feature
         mask = offs < R
@@ -135,11 +121,10 @@ if _HAS_TRITON:
             tl.store(oc_ptr + offs * s_row + a * s_col, oc, mask=mask & (a < n_ang))
             tl.store(os_ptr + offs * s_row + a * s_col, os, mask=mask & (a < n_ang))
 
-    @triton.autotune(configs=_RS_CONFIGS, key=['R_BUCKET', 'N_ANG', 'N_GRID'])
     @triton.jit
     def _rs_bwd_kernel(acos_ptr, asin_ptr, cs_ptr, ss_ptr, ca_ptr, sa_ptr,
                        goc_ptr, gos_ptr, dac_ptr, das_ptr,
-                       R, R_BUCKET, n_ang, n_grid, s_row, s_col,
+                       R, n_ang, n_grid, s_row, s_col,
                        BLOCK: tl.constexpr, N_ANG: tl.constexpr, N_GRID: tl.constexpr):
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offs < R
@@ -201,11 +186,10 @@ def _realspace_forward_triton(A_cos, A_sin, cos_synth, sin_synth,
     oc = torch.empty(R, n_ang, device=A_cos.device, dtype=torch.float32)
     os = torch.empty_like(oc)
     N_ANG, N_GRID = triton.next_power_of_2(n_ang), triton.next_power_of_2(n_grid)
-    grid = lambda META: (triton.cdiv(R, META['BLOCK']),)  # noqa: E731
+    grid = (triton.cdiv(R, _RS_BLOCK),)
     _rs_fwd_kernel[grid](acos, asin, cs, ss, ca, sa, oc, os,
-                         R, max(R, 1).bit_length(), n_ang, n_grid,
-                         acos.stride(0), acos.stride(1),
-                         N_ANG=N_ANG, N_GRID=N_GRID)
+                         R, n_ang, n_grid, acos.stride(0), acos.stride(1),
+                         BLOCK=_RS_BLOCK, N_ANG=N_ANG, N_GRID=N_GRID)
     out = lambda t: t.reshape(n_e, F, n_ang).to(A_cos.dtype)  # noqa: E731
     return out(oc), out(os)
 
@@ -222,11 +206,10 @@ def _realspace_backward_triton(g_out_cos, g_out_sin, A_cos, A_sin,
     dac = torch.empty(R, n_ang, device=A_cos.device, dtype=torch.float32)
     das = torch.empty_like(dac)
     N_ANG, N_GRID = triton.next_power_of_2(n_ang), triton.next_power_of_2(n_grid)
-    grid = lambda META: (triton.cdiv(R, META['BLOCK']),)  # noqa: E731
+    grid = (triton.cdiv(R, _RS_BLOCK),)
     _rs_bwd_kernel[grid](acos, asin, cs, ss, ca, sa, goc, gos, dac, das,
-                         R, max(R, 1).bit_length(), n_ang, n_grid,
-                         acos.stride(0), acos.stride(1),
-                         N_ANG=N_ANG, N_GRID=N_GRID)
+                         R, n_ang, n_grid, acos.stride(0), acos.stride(1),
+                         BLOCK=_RS_BLOCK, N_ANG=N_ANG, N_GRID=N_GRID)
     out = lambda t: t.reshape(n_e, F, n_ang).to(A_cos.dtype)  # noqa: E731
     return out(dac), out(das)
 
