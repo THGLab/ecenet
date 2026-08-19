@@ -26,7 +26,6 @@ import torch
 from ecenet.equivariant import RealSpaceNonlinearity
 from ecenet.realspace_kernel import (
     RealSpaceFused,
-    fuse_realspace,
     is_fusible,
     realspace_reference,
 )
@@ -49,7 +48,9 @@ def test_forward_equivalence():
     nl = make_nl()
     A_cos, A_sin = make_inputs()
     oc_ref, os_ref = nl(A_cos, A_sin)
-    oc_fus, os_fus = fuse_realspace(nl, A_cos, A_sin)
+    nl.fused = True
+    oc_fus, os_fus = nl(A_cos, A_sin)
+    nl.fused = False
     # …and the standalone reference fn matches too (same spec).
     oc_r, os_r = realspace_reference(A_cos, A_sin, nl.cos_synth, nl.sin_synth,
                                      nl.cos_analysis, nl.sin_analysis,
@@ -74,7 +75,9 @@ def test_backward_equivalence():
         return a.grad, b.grad
 
     ref = grads(lambda a, b: nl(a, b))
-    fus = grads(lambda a, b: fuse_realspace(nl, a, b))
+    nl.fused = True
+    fus = grads(lambda a, b: nl(a, b))
+    nl.fused = False
     worst = 0.0
     for name, r, f in zip(("dA_cos", "dA_sin"), ref, fus):
         e = (r - f).abs().max().item()
@@ -131,7 +134,8 @@ def test_fusibility_gate():
     A_cos, A_sin = make_inputs(seed=3)
     nl.mix_channels = True
     ref = nl(A_cos, A_sin)                             # module forward, unaffected
-    fb = fuse_realspace(nl, A_cos, A_sin)              # gate → falls back to nl()
+    nl.fused = True
+    fb = nl(A_cos, A_sin)                              # gate → reference path
     assert torch.equal(ref[0], fb[0]) and torch.equal(ref[1], fb[1])
     print("  fusibility gate: common path fuses; variants report not-fusible")
 

@@ -265,13 +265,3 @@ class RealSpaceFused(torch.autograd.Function):
         dA_cos = df @ cos_synth.transpose(-1, -2)           # (n_e, F, n_ang)
         dA_sin = df @ sin_synth.transpose(-1, -2)
         return dA_cos, dA_sin, None, None, None, None, None
-
-
-def fuse_realspace(nl, A_cos, A_sin):
-    """Run ``RealSpaceNonlinearity`` ``nl`` via the fused path when its config is
-    the common one, else fall back to its own forward. Convenience wrapper used
-    by the model integration."""
-    if not is_fusible(nl):
-        return nl(A_cos, A_sin)
-    return RealSpaceFused.apply(A_cos, A_sin, nl.cos_synth, nl.sin_synth,
-                                nl.cos_analysis, nl.sin_analysis, nl.activation)

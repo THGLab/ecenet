@@ -44,8 +44,3 @@ def build_type_map(atomic_numbers):
 def to_element_to_type(type_map):
     """``{atomic_number: idx}`` → ``{symbol: idx}`` (the checkpoint form)."""
     return {symbol(z): idx for z, idx in type_map.items()}
-
-
-def to_type_map(element_to_type):
-    """``{symbol: idx}`` → ``{atomic_number: idx}``."""
-    return {number(sym): idx for sym, idx in element_to_type.items()}
