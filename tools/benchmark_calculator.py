@@ -250,6 +250,8 @@ def main():
                'n_atoms': n_atoms,
                'dtype': 'float32' if args.float32 else 'default/float64',
                'fuse': args.fuse, 'device': gpu,
+               'host': os.uname().nodename,  # login vs compute node — shared-GPU
+                                             # login timings are contended garbage
                'torch': torch.__version__ if torch is not None else '',
                'sp_ms': round(sp_ms, 3),
                'sp_us_per_atom': round(sp_ms / n_atoms * 1000, 3),
