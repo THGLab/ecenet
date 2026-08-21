@@ -292,9 +292,25 @@ def test_les_calculator():
                                l0_is_charge=True, les_dipole=True).sum()
         assert abs(float(e_lr)) > 0, "E_lr is identically zero in the test"
 
+        # latent charges + dipoles are stashed on every force call: q is the
+        # packed l0's first column (edge mode), u the remaining three
+        l0_np = l0.detach().numpy()
+        q_calc = atoms.get_charges()
+        dq = np.abs(q_calc - l0_np[:, 0]).max()
+        du = np.abs(calc.results['les_dipoles'] - l0_np[:, 1:4]).max()
+        assert dq < 1e-12, f"exposed charges != l0[:, 0]: {dq:.3e}"
+        assert du < 1e-12, f"exposed dipoles != l0[:, 1:4]: {du:.3e}"
+        assert abs(float(np.abs(q_calc).max())) > 0, \
+            "latent charges identically zero in the test"
+
         # analytic stress vs FD: deform positions AND cell (x → x·(1+ε)),
         # which is exactly what the strain pass differentiates
         stress_v = atoms.get_stress()   # Voigt [xx, yy, zz, yz, xz, xy]
+        # the strain pass evaluates at ε = 0 (unstrained geometry), so the
+        # stress call leaves the stashed charges unchanged
+        dq_strain = np.abs(calc.results['charges'] - q_calc).max()
+        assert dq_strain < 1e-12, \
+            f"stress call perturbed the stashed charges: {dq_strain:.3e}"
         V = abs(np.linalg.det(s['cell']))
         eps = 1e-6
         max_err = 0.0
@@ -312,6 +328,66 @@ def test_les_calculator():
             max_err = max(max_err, abs(fd - stress_v[vi]))
         assert max_err < 1e-7, f"stress FD mismatch (incl. Ewald): {max_err:.2e}"
 
+        # Born effective charges on the PERIODIC box — the Berry-phase path
+        # eval_spice_bec never exercised (it ran cell=None only).
+        na = len(atoms)
+        Z = calc.compute_bec(atoms)
+        assert Z.shape == (na, 3, 3) and np.isfinite(Z).all()
+        bec_mod = calc.les_module.les.bec
+        cell64 = torch.tensor(s['cell'], dtype=DTYPE)
+
+        # exact identity: with q fixed (no charge flow) the dephasing +
+        # projection must give Z* = (q − q̄) ⊗ I to machine precision
+        q_fix = torch.tensor(np.linspace(-0.3, 0.4, na), dtype=DTYPE)
+        pos_g = torch.tensor(s['positions'], dtype=DTYPE, requires_grad=True)
+        Z_fix = bec_mod(q=q_fix, r=pos_g, cell=cell64.view(1, 3, 3))
+        q_eff = (q_fix - q_fix.mean() if bec_mod.remove_mean else q_fix)
+        expect = (q_eff.numpy()[:, None, None] * np.eye(3)
+                  * bec_mod.normalization_factor)
+        d_id = np.abs(Z_fix.detach().numpy() - expect).max()
+        assert d_id < 1e-10, f"periodic static-charge identity: {d_id:.3e}"
+
+        # FD INCLUDING charge flow: finite-difference the complex
+        # polarization (model q and u recomputed at each displaced geometry,
+        # frozen topology), dephase with the reference phases, project —
+        # exactly what upstream's analytic grad computes
+        ei0, ej0, she0, ni0, nj0, shn0 = calc._neighbor_lists(
+            torch.tensor(s['positions'], dtype=DTYPE), s['cell'])
+
+        def pol(pos_np):
+            p = torch.tensor(pos_np, dtype=DTYPE)
+            with torch.no_grad():
+                _, l0p = calc.model.forward_pbc(
+                    p, types, ei0, ej0, she0, ni0, nj0, shn0,
+                    return_embeddings=True, l0_only=True)
+            qp = l0p[:, 0:1]
+            if bec_mod.remove_mean:
+                qp = qp - qp.mean(dim=0, keepdim=True)
+            P, phase, proj = bec_mod.compute_pol_pbc(p, qp, cell64)
+            P = P * bec_mod.normalization_factor
+            P_u = l0p[:, 1:4].sum(0) * bec_mod.normalization_factor
+            return P.numpy(), P_u.numpy(), phase.numpy(), proj.numpy()
+
+        _, _, phase0, proj0 = pol(s['positions'])
+        eps_fd = 1e-5
+        Z_fd = np.zeros((na, 3, 3))
+        for i in range(na):
+            for b in range(3):
+                dp = s['positions'].copy(); dm = s['positions'].copy()
+                dp[i, b] += eps_fd; dm[i, b] -= eps_fd
+                Pp, Pup, _, _ = pol(dp)
+                Pm, Pum, _, _ = pol(dm)
+                dP  = (Pp - Pm) / (2 * eps_fd)     # complex (3,)
+                dPu = (Pup - Pum) / (2 * eps_fd)   # real (3,)
+                zb = (dP * np.conj(phase0[i])).real
+                Z_fd[i, :, b] = proj0 @ zb + dPu
+        d_bec = np.abs(Z_fd - Z).max()
+        assert d_bec < 1e-6, f"periodic BEC vs FD (incl. charge flow): {d_bec:.3e}"
+        # charge flow is actually in the number (Z* is not diagonal)
+        off = np.abs(Z - np.trace(Z, axis1=1, axis2=2)[:, None, None]
+                     / 3 * np.eye(3)).max()
+        assert off > 0, "BEC has no off-diagonal/flow structure in the test"
+
         # pbc=False → isolated path
         atoms_free = Atoms(numbers=s['numbers'], positions=s['positions'])
         atoms_free.calc = calc
@@ -324,6 +400,8 @@ def test_les_calculator():
                                                les_dipole=True).sum()
         dfree = abs(e_free - (float(e_man_f) + e_ref_sum))
         assert dfree < 1e-10, f"isolated path mismatch: {dfree:.3e}"
+        Z_free = calc.compute_bec(atoms_free)
+        assert Z_free.shape == (na, 3, 3) and np.isfinite(Z_free).all()
 
         # a short-range checkpoint is refused
         ckpt_sr = os.path.join(td, 'sr.mdl')
@@ -337,7 +415,9 @@ def test_les_calculator():
         except ValueError as e:
             assert 'les' in str(e).lower()
     print(f"  energy/forces == manual joint graph (dE={de:.1e}, dF={df:.1e}); "
-          f"stress FD {max_err:.1e}; isolated path {dfree:.1e}; SR refused\n")
+          f"charges/dipoles exposed (dq={dq:.1e}, du={du:.1e}); "
+          f"stress FD {max_err:.1e}; periodic BEC identity {d_id:.1e}, "
+          f"FD {d_bec:.1e}; isolated path {dfree:.1e}; SR refused\n")
 
 
 def test_tensorize_keeps_cell():

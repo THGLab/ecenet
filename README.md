@@ -312,6 +312,25 @@ print(atoms.get_potential_energy())   # E_sr + E_lr, eV
 It refuses short-range checkpoints (symmetric with `ECENetCalculator`
 refusing LES ones).
 
+Every force call also exposes the per-atom latent charges — they are computed
+on the way to `E_lr` anyway — via `atoms.get_charges()` (and, for `les_dipole`
+checkpoints, the latent atomic dipoles as `calc.results['les_dipoles']`).
+`run_md_xyz --dump_charges` writes them onto every dumped frame as `les_q` /
+`les_u` extxyz columns, giving charge/dipole trajectories along MD for free
+(extxyz output only — ASE's `.traj` format drops custom per-atom arrays). The
+global sign of the latent charges is arbitrary (`E_lr` is quadratic in `q`):
+consistent within a checkpoint, not physically pinned.
+
+`calc.compute_bec(atoms)` returns the Born effective charges `Z* = ∂P/∂r`
+as an `(N, 3, 3)` array, charge-flow terms included (upstream's BEC module
+does the differentiation — Berry-phase polarization for periodic cells,
+direct sum otherwise; verified against finite differences of the
+polarization on a periodic box, charge flow included, in
+`tests/test_xyz_trainer.py`). Unlike the charges this cannot ride along the
+force call — it runs its own forward plus three backward passes (≈ 4 force
+calls). `run_md_xyz --dump_bec` writes it per dumped frame as a per-atom
+`bec` column of 9 row-major components (the `les_fit` reference layout).
+
 The other two trainers take `use_les=True` as well. `train_ecenet_mptrj`
 runs the **periodic** path: one batched LES call per step over the
 concatenated atoms with the stacked cells (reciprocal-space Ewald per

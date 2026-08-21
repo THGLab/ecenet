@@ -42,7 +42,8 @@ def run_md_xyz(checkpoint, xyz, cell=None, frame_idx=-1, seed=0, ensemble='nvt',
                temperature=300, timestep=0.5, friction=0.01, n_steps=10000,
                log_every=100, output='traj.xyz', log='md.log', device=None,
                float32=False, energy_units=None, log_timings=False,
-               fuse_nonlin=False, edge_frame_fused=False, tf32=False):
+               fuse_nonlin=False, edge_frame_fused=False, tf32=False,
+               dump_charges=False, dump_bec=False):
     """Run NVT/NVE MD from an arbitrary xyz file.
 
     Importable entry point (see main() for the equivalent CLI). Writes a
@@ -77,6 +78,17 @@ def run_md_xyz(checkpoint, xyz, cell=None, frame_idx=-1, seed=0, ensemble='nvt',
     calc = load_calculator(checkpoint, device=device, dtype=dtype,
                            energy_units=energy_units, log_timings=log_timings)
     atoms.calc = calc
+
+    if (dump_charges or dump_bec) and 'charges' not in calc.implemented_properties:
+        raise ValueError(
+            "--dump_charges/--dump_bec need a joint-LES checkpoint (the "
+            "latent charges come from the LES head); this checkpoint loaded "
+            f"a short-range {type(calc).__name__}.")
+    if (dump_charges or dump_bec) and output.endswith('.traj'):
+        raise ValueError(
+            "--dump_charges/--dump_bec need an extended-xyz output: ASE's "
+            ".traj format silently drops custom per-atom arrays "
+            "(les_q / les_u / bec). Use --output traj.xyz.")
 
     # Fused kernels (opt-in). MD is forces-only (single backward), so both are
     # safe here; edge_frame_fused enables the MP pack/unrotate fusion with it
@@ -117,12 +129,29 @@ def run_md_xyz(checkpoint, xyz, cell=None, frame_idx=-1, seed=0, ensemble='nvt',
             timestep=timestep * units.fs,
         )
 
-    # Trajectory writer
+    # Trajectory writer. With dump_charges, copy the latent charges (and,
+    # for les_dipole checkpoints, the atomic dipoles) from the calculator's
+    # last force call into per-atom arrays, so the extxyz writer emits them
+    # as les_q / les_u columns (guarded above: .traj drops custom arrays).
+    # dump_bec additionally computes the Born effective charges per dumped
+    # frame (its own forward + 3 backwards — not free like the charges) and
+    # writes them as a bec column of 9 row-major components per atom, the
+    # same layout as the les_fit reference files.
+    def dump_les_arrays():
+        if dump_charges:
+            atoms.set_array('les_q', calc.results['charges'])
+            if 'les_dipoles' in calc.results:
+                atoms.set_array('les_u', calc.results['les_dipoles'])
+        if dump_bec:
+            atoms.set_array('bec', calc.compute_bec(atoms).reshape(-1, 9))
+
     if output.endswith('.traj'):
         traj = Trajectory(output, 'w', atoms)
         dyn.attach(traj.write, interval=log_every)
     else:
         def write_frame():
+            if dump_charges or dump_bec:
+                dump_les_arrays()
             write(output, atoms, append=True)
         dyn.attach(write_frame, interval=log_every)
 
@@ -199,6 +228,21 @@ def main():
                         help='Fused RealSpaceNonlinearity (Triton on CUDA+silu)')
     parser.add_argument('--edge_frame_fused', action='store_true',
                         help='Fused edge-frame + MP pack/unrotate (Triton on CUDA+fp32)')
+    parser.add_argument('--dump_charges', action='store_true',
+                        help='Write the LES latent charges (les_q) — and, for '
+                             'les_dipole checkpoints, the latent atomic '
+                             'dipoles (les_u) — as per-atom arrays on every '
+                             'dumped frame. Joint-LES checkpoints only. Note '
+                             'the global sign of the latent charges is '
+                             'arbitrary (E_lr is quadratic in q).')
+    parser.add_argument('--dump_bec', action='store_true',
+                        help='Compute the Born effective charges Z* = dP/dr '
+                             '(charge-flow terms included) on every dumped '
+                             'frame and write them as a per-atom bec column '
+                             'of 9 row-major components. Joint-LES '
+                             'checkpoints only; costs one extra forward + 3 '
+                             'backwards per dumped frame. Same arbitrary '
+                             'global sign as the latent charges.')
     parser.add_argument('--tf32', action='store_true',
                         help='Route float32 matmuls to TF32 tensor cores (Ampere+); '
                              'no effect without --float32. The fused Triton kernels '

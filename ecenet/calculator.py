@@ -359,25 +359,28 @@ class ECENetCalculator(Calculator):
         s = grads[1] if grads[1] is not None else torch.zeros_like(strain)
         return energy_tensor, f, s
 
-    def _compute_pbc(self, atoms, pos, types, need_stress):
-        """Energy / forces (+ optional stress) for a periodic system.
+    def _types(self, symbols):
+        """Element symbols → model type indices, rejecting unsupported ones."""
+        unsupported = set(s for s in symbols if s not in self.element_to_type)
+        if unsupported:
+            raise ValueError(f"Unsupported elements: {unsupported}. "
+                             f"Supported: {list(self.element_to_type)}")
+        return torch.tensor(
+            [self.element_to_type[s] for s in symbols],
+            dtype=torch.long, device=self.device)
 
-        Builds the edge and neighbour lists, then evaluates the model (with
-        strain-based stress if requested). The list flavour is chosen per
-        cell: the fast minimum-image list when the cutoff sphere fits inside
-        half the cell's minimum perpendicular width (typical MD boxes), and
-        the all-images list — every periodic copy within the cutoff,
-        self-image edges included, exactly the topology the trainers build —
-        when it does not (small crystal cells: ~97% of MPtrj/WBM frames).
-        The two are identical wherever MIC is valid.
+    def _neighbor_lists(self, pos, cell):
+        """Edge + neighbour lists for a periodic cell.
 
-        Returns ``(energy_tensor, forces_tensor, stress_grad, n_edges, t_nl)``;
-        ``stress_grad`` is None when stress was not requested and ``t_nl`` is the
-        post-neighbour-list timestamp (None unless ``log_timings``).
+        The list flavour is chosen per cell: the fast minimum-image list when
+        the cutoff sphere fits inside half the cell's minimum perpendicular
+        width (typical MD boxes), and the all-images list — every periodic
+        copy within the cutoff, self-image edges included, exactly the
+        topology the trainers build — when it does not (small crystal cells:
+        ~97% of MPtrj/WBM frames). The two are identical wherever MIC is
+        valid.
         """
         from ecenet.radial import min_perpendicular_width, torch_neighbor_list
-
-        cell = atoms.get_cell().array  # (3, 3), rows = lattice vectors
 
         max_cut = max(self.model.r_cut_edge, self.model.r_cut_neighbor)
         if max_cut > 0.5 * min_perpendicular_width(cell):
@@ -391,6 +394,21 @@ class ECENetCalculator(Calculator):
                 pos.detach(), cell, self.model.r_cut_edge)
             nb_src, nb_dst, shift_vecs_nb = self._gpu_neighbor_list(
                 pos.detach(), cell, self.model.r_cut_neighbor)
+        return edge_i, edge_j, shift_vecs_edge, nb_src, nb_dst, shift_vecs_nb
+
+    def _compute_pbc(self, atoms, pos, types, need_stress):
+        """Energy / forces (+ optional stress) for a periodic system.
+
+        Builds the edge and neighbour lists (see ``_neighbor_lists``), then
+        evaluates the model (with strain-based stress if requested).
+
+        Returns ``(energy_tensor, forces_tensor, stress_grad, n_edges, t_nl)``;
+        ``stress_grad`` is None when stress was not requested and ``t_nl`` is the
+        post-neighbour-list timestamp (None unless ``log_timings``).
+        """
+        cell = atoms.get_cell().array  # (3, 3), rows = lattice vectors
+        (edge_i, edge_j, shift_vecs_edge,
+         nb_src, nb_dst, shift_vecs_nb) = self._neighbor_lists(pos, cell)
 
         t_nl = self._t() if self.log_timings else None
 
@@ -416,17 +434,7 @@ class ECENetCalculator(Calculator):
 
         symbols = atoms.get_chemical_symbols()
         positions_np = atoms.get_positions()  # Å
-
-        # Check all elements are supported
-        unsupported = set(s for s in symbols if s not in self.element_to_type)
-        if unsupported:
-            raise ValueError(f"Unsupported elements: {unsupported}. "
-                             f"Supported: {list(self.element_to_type)}")
-
-        types = torch.tensor(
-            [self.element_to_type[s] for s in symbols],
-            dtype=torch.long, device=self.device
-        )
+        types = self._types(symbols)
         pos = torch.tensor(
             positions_np, dtype=self.dtype, device=self.device
         ).requires_grad_(True)
@@ -502,6 +510,7 @@ class ECENetLESCalculator(ECENetCalculator):
     """
 
     _uses_cell = True
+    implemented_properties = ['energy', 'forces', 'stress', 'charges']
 
     def __init__(self, model, les_module=None, **kwargs):
         """The l0 convention (l0_is_charge / les_dipole) is read off the
@@ -541,11 +550,29 @@ class ECENetLESCalculator(ECENetCalculator):
         return calc
 
     # ── Energy seams: add E_lr on the same graph ────────────────────────────
+    #
+    # Both seams also stash the per-atom latent charges (and, with
+    # ``les_dipole``, the latent atomic dipoles) into ``self.results`` as a
+    # side effect — every force call computes them anyway, so exposing them
+    # is free. ``atoms.get_charges()`` reads ``results['charges']`` (e);
+    # ``results['les_dipoles']`` holds u (N, 3) in e·Å. Stashing is safe in
+    # the strain (stress) pass too: it evaluates at ε = 0, i.e. the
+    # unstrained geometry, so it stores the same numbers. The global sign of
+    # the latent charges is arbitrary (E_lr is quadratic in q) — consistent
+    # within a checkpoint, not physically pinned.
+
+    def _stash_charges(self, q, l0):
+        self.results['charges'] = q.detach().cpu().numpy().reshape(-1)
+        if self.model.les_dipole:
+            self.results['les_dipoles'] = l0[:, 1:4].detach().cpu().numpy()
 
     def _energy_free(self, pos, types):
         e_sr, l0 = self.model.forward(pos, types, return_embeddings=True,
                                       l0_only=True)
-        return e_sr + self.les_module(l0, pos, **self.les_flags).sum()
+        e_lr, q = self.les_module(l0, pos, return_charges=True,
+                                  **self.les_flags)
+        self._stash_charges(q, l0)
+        return e_sr + e_lr.sum()
 
     def _energy_pbc(self, pos, types, edge_i, edge_j, shift_vecs_edge,
                     nb_src, nb_dst, shift_vecs_nb, cell=None):
@@ -553,8 +580,63 @@ class ECENetLESCalculator(ECENetCalculator):
             pos, types, edge_i, edge_j, shift_vecs_edge,
             nb_src, nb_dst, shift_vecs_nb,
             return_embeddings=True, l0_only=True)
-        return e_sr + self.les_module(l0, pos, cell=cell,
-                                      **self.les_flags).sum()
+        e_lr, q = self.les_module(l0, pos, cell=cell, return_charges=True,
+                                  **self.les_flags)
+        self._stash_charges(q, l0)
+        return e_sr + e_lr.sum()
+
+    def compute_bec(self, atoms):
+        """Born effective charges Z* = ∂P/∂r for one structure, (N, 3, 3).
+
+        Puts the positions on the autograd graph, so the latent charges q(r)
+        (and dipoles u(r)) stay functions of the positions and upstream's BEC
+        module delivers the charge-flow terms Σⱼ rⱼ ∂qⱼ/∂rᵢ — the part a
+        static-charge picture misses. Upstream handles the polarization
+        (Berry-phase-style for periodic cells, direct sum otherwise),
+        mean-charge removal, and the √ε∞ normalisation as configured in the
+        checkpoint's ``les_arguments``; with ``les_dipole`` the charge and
+        dipole parts are summed.
+
+        Unlike the latent-charge stash this cannot ride along ``calculate()``
+        — the force backward frees the graph, and Z* needs gradients of the
+        three polarization components — so it runs its own forward plus three
+        backward passes (≈ 4 force calls' cost). Topology is frozen from the
+        detached positions (standard). Same arbitrary global sign as the
+        latent charges. Note the periodic path calls ``torch.linalg.det/inv``
+        on the cell — the float32-CUDA det bug on cu13 torch applies.
+        """
+        symbols = atoms.get_chemical_symbols()
+        types = self._types(symbols)
+        pos = torch.tensor(atoms.get_positions(), dtype=self.dtype,
+                           device=self.device).requires_grad_(True)
+        with torch.enable_grad():
+            if atoms.pbc.any():
+                cell_np = atoms.get_cell().array
+                (edge_i, edge_j, she,
+                 nb_src, nb_dst, shn) = self._neighbor_lists(pos, cell_np)
+                _, l0 = self.model.forward_pbc(
+                    pos, types, edge_i, edge_j, she, nb_src, nb_dst, shn,
+                    return_embeddings=True, l0_only=True)
+                cell_t = torch.tensor(cell_np, dtype=self.dtype,
+                                      device=self.device).view(-1, 3, 3)
+            else:
+                _, l0 = self.model.forward(pos, types, return_embeddings=True,
+                                           l0_only=True)
+                cell_t = None
+            if self.les_flags['l0_is_charge']:
+                q = l0[:, 0]
+                u = l0[:, 1:4] if self.les_flags['les_dipole'] else None
+            else:
+                # upstream's atomwise head maps the l0 descriptor to charges
+                q = self.les_module.les.atomwise(
+                    l0.reshape(l0.shape[0], -1),
+                    torch.zeros(len(symbols), dtype=torch.long,
+                                device=self.device))
+                u = None
+            bec = self.les_module.les.bec(q=q, r=pos, cell=cell_t, u=u)
+        if bec.dim() == 4:              # (N, 2, 3, 3): charge + dipole parts
+            bec = bec.sum(dim=1)
+        return bec.detach().cpu().numpy()
 
 
 def load_calculator(checkpoint_path, verbose=True, **kwargs):
