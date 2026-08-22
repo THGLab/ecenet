@@ -183,6 +183,7 @@ def train_ecenet(
     les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
+    les_charges=True,      # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
     # Joint LES long-range training: E = E_sr + E_lr on one autograd graph
     # (isolated pairwise path — rMD17/MD22 molecules have no cell). NOTE on
     # units: these datasets are in kcal/mol while the LES Coulomb constant is
@@ -285,6 +286,7 @@ def train_ecenet(
         les_readout=les_readout,
         les_charge_scale=les_charge_scale,
         les_dipole=les_dipole,
+        les_charges=les_charges,
     )
     if dtype == torch.float64:
         model = model.double()
@@ -463,6 +465,7 @@ def train_ecenet(
                 les_readout=les_readout,
                 les_charge_scale=les_charge_scale,
                 les_dipole=les_dipole,
+                les_charges=les_charges,
             ),
             # molecule-specific element mapping: {symbol: type_index}
             'element_to_type': elements.to_element_to_type(type_to_idx),

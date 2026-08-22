@@ -282,6 +282,19 @@ kernels exactly as it does `f_qq` (verified against upstream's per-structure
 loop) — but note the dipole–dipole kernel is a `(ΣN)²·3·3` tensor, 9× the
 charge kernel's memory, so dipole runs want smaller atom budgets.
 
+`les_charges=False` (requires `les_dipole=True`; all four trainers and
+`ecenet.ECENet(...)`) is the **dipoles-only** ablation: the head emits only
+the dipole block and the q column of the packed l0 is exactly zero, so
+`E_lr = ½uᵀf_uu u` alone — no monopole–monopole term and no q–u cross-term,
+which also means inter-molecular charge transfer is inexpressible by
+construction. Because that cross-term is what makes the zero-init dipole
+slot trainable, the dipoles-only head gets **standard init** instead (a
+zero-init u would sit on the uu-quadratic energy's gradient-free saddle,
+exactly the charge head's original problem), with `les_charge_scale` now
+acting on u. Everything downstream — wrapper, calculators, dumped `les_q`
+(all zeros), BECs (now pure dipole flow) — works unchanged, since the l0
+layout is untouched.
+
 The SPICE trainer takes the same flags (`use_les=True`, `les_arguments`) and
 trains jointly under DDP: the LES head lives inside the DDP-wrapped forward
 module (so its gradients join the bucket reduction and run on every step,

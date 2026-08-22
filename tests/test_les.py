@@ -358,6 +358,80 @@ def test_edge_dipole():
     print("  dipole read-out: batched variants consistent; non-edge rejected")
 
 
+def test_dipoles_only():
+    """les_charges=False (dipoles-only ablation): the head emits ONLY the
+    dipole block, the q column of the packed l0 is exactly 0, and u is
+    NONZERO at init — standard init, because with the charges gone the
+    qᵀf_qu·u cross-term is gone too and a zero-init dipole head would sit on
+    the uu-quadratic ∂E/∂u ∝ u saddle. Also: u equivariant / bond-span
+    confined, les_charge_scale acts on u, E_lr equals the pure dipole-dipole
+    term, the head sees a gradient at init, and the flag without les_dipole
+    is rejected."""
+    for mode in ('edge', 'edge_basis'):
+        m = make_model(seed=0, les_readout=mode, les_dipole=True,
+                       les_charges=False)
+        pos, types = random_structure()
+        _, l0 = m(pos, types, return_embeddings=True, l0_only=True)
+        assert l0.shape == (len(types), 4), f"{mode}: {tuple(l0.shape)}"
+        assert l0[:, 0].abs().max() == 0.0, f"{mode}: q must be exactly 0"
+        assert l0[:, 1:].abs().max() > 0, \
+            f"{mode}: u must be nonzero at init (standard init — saddle)"
+
+        # SO(3): u vector-equivariant; planar structure → u_z = 0 exactly
+        Q = rand_rotation()
+        _, l0b = m(pos @ Q.T, types, return_embeddings=True, l0_only=True)
+        du = (l0[:, 1:] @ Q.T - l0b[:, 1:]).abs().max()
+        assert du < TOL, f"{mode}: u not vector-equivariant: {du:.3e}"
+        g = torch.Generator().manual_seed(9)
+        pos_p = torch.randn(6, 3, generator=g, dtype=DTYPE) * 1.8
+        pos_p[:, 2] = 0.0
+        _, l0p = m(pos_p, types, return_embeddings=True, l0_only=True)
+        assert l0p[:, 0].abs().max() == 0.0
+        assert l0p[:, 3].abs().max() < TOL, \
+            f"{mode}: planar structure has out-of-plane dipole"
+
+        # les_charge_scale now acts on the dipole
+        m2 = make_model(seed=0, les_readout=mode, les_dipole=True,
+                        les_charges=False, les_charge_scale=0.1)
+        _, l0s = m2(pos, types, return_embeddings=True, l0_only=True)
+        ds = (l0s - 0.1 * l0).abs().max()
+        assert ds < TOL, f"{mode}: les_charge_scale on u broken: {ds:.3e}"
+        print(f"  {mode}+dipoles-only: q ≡ 0, u ≠ 0 at init, equivariant "
+              f"({du:.1e}), planar → u_z=0, scale acts on u")
+
+    if HAVE_LES:
+        # E_lr equals the pure dipole-dipole term (upstream fed q = 0
+        # directly), and the head has a nonzero gradient at init — the
+        # standard init really is off the saddle
+        m = make_model(seed=0, les_readout='edge_basis', les_dipole=True,
+                       les_charges=False)
+        lr = LESLongRange().double()
+        pos, types = random_structure()
+        _, l0 = m(pos, types, return_embeddings=True, l0_only=True)
+        e = lr(l0, pos, **m.les_flags)
+        batch0 = torch.zeros(len(types), dtype=torch.long)
+        e_uu = lr.les(latent_charges=torch.zeros(len(types), dtype=DTYPE),
+                      latent_dipoles=l0[:, 1:4].detach(), positions=pos,
+                      cell=None, batch=batch0, compute_energy=True)['E_lr']
+        d = (e.sum() - e_uu.sum()).abs()
+        assert d < 1e-10, f"E_lr != pure uu term: {d:.3e}"
+        assert float(e.abs().sum()) > 0, "E_lr identically zero at init"
+        e.sum().backward()
+        gmax = max(float(p.grad.abs().max())
+                   for p in m.les_edge_charge.parameters()
+                   if p.grad is not None)
+        assert gmax > 0, "dipole head has zero gradient at init (saddle)"
+        print(f"  E_lr == pure uu term ({float(d):.1e}); "
+              f"head grad at init {gmax:.2e}")
+
+    try:
+        ECENet(**COMMON, les_readout='edge_basis', les_charges=False)
+        raise AssertionError("les_charges=False without les_dipole should raise")
+    except ValueError as err:
+        assert 'les_charges' in str(err)
+    print("  dipoles-only: les_charges=False without les_dipole rejected")
+
+
 def test_edge_dipole_les_energy():
     """Wrapper with les_dipole: the VECTORIZED isolated path (masked
     f_qq/f_qu/f_uu on the concatenated batch) equals upstream's per-structure
@@ -603,6 +677,7 @@ if __name__ == "__main__":
     test_softmax_readout_variants_consistent()
     test_edge_readout_model()
     test_edge_dipole()
+    test_dipoles_only()
     test_edge_dipole_les_energy()
     test_edge_readout_les_energy()
     test_les_readout_validation()

@@ -162,6 +162,7 @@ class ECENet(nn.Module):
         les_readout: str = 'sum',
         les_charge_scale: float = 1.0,
         les_dipole: bool = False,
+        les_charges: bool = True,
     ):
         super().__init__()
         if mp_type == 'transformer':
@@ -261,7 +262,21 @@ class ECENet(nn.Module):
                 f"les_dipole=True requires les_readout='edge' or 'edge_basis' "
                 f"(got {les_readout!r}): the dipole is emitted by the per-edge "
                 "charge head, which the atomwise read-outs don't have.")
+        # les_charges=False: dipoles-only ablation — the head emits ONLY the
+        # dipole block and the q column of the packed l0 is hard zero, so
+        # E_lr = ½uᵀf_uu·u alone (the f_qq and f_qu terms vanish identically
+        # at q = 0 and the wrapper/calculators/tools need no changes). With
+        # the charges gone the qᵀf_qu·u cross-term that un-saddles the
+        # zero-init dipole slot is gone too — ∂E_lr/∂u ∝ u — so the dipole
+        # block gets STANDARD init here (the 'edge' charge-head saddle note,
+        # transplanted), with les_charge_scale now acting on u.
+        if not les_charges and not les_dipole:
+            raise ValueError(
+                "les_charges=False requires les_dipole=True (dipoles-only "
+                "read-out): with both off there is no latent multipole left "
+                "for the LES energy.")
         self.les_dipole = bool(les_dipole)
+        self.les_charges = bool(les_charges)
         self._l0_dim = (4 if les_dipole else 1) if _edge_mode else 2 * embed_dim
         # les_charge_scale: fixed multiplier on the edge-mode latent charge
         # — the whole packed [q | u] when les_dipole is on, keeping the q–u
@@ -288,11 +303,14 @@ class ECENet(nn.Module):
             nn.init.zeros_(self.les_score.weight)
             nn.init.zeros_(self.les_score.bias)
         elif les_readout == 'edge':
-            self.les_edge_charge = nn.Linear(2 * embed_dim,
-                                             2 if les_dipole else 1, bias=False)
-            if les_dipole:
+            n_head_out = (2 if les_dipole else 1) if les_charges else 1
+            self.les_edge_charge = nn.Linear(2 * embed_dim, n_head_out,
+                                             bias=False)
+            if les_dipole and les_charges:
                 with torch.no_grad():
                     self.les_edge_charge.weight[1].zero_()   # dipole slot
+            # les_charges=False: the single (standard-init) row IS the dipole
+            # scalar — zero-init would sit on the uu-quadratic saddle (above)
         # (the 'edge_basis' head is built with the output MLP below)
 
         # ── Element(+distance)-conditioned FiLM gate (optional) ───────────────
@@ -417,14 +435,17 @@ class ECENet(nn.Module):
         # last layer widens to a second n_output_out block (dipole channels,
         # dotted with the same radial basis), zero-init per the note above.
         if les_readout == 'edge_basis':
-            q_dims = mlp_dims[:-1] + [n_output_out * (2 if les_dipole else 1)]
+            n_blocks = (2 if les_dipole else 1) if les_charges else 1
+            q_dims = mlp_dims[:-1] + [n_output_out * n_blocks]
             self.les_edge_charge = OutputMLP(q_dims, activation=act(),
                                              zero_init_last=False)
-            if les_dipole:
+            if les_dipole and les_charges:
                 with torch.no_grad():
                     last = self.les_edge_charge.linears[-1]
                     last.weight[n_output_out:].zero_()       # dipole block
                     last.bias[n_output_out:].zero_()
+            # les_charges=False: the single (standard-init) block IS the
+            # dipole — see the saddle note at the les_charges check above
 
         # ── Per-type atomic energy baseline ──────────────────────────────
         self.atomic_energy = nn.Parameter(torch.zeros(n_types))
@@ -677,7 +698,14 @@ class ECENet(nn.Module):
             else:
                 out = self.les_edge_charge(h_l0)               # (E, 1 | 2)
             if self.les_dipole:
-                h_l0 = torch.cat([out[:, :1], out[:, 1:2] * r_hat], dim=1)
+                if self.les_charges:
+                    h_l0 = torch.cat([out[:, :1], out[:, 1:2] * r_hat], dim=1)
+                else:
+                    # dipoles-only: the head's single block is the dipole
+                    # scalar; the q column stays hard zero so the packed
+                    # [q | u] layout — and every consumer of it — is unchanged
+                    h_l0 = torch.cat([torch.zeros_like(out[:, :1]),
+                                      out[:, :1] * r_hat], dim=1)
             else:
                 h_l0 = out
         elif self.les_readout == 'softmax':
