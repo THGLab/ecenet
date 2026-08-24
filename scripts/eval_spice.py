@@ -145,7 +145,7 @@ def evaluate_by_subset(energy_fn, structures, e_ref, dtype, device, batch_size=8
             'force_mae_mev_ang':   f_mae * 1000,
         }
         print(f"  {subset_name:30s} (n={n:6d}): "
-              f"E={e_mae*1000:6.2f} meV/atom  F={f_mae*1000:6.1f} meV/Å")
+              f"E={e_mae*1000:6.2f} meV/atom  F={f_mae*1000:6.2f} meV/Å")
 
     return results
 
@@ -314,7 +314,7 @@ def main():
     total_n = sum(r['n'] for r in results.values())
     print(f"\n  {'Overall':30s} (n={total_n:6d}): "
           f"E={total_e/total_n*1000:6.2f} meV/atom  "
-          f"F={total_f_num/total_n*1000:6.1f} meV/Å")
+          f"F={total_f_num/total_n*1000:6.2f} meV/Å")
 
 
 if __name__ == '__main__':
