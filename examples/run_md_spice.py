@@ -28,7 +28,7 @@ from ase.io.trajectory import Trajectory
 from ase.md.langevin import Langevin
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
-from ecenet.calculator import ECENetCalculator
+from ecenet.calculator import load_calculator
 from scripts.train_ecenet_spice import ELEMENT_TO_TYPE
 
 _CONFIG_TYPE_RE = re.compile(r'config_type=(?:"([^"]*)"|(\S+))')
@@ -108,13 +108,24 @@ def run_md_spice(checkpoint, xyz='test_large_neut_all.xyz', config_type=None,
                  frame_idx=None, seed=0, temperature=300, timestep=0.5,
                  friction=0.01, n_steps=20000, log_every=100,
                  output='traj.xyz', log='md.log', device=None, float32=False,
-                 log_timings=False):
+                 log_timings=False, fuse_nonlin=False, edge_frame_fused=False, tf32=False):
     """Run NVT Langevin MD from a SPICE xyz starting frame.
 
     Importable entry point (see main() for the equivalent CLI). Writes a
     trajectory to `output` and a step log to `log`; returns the final Atoms.
     """
     dtype  = torch.float32 if float32 else torch.float64
+
+    if tf32:
+        if dtype == torch.float64:
+            print("[tf32] requested but dtype=float64 → no effect (TF32 is "
+                  "float32-only); add --float32 to use it")
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
+            print("[tf32] enabled: float32 matmuls → TF32 tensor cores "
+                  "(A/B energies/forces against a tf32=False run)")
 
     # ── Load starting frame ────────────────────────────────────────────────
     atoms = load_starting_frame(xyz, config_type,
@@ -126,11 +137,22 @@ def run_md_spice(checkpoint, xyz='test_large_neut_all.xyz', config_type=None,
     print(f"Loading checkpoint: {checkpoint}")
     # Newer checkpoints store their own element mapping; pass the SPICE mapping
     # as a fallback so checkpoints saved before that still load here.
-    calc = ECENetCalculator.from_checkpoint(
+    calc = load_calculator(
         checkpoint, device=device, dtype=dtype,
         element_to_type=ELEMENT_TO_TYPE,
         log_timings=log_timings)
     atoms.calc = calc
+
+    # Fused kernels (opt-in). MD is forces-only (single backward), so both are
+    # safe here; edge_frame_fused enables the MP pack/unrotate fusion with it
+    # (the separate e2n knob is a profiling concern — see tools/profile_step.py).
+    if fuse_nonlin:
+        calc.model.set_activation_fused(True)
+        n_set = sum(1 for m in calc.model.modules() if getattr(m, 'fused', False))
+        print(f"[fuse_nonlin] fused RealSpaceNonlinearity on {n_set} module(s)")
+    if edge_frame_fused:
+        calc.model.set_edge_frame_fused(True, e2n=True)
+        print("[edge_frame_fused] fused gather+rotate+reshape (+MP pack/unrotate)")
 
     # Quick sanity check
     e = atoms.get_potential_energy()
@@ -219,6 +241,14 @@ def main():
     parser.add_argument('--float32',      action='store_true')
     parser.add_argument('--log_timings',  action='store_true',
                         help='Print NL/fwd/bwd timings for each step')
+    parser.add_argument('--fuse_nonlin',  action='store_true',
+                        help='Fused RealSpaceNonlinearity (Triton on CUDA+silu)')
+    parser.add_argument('--edge_frame_fused', action='store_true',
+                        help='Fused edge-frame + MP pack/unrotate (Triton on CUDA+fp32)')
+    parser.add_argument('--tf32', action='store_true',
+                        help='Route float32 matmuls to TF32 tensor cores (Ampere+); '
+                             'no effect without --float32. The fused Triton kernels '
+                             'stay IEEE regardless.')
     args = parser.parse_args()
     run_md_spice(**vars(args))
 

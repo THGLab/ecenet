@@ -35,6 +35,7 @@ from ase import units as ase_units
 
 from ecenet import ECENet
 from ecenet.calculator import ECENetCalculator
+from ecenet.equivariant import RealSpaceNonlinearity
 
 torch.manual_seed(0)
 
@@ -299,37 +300,223 @@ def test_from_checkpoint_missing_hparams_raises():
     raise AssertionError("expected ValueError when no hparams are stored")
 
 
-# ── real committed checkpoint (trained weights, not synthetic) ───────────────
+def test_legacy_edge_mp_checkpoint_raises():
+    """Checkpoints trained with the removed mp_type='edge' message passing
+    (identifiable by mp_layers.*.W_msg weights) must fail loudly: those weights
+    have no counterpart in the current MP layers, so a tolerant load would
+    silently run a randomly initialised MP layer and return wrong energies.
 
-_ETHANOL_MDL = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'examples', 'ethanol.mdl')
+    The fixture mirrors the layout of a real dev-era edge-MP checkpoint
+    (hparams incl. the removed n_dist_embed/n_dist_basis keys, W_msg in the
+    state dict); the 8.6 MB real one this replaced was dropped from examples/.
+    The rejection fires on the W_msg key before the model is built, so a
+    minimal state dict exercises the same path."""
+    hp = dict(n_types=3, r_cut_edge=6.0, r_cut_neighbor=5.0, l_max=2, n_max=4,
+              embed_dim=8, n_layers=2, n_max_d=4, n_grid=None,
+              cutoff_type='cosine', activation='silu', use_nonlinearity=True,
+              output_hidden_dims=None, analytic_ace_basis=True,
+              n_dist_embed=0, n_mp=2, n_dist_basis=8)
+    state = {'mp_layers.0.W_msg': torch.zeros(3, 3, 8, dtype=torch.float64)}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'legacy_edge_mp.mdl')
+        torch.save({'model': state, 'hparams': hp,
+                    'element_to_type': {'H': 0, 'C': 1, 'O': 2},
+                    'energy_units': 'kcal/mol'}, path)
+        try:
+            ECENetCalculator.from_checkpoint(path)
+        except ValueError as e:
+            assert 'W_msg' in str(e) and 'edge' in str(e), f"unhelpful message: {e}"
+            print(f"  legacy edge-MP checkpoint rejected: {str(e)[:64]}…")
+        else:
+            raise AssertionError("expected a ValueError for a legacy edge-MP checkpoint")
 
 
-def test_real_ethanol_checkpoint_single_point():
-    """Load the committed ethanol checkpoint (real trained weights) and run a
-    single-point on an ethanol molecule. The synthetic tests use random weights;
-    this exercises from_checkpoint + the molecular path on a real model."""
-    if not os.path.exists(_ETHANOL_MDL):
-        print(f"  [skip] {_ETHANOL_MDL} not present")
-        return
-    from ase.build import molecule
+def test_trainers_save_every_architecture_hparam():
+    """Every ECENet constructor argument that changes the architecture must be in
+    the 'hparams' each trainer saves — from_checkpoint rebuilds the model from
+    that dict alone, so a missing key silently substitutes a default (and, when
+    it changes tensor shapes, makes the checkpoint fail to load at all)."""
+    import ast
+    import inspect
 
-    calc = ECENetCalculator.from_checkpoint(_ETHANOL_MDL)
-    assert calc.element_to_type == {'H': 0, 'C': 1, 'O': 2}
-    assert abs(calc._to_ev - _KCAL) < 1e-15          # rMD17 model → kcal/mol
+    from ecenet import ECENet
 
-    atoms = molecule('CH3CH2OH')                     # 9-atom ethanol (H/C/O)
-    atoms.calc = calc
-    e = atoms.get_potential_energy()
-    f = atoms.get_forces()
-    assert np.isfinite(e)
-    assert f.shape == (len(atoms), 3) and np.isfinite(f).all()
-    print(f"  real ethanol.mdl: {len(atoms)} atoms, E={e:.2f} eV, |F|max={np.abs(f).max():.3f}")
+    # Args that describe the *architecture*. Excluded: n_types (data-derived) and
+    # options that do not affect the built module tree.
+    required = set(inspect.signature(ECENet).parameters) - {'self', 'n_types'}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    trainers = ('train_ecenet.py', 'train_ecenet_spice.py', 'train_ecenet_mptrj.py')
+
+    for name in trainers:
+        tree = ast.parse(open(os.path.join(root, 'scripts', name)).read())
+        saved = set()
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call) and getattr(call.func, 'id', None) == 'dict':
+                keys = {k.arg for k in call.keywords if k.arg}
+                if {'n_types', 'l_max'} <= keys:      # the hparams dict
+                    saved |= keys
+        assert saved, f"{name}: no hparams dict found"
+        missing = sorted(required - saved)
+        assert not missing, f"{name}: hparams omits architecture args {missing}"
+        stale = sorted(saved - required - {'n_types'})
+        assert not stale, f"{name}: hparams saves non-ECENet args {stale}"
+    print(f"  all {len(trainers)} trainers save every architecture hparam "
+          f"({len(required)} args)")
+
+
+def test_legacy_pre_scale_buffers_are_dropped():
+    """RealSpaceNonlinearity used to carry fixed pre_scale=1 / pre_shift=0 buffers
+    and apply them before the activation — an exact identity, never learnable.
+    They are gone, so a checkpoint that still has them must load and give the same
+    energy, not trip the unexpected-key check."""
+    model = _tiny_model(3)
+    state = dict(model.state_dict())
+    assert not any('pre_scale' in k for k in state), "buffers should no longer exist"
+    # forge a pre-removal checkpoint: identity buffers on every nonlinearity
+    n_added = 0
+    for name, mod in model.named_modules():
+        if isinstance(mod, RealSpaceNonlinearity):
+            w = mod.n_features
+            state[f'{name}.pre_scale'] = torch.ones(w, 1, dtype=torch.float64)
+            state[f'{name}.pre_shift'] = torch.zeros(w, 1, dtype=torch.float64)
+            n_added += 2
+    assert n_added > 0, "no nonlinearities found to forge buffers on"
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'legacy_affine.mdl')
+        torch.save({'model': state, 'hparams': dict(n_types=3, n_mp=1, **_HPARAMS),
+                    'element_to_type': {'H': 0, 'C': 1, 'O': 2}}, path)
+        calc = ECENetCalculator.from_checkpoint(path)
+    e_legacy = _energy(calc, _mol())
+    e_direct = _energy(ECENetCalculator(model, element_to_type={'H': 0, 'C': 1, 'O': 2}),
+                       _mol())
+    assert e_legacy == e_direct, \
+        f"dropping the identity buffers changed the energy: {e_legacy} vs {e_direct}"
+    print(f"  legacy checkpoint with {n_added} pre_scale/pre_shift buffers loads, "
+          f"energy unchanged ({e_legacy:.6f} eV)")
+
+
+def test_architecture_mismatch_raises():
+    """A checkpoint whose weights disagree with the architecture rebuilt from
+    'hparams' must raise rather than load a partly random model."""
+    hp = dict(n_types=3, n_mp=2, **_HPARAMS)
+    model = ECENet(**hp).double()
+    # drop a genuine MP parameter → the rebuilt model has no weights for it
+    dropped = 'mp_layers.0.msg_up.weights'
+    assert dropped in model.state_dict(), f"{dropped} is no longer a parameter"
+    state = {k: v for k, v in model.state_dict().items() if k != dropped}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'mismatch.mdl')
+        torch.save({'model': state, 'hparams': hp,
+                    'element_to_type': {'H': 0, 'C': 1, 'O': 2}}, path)
+        try:
+            ECENetCalculator.from_checkpoint(path)
+        except ValueError as e:
+            assert 'do not match' in str(e) and dropped in str(e), f"unhelpful message: {e}"
+            print(f"  architecture mismatch rejected: {str(e)[:60]}…")
+        else:
+            raise AssertionError("expected a ValueError for mismatched weights")
+
+
+def _direct_all_images(model, pos, cell, types_list):
+    """Reference: forward_pbc on the all-images topology (the lists are
+    themselves ASE-verified in test_mptrj_trainer.py)."""
+    from ecenet.radial import torch_neighbor_list
+    pt = torch.tensor(pos, dtype=torch.float64, requires_grad=True)
+    ct = torch.tensor(cell, dtype=torch.float64)
+    types = torch.tensor(types_list, dtype=torch.long)
+    ei, ej, she = torch_neighbor_list(pt.detach(), ct, model.r_cut_edge)
+    ni, nj, shn = torch_neighbor_list(pt.detach(), ct, model.r_cut_neighbor)
+    e = model.forward_pbc(pt, types, ei, ej, she, ni, nj, shn)
+    f = -torch.autograd.grad(e, pt)[0]
+    return e.item(), f.numpy(), len(ei), pt
+
+
+def test_pbc_small_cell_uses_all_images_topology():
+    """Small crystal cells (cutoff > half the minimum perpendicular width —
+    ~97% of MPtrj/WBM frames): the calculator must build the same all-images
+    topology the trainers train on, self-image edges included. The
+    minimum-image shortcut drops periodic-image edges there — this pins the
+    automatic dispatch by matching a direct forward_pbc evaluation."""
+    model = _tiny_model(2)
+    rng = np.random.RandomState(0)
+    cell = np.array([[4.0, 0.3, 0.0], [0.0, 4.2, 0.4], [0.0, 0.0, 3.8]])
+    pos = rng.uniform(0, 1, (4, 3)) @ cell
+    atoms = Atoms(symbols=['H', 'C', 'H', 'C'], positions=pos, cell=cell,
+                  pbc=True)
+    atoms.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                  dtype=torch.float64,
+                                  element_to_type={'H': 0, 'C': 1})
+    e_calc = atoms.get_potential_energy()
+    f_calc = atoms.get_forces()
+
+    e_ref, f_ref, n_edges, pt = _direct_all_images(model, pos, cell,
+                                                   [0, 1, 0, 1])
+    assert abs(e_ref - e_calc) < 1e-10, (e_ref, e_calc)
+    assert np.abs(f_ref - f_calc).max() < 1e-10
+    # the regression: MIC finds strictly fewer edges in this cell, so the old
+    # minimum-image path could not have produced this energy
+    mi, _, _ = atoms.calc._gpu_neighbor_list(pt.detach(), cell,
+                                             model.r_cut_edge)
+    assert n_edges > len(mi), (n_edges, len(mi))
+    print(f"  small cell: all-images topology dispatched "
+          f"({n_edges} edges vs {len(mi)} under MIC), E/F match direct")
+
+
+def test_pbc_large_cell_paths_agree():
+    """Where MIC is valid (cutoff ≤ half the cell width) the two list
+    flavours are identical, so the fast minimum-image path must reproduce
+    the all-images reference exactly."""
+    model = _tiny_model(2)
+    rng = np.random.RandomState(1)
+    cell = np.diag([12.0, 12.5, 13.0])
+    pos = rng.uniform(0, 1, (6, 3)) @ cell
+    atoms = Atoms(symbols=['H', 'C', 'H', 'C', 'H', 'C'], positions=pos,
+                  cell=cell, pbc=True)
+    atoms.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                  dtype=torch.float64,
+                                  element_to_type={'H': 0, 'C': 1})
+    e_calc = atoms.get_potential_energy()
+    f_calc = atoms.get_forces()
+    e_ref, f_ref, _, _ = _direct_all_images(model, pos, cell,
+                                            [0, 1, 0, 1, 0, 1])
+    assert abs(e_ref - e_calc) < 1e-10, (e_ref, e_calc)
+    assert np.abs(f_ref - f_calc).max() < 1e-10
+    print("  large cell: MIC fast path == all-images reference")
+
+
+def test_zero_edge_forces_and_stress_zero():
+    """Systems where every pair sits beyond the cutoff (e.g. a weak model
+    relaxing a WBM cell past dissociation — found in the wild by exactly
+    that): the energy is the per-atom offsets, positions never enter the
+    graph, and forces/stress must come back exactly zero rather than
+    autograd's 'tensor not used in graph' error."""
+    model = _tiny_model(2)
+    pos = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    # periodic, MIC branch (box ≫ 2·r_cut) — energy, forces, and stress
+    atoms = Atoms(symbols=['H', 'C'], positions=pos,
+                  cell=np.diag([20.0, 20.0, 20.0]), pbc=True)
+    atoms.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                  dtype=torch.float64,
+                                  element_to_type={'H': 0, 'C': 1})
+    assert np.isfinite(atoms.get_potential_energy())
+    assert np.all(atoms.get_forces() == 0.0)
+    assert np.all(atoms.get_stress() == 0.0)
+    # non-periodic path too
+    mol = Atoms(symbols=['H', 'C'], positions=pos)
+    mol.calc = ECENetCalculator(model, device=torch.device('cpu'),
+                                dtype=torch.float64,
+                                element_to_type={'H': 0, 'C': 1})
+    assert np.isfinite(mol.get_potential_energy())
+    assert np.all(mol.get_forces() == 0.0)
+    print("  zero-edge: finite energy, exact-zero forces/stress (PBC + free)")
 
 
 if __name__ == '__main__':
     print("ECENetCalculator behaviour")
+    test_pbc_small_cell_uses_all_images_topology()
+    test_pbc_large_cell_paths_agree()
+    test_zero_edge_forces_and_stress_zero()
     test_energy_units_kcal_vs_ev_scaling()
     test_energy_reference_added_per_atom()
     test_energy_mean_added_in_ev()
@@ -343,5 +530,8 @@ if __name__ == '__main__':
     test_from_checkpoint_spice_style()
     test_from_checkpoint_missing_mapping_raises()
     test_from_checkpoint_missing_hparams_raises()
-    test_real_ethanol_checkpoint_single_point()
+    test_legacy_edge_mp_checkpoint_raises()
+    test_trainers_save_every_architecture_hparam()
+    test_legacy_pre_scale_buffers_are_dropped()
+    test_architecture_mismatch_raises()
     print("All tests passed.")

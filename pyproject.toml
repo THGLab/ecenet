@@ -24,6 +24,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["ruff"]
+# LES long-range electrostatics (optional; see the README's IP note). Upstream
+# is CC BY-NC 4.0 (non-commercial) and not on PyPI, hence the pinned git URL —
+# which also means this extra cannot be part of a PyPI upload. The pin is
+# mirrored in ecenet/les.py (_LES_PIN); keep the two in sync.
+les = ["les @ git+https://github.com/ChengUCB/les@c8063fad18e3d59cb4d783e0ed5a1efea8d55b8d"]
 
 [tool.setuptools.packages.find]
 include = ["ecenet*"]

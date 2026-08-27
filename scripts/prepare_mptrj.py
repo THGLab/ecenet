@@ -2,7 +2,7 @@
 
 One-time preprocessing: parse the raw 11 GB JSON, build per-frame torch
 tensors + PBC neighbor lists, write ~158 sharded .pt files plus a manifest +
-type_map + e_ref. Training then opens the manifest and streams shards via
+type_map + e_ref + atom_counts. Training then opens the manifest and streams shards via
 ``ecenet.datasets.mptrj.MPtrjShardDataset`` — startup drops from ~35 min to
 ~10 s, and host RAM is bounded by the shard size, not the full dataset.
 
@@ -51,6 +51,7 @@ from train_ecenet_mptrj import (
 )
 
 from ecenet import elements
+from ecenet.datasets.mptrj import ATOM_COUNTS_FILE
 
 
 def parse_args():
@@ -164,6 +165,7 @@ def tensorize_frame(fr, mp_id, type_map, e_ref, args, dtype, compute_device):
 
     return {
         'pos':     torch.tensor(positions, dtype=dtype, device='cpu'),
+        'cell':    torch.tensor(cell, dtype=dtype, device='cpu'),  # LES Ewald needs it
         'types':   torch.tensor(types_np, dtype=torch.long, device='cpu'),
         'energy':  torch.tensor(float(energy) - ref, dtype=dtype, device='cpu'),
         'forces':  torch.tensor(forces, dtype=dtype, device='cpu'),
@@ -201,8 +203,8 @@ def pass2_tensorize(in_path, type_map, e_ref, args, dtype, compute_device):
 
 def write_shards(all_frames, out_dir, shard_size, shuffle_seed):
     """Globally shuffle frame order (so val-as-shard-suffix is a uniform random
-    sample of frames), then write fixed-size .pt shards. Returns shard filenames
-    in write order."""
+    sample of frames), then write fixed-size .pt shards. Returns
+    (shard filenames in write order, per-shard atom-count tensors)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     n = len(all_frames)
@@ -213,6 +215,7 @@ def write_shards(all_frames, out_dir, shard_size, shuffle_seed):
 
     t0 = time.time()
     shard_paths = []
+    atom_counts = []   # per-shard (n_frames,) int64 — sidecar for size-aware batching
     n_shards = (n + shard_size - 1) // shard_size
     for si in range(n_shards):
         sl = perm[si * shard_size:(si + 1) * shard_size]
@@ -220,12 +223,14 @@ def write_shards(all_frames, out_dir, shard_size, shuffle_seed):
         path = out_dir / f'shard_{si:05d}.pt'
         torch.save(shard, path)
         shard_paths.append(path.name)
+        atom_counts.append(torch.tensor([f['n_atoms'] for f in shard],
+                                        dtype=torch.int64))
         # Free this shard's references; the next-shard build still pulls from
         # all_frames so we can't fully drop until the loop ends.
         del shard
         if (si + 1) % 20 == 0 or si == n_shards - 1:
             print_flush(f'  wrote {si+1}/{n_shards} shards ({time.time()-t0:.0f}s)')
-    return shard_paths
+    return shard_paths, atom_counts
 
 
 def main():
@@ -244,12 +249,16 @@ def main():
                                  dtype, compute_device)
 
     # Shuffle + shard
-    shard_paths = write_shards(all_frames, out_dir, args.shard_size, args.shuffle_seed)
+    shard_paths, atom_counts = write_shards(all_frames, out_dir, args.shard_size,
+                                            args.shuffle_seed)
 
     # Sidecar metadata
     torch.save(type_map, out_dir / 'type_map.pt')
     torch.save(torch.from_numpy(np.asarray(e_ref, dtype=np.float64)),
                out_dir / 'e_ref.pt')
+    # Per-frame atom counts per shard: lets the trainer's size-aware batching
+    # plan every shard's packing without loading it (DDP count alignment).
+    torch.save(atom_counts, out_dir / ATOM_COUNTS_FILE)
 
     manifest = {
         'n_frames': len(all_frames),

@@ -111,6 +111,66 @@ def test_ecenet_mp():
     print(f"  ECENet(n_mp=2) runs: E={e.item():.4f}, SO(3) err {err:.1e}")
 
 
+def test_forward_batch_topology_list_formats():
+    """forward_batch's variable-topology fallback must consume BOTH
+    per-structure list formats — build_topology tuples AND
+    scripts/train_ecenet-style dicts — bit-identically to the on-the-fly
+    path. Regression: forwarding a dict list used to unpack the dicts as
+    tuples (i.e. their KEYS) and crash with a str + int TypeError."""
+    model = ECENet(**COMMON).double()
+    g = torch.Generator().manual_seed(3)
+    types = torch.randint(0, N_TYPES, (6,), generator=g)
+    pos_list = [torch.randn(6, 3, generator=g, dtype=DTYPE) * 1.8
+                for _ in range(3)]     # same composition, different geometries
+
+    tuples = model.build_topology(pos_list)
+    dicts = [{'edge_i': t[0], 'edge_j': t[1], 'nb_src': t[2], 'nb_dst': t[3]}
+             for t in tuples]
+
+    e_fly = model.forward_batch(pos_list, types)
+    e_tup = model.forward_batch(pos_list, types, topology=tuples)
+    e_dic = model.forward_batch(pos_list, types, topology=dicts)
+    d = max((e_fly - e_tup).abs().max().item(),
+            (e_fly - e_dic).abs().max().item())
+    assert d == 0.0, f"topology-list formats diverge from on-the-fly: {d:.3e}"
+    print(f"  forward_batch consumes tuple AND dict topology lists "
+          f"(d={d:.1e} vs on-the-fly)")
+
+
+def test_zero_edge_energy_is_atomic_and_consistent():
+    """A structure with no edges keeps Σ atomic_energy: forward and
+    forward_batch_multi must agree, and the energy must be continuous across
+    the last edge leaving r_cut (no jump by the per-element constants)."""
+    model = ECENet(**COMMON).double()
+    with torch.no_grad():
+        model.atomic_energy.normal_(std=0.5)   # trained models are nonzero here
+
+    # lone atom + a 2-atom structure with every pair beyond r_cut_edge
+    for pos, types in (
+        (torch.zeros(1, 3, dtype=DTYPE), torch.tensor([2])),
+        (torch.tensor([[0.0, 0, 0], [50.0, 0, 0]], dtype=DTYPE),
+         torch.tensor([1, 3])),
+    ):
+        e_single = model(pos, types)
+        e_batch = model.forward_batch_multi([pos], [types])[0]
+        e_ref = model.atomic_energy[types].sum()
+        assert torch.allclose(e_single, e_ref), \
+            f"forward zero-edge energy {e_single.item():.6f} != Σ atomic_energy {e_ref.item():.6f}"
+        assert torch.allclose(e_single, e_batch), \
+            f"forward {e_single.item():.6f} != forward_batch_multi {e_batch.item():.6f}"
+
+    # continuity: dimer just inside vs just outside r_cut — the envelope takes
+    # the edge energy to 0, so the difference must be tiny, not Σ atomic_energy
+    r = model.r_cut_edge
+    types = torch.tensor([1, 3])
+    e_in = model(torch.tensor([[0.0, 0, 0], [r - 1e-6, 0, 0]], dtype=DTYPE), types)
+    e_out = model(torch.tensor([[0.0, 0, 0], [r + 1e-6, 0, 0]], dtype=DTYPE), types)
+    gap = (e_in - e_out).abs().item()
+    assert gap < 1e-8, f"energy jump {gap:.3e} across r_cut_edge"
+    print(f"  zero-edge energy = Σ atomic_energy, forward == batch, "
+          f"continuous at r_cut (gap={gap:.1e})")
+
+
 if __name__ == "__main__":
     print("ECENet integration")
     test_constructs_and_runs()
@@ -118,4 +178,6 @@ if __name__ == "__main__":
     test_forces_finite_difference()
     test_training_path_forward_batch_multi()
     test_ecenet_mp()
+    test_forward_batch_topology_list_formats()
+    test_zero_edge_energy_is_atomic_and_consistent()
     print("All tests passed.")

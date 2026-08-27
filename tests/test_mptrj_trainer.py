@@ -145,6 +145,68 @@ def test_loss_decreases():
     print(f"  loss {losses[0]:.3f} -> {losses[-1]:.3f}  OK\n")
 
 
+def test_lr_schedules():
+    """The open-loop LR schedules ('multistep' / 'cosine') are pure functions of
+    the epoch index. Checks the LR actually logged each epoch against the closed
+    form, and that multistep matches torch.optim.lr_scheduler.MultiStepLR exactly.
+    """
+
+    import train_ecenet_mptrj as T
+    structs = make_structures(16, seed=3)
+
+    def run(**kw):
+        lrs = []
+        orig = T.print_flush
+
+        def capture(*a, **k):
+            s = ' '.join(str(x) for x in a)
+            if 'Epoch' in s and 'lr=' in s:
+                lrs.append(float(s.split('lr=')[1].split('|')[0]))
+
+        T.print_flush = capture
+        try:
+            train_ecenet_mptrj(
+                train_structures=structs, n_val=3,
+                l_max=2, n_max=2, embed_dim=8, n_layers=1, n_max_d=4,
+                r_cut_edge=4.0, r_cut_neighbor=3.5, stress_weight=0.0,
+                n_epochs=8, batch_size=4, lr=1e-2, dtype=DTYPE, device=DEVICE,
+                seed=0, verbose=True, **kw)
+        finally:
+            T.print_flush = orig
+        return lrs
+
+    # multistep: lr * gamma^(milestones passed), from the epoch index
+    lrs = run(lr_schedule='multistep', lr_milestones=[3, 6], lr_gamma=0.5)
+    expect = [1e-2 * 0.5 ** sum(1 for m in (3, 6) if e >= m) for e in range(len(lrs))]
+    assert len(lrs) == 8, f"expected 8 epoch lines, got {len(lrs)}"
+    for e, (got, want) in enumerate(zip(lrs, expect)):
+        assert abs(got - want) < 1e-9 * max(want, 1e-12), \
+            f"multistep epoch {e}: logged lr {got:.3e}, expected {want:.3e}"
+
+    # ...and that closed form is exactly torch's MultiStepLR
+    p = torch.nn.Parameter(torch.zeros(1))
+    opt = torch.optim.SGD([p], lr=1e-2)
+    sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[3, 6], gamma=0.5)
+    for e in range(len(lrs)):
+        assert opt.param_groups[0]['lr'] == expect[e], \
+            f"epoch {e}: torch MultiStepLR {opt.param_groups[0]['lr']:.3e} != {expect[e]:.3e}"
+        opt.step()
+        sch.step()
+
+    # cosine with warmup: linear ramp, then decay reaching the floor on the last epoch
+    lrs_c = run(lr_schedule='cosine', warmup_epochs=2, lr_min_factor=0.1)
+    assert abs(lrs_c[0] - 1e-2 * 0.5) < 1e-12 and abs(lrs_c[1] - 1e-2) < 1e-12, \
+        f"warmup ramp wrong: {lrs_c[:2]}"
+    assert abs(lrs_c[-1] - 1e-3) < 1e-9, f"cosine should end at the floor: {lrs_c[-1]:.3e}"
+    assert all(b <= a + 1e-15 for a, b in zip(lrs_c[1:], lrs_c[2:])), \
+        f"cosine should decay monotonically after warmup: {lrs_c}"
+
+    # 'plateau' (default) is untouched: constant while the val metric improves
+    assert len(set(run())) == 1, "plateau should hold the LR over a short run"
+    print(f"  lr_schedule: multistep == torch.MultiStepLR ({lrs[0]:.1e}→{lrs[-1]:.1e}), "
+          f"cosine warmup+floor OK, plateau unchanged\n")
+
+
 def test_stress_and_force_fd():
     print("=== FD check: autograd stress/forces vs finite differences ===")
     structs = make_structures(1, seed=7, n_atoms_range=(6, 7))
@@ -304,10 +366,81 @@ def test_torch_neighbor_list_matches_ase():
     print()
 
 
+def test_forward_batch_multi_pbc():
+    """forward_batch_multi with 6-tuple periodic topology (edge_i, edge_j,
+    shift_e, nb_src, nb_dst, shift_nb) must reproduce the per-structure
+    forward_pbc loop — energies, forces, and l0 embeddings — including a
+    zero-edge structure mid-batch and a non-periodic 4-tuple in the mix."""
+    print("=== forward_batch_multi: periodic topology == forward_pbc loop ===")
+    structs = make_structures(3, seed=21)
+    type_map = build_type_map(structs)
+    torch.manual_seed(3)
+    model = ECENet(n_types=len(type_map), r_cut_edge=4.0, r_cut_neighbor=3.5,
+                   l_max=2, n_max=2, embed_dim=8, n_layers=1, n_max_d=4,
+                   n_mp=2).double().to(DEVICE)
+    for p in model.parameters():
+        with torch.no_grad():
+            p.add_(0.05 * torch.randn_like(p))
+
+    pos_list, types_list, topo = [], [], []
+    for s in structs:
+        pos_list.append(torch.tensor(s['positions'], dtype=DTYPE, device=DEVICE))
+        types_list.append(torch.tensor([type_map[int(z)] for z in s['numbers']],
+                                       dtype=torch.long, device=DEVICE))
+        topo.append(build_topology(s['positions'], s['cell'], True,
+                                   4.0, 3.5, DEVICE, DTYPE))
+    # a zero-edge periodic structure mid-batch (2 atoms 10 Å apart, 20 Å box)
+    ze_pos = np.array([[0.0, 0, 0], [10.0, 0, 0]])
+    ze_cell = np.diag([20.0, 20.0, 20.0])
+    pos_list.insert(1, torch.tensor(ze_pos, dtype=DTYPE, device=DEVICE))
+    types_list.insert(1, torch.zeros(2, dtype=torch.long, device=DEVICE))
+    topo.insert(1, build_topology(ze_pos, ze_cell, True, 4.0, 3.5, DEVICE, DTYPE))
+    # and a non-periodic 4-tuple mixed in (a free molecule)
+    mol = torch.tensor([[0.0, 0, 0], [1.1, 0, 0], [0.0, 1.2, 0]],
+                       dtype=DTYPE, device=DEVICE)
+    pos_list.append(mol)
+    types_list.append(torch.zeros(3, dtype=torch.long, device=DEVICE))
+    topo.append(model.build_topology([mol])[0])
+
+    # reference: per-structure forward_pbc / forward
+    e_ref, f_ref, l0_ref = [], [], []
+    for pos, types, tp in zip(pos_list, types_list, topo):
+        p = pos.detach().clone().requires_grad_(True)
+        if len(tp) == 6:
+            e, l0 = model.forward_pbc(p, types, *tp, return_embeddings=True,
+                                      l0_only=True)
+        else:
+            e, l0 = model(p, types, return_embeddings=True, l0_only=True)
+        g = (torch.autograd.grad(e, p, allow_unused=True)[0]
+             if e.requires_grad else None)
+        e_ref.append(e.item())
+        f_ref.append(torch.zeros_like(p) if g is None else -g)
+        l0_ref.append(l0)
+
+    # batched: one forward_batch_multi call over the mixed topology
+    leaves = [p.detach().clone().requires_grad_(True) for p in pos_list]
+    e_b, l0_list = model.forward_batch_multi(leaves, types_list,
+                                             return_embeddings=True,
+                                             l0_only=True, topology=topo)
+    grads = torch.autograd.grad(e_b.sum(), leaves, allow_unused=True)
+    for k in range(len(pos_list)):
+        de = abs(e_b[k].item() - e_ref[k])
+        fb = (torch.zeros_like(leaves[k]) if grads[k] is None else -grads[k])
+        df = (fb - f_ref[k]).abs().max().item()
+        dl = (l0_list[k] - l0_ref[k]).abs().max().item()
+        assert de < 1e-10, (k, de)
+        assert df < 1e-10, (k, df)
+        assert dl < 1e-10, (k, dl)
+    print(f"  {len(pos_list)} structures (periodic + zero-edge + free molecule): "
+          "E/F/l0 match the per-structure loop\n")
+
+
 if __name__ == '__main__':
     test_torch_neighbor_list_matches_ase()
+    test_forward_batch_multi_pbc()
     test_wigner_pole_gradient()
     test_stress_and_force_fd()
     test_loss_decreases()
+    test_lr_schedules()
     test_smoke_train()
     print("ALL TESTS PASSED")

@@ -10,7 +10,7 @@ Usage (run from the repo root):
         --r_cut_edge 8.0 --r_cut_neighbor 6.0 \
         --n_mp 2 \
         --output_hidden_dims 128 128 \
-        --n_dist_basis 16 --n_grid 16 \
+        --n_grid 16 \
         --batch_size 8
 """
 
@@ -29,6 +29,7 @@ from train_ecenet_spice import (
     ELEMENT_TO_TYPE,
     N_TYPES,
     TYPE_NAMES,
+    _MultiForwardWrapper,
     compute_energy_reference,
 )
 
@@ -144,7 +145,7 @@ def evaluate_by_subset(energy_fn, structures, e_ref, dtype, device, batch_size=8
             'force_mae_mev_ang':   f_mae * 1000,
         }
         print(f"  {subset_name:30s} (n={n:6d}): "
-              f"E={e_mae*1000:6.2f} meV/atom  F={f_mae*1000:6.1f} meV/Å")
+              f"E={e_mae*1000:6.2f} meV/atom  F={f_mae*1000:6.2f} meV/Å")
 
     return results
 
@@ -170,11 +171,13 @@ def main():
     parser.add_argument('--activation',       default='silu')
     parser.add_argument('--no_nonlinearity',  action='store_true')
     parser.add_argument('--n_mp', type=int, default=1)
-    parser.add_argument('--n_dist_basis',     type=int,   default=8)
     # Eval options
     parser.add_argument('--batch_size',       type=int,   default=8)
     parser.add_argument('--float32',          action='store_true')
     parser.add_argument('--device',           default=None)
+    parser.add_argument('--ignore_les',       action='store_true',
+                        help='Evaluate the short-range part of an LES checkpoint '
+                             'alone (deliberately dropping E_lr).')
     args = parser.parse_args()
 
     dtype  = torch.float32 if args.float32 else torch.float64
@@ -224,11 +227,12 @@ def main():
             use_nonlinearity=not args.no_nonlinearity,
             output_hidden_dims=args.output_hidden_dims,
             analytic_ace_basis=True,
-            n_mp=args.n_mp, n_dist_basis=args.n_dist_basis,
+            n_mp=args.n_mp,
         )
 
     # Strip any long-range-only keys from old checkpoints (not SR constructor args)
-    for k in ['r_cut_lr', 'lr_n_rbf', 'lr_embed_dim', 'lr_hidden_layers', 'lr_module_type']:
+    for k in ['r_cut_lr', 'lr_n_rbf', 'lr_embed_dim', 'lr_hidden_layers', 'lr_module_type',
+              'n_dist_basis']:
         hp.pop(k, None)
 
     # nonlinearity_type removed (the only kind was 'realspace'). A legacy 'none'
@@ -241,11 +245,13 @@ def main():
     legacy_used_mp = bool(hp.get('use_message_passing'))
     for k in ['use_message_passing', 'n_mp_steps', 'n_layers_per_mp', 'n_final_layers']:
         hp.pop(k, None)
+    allow_partial_load = False
     if n_mp is None:
         if legacy_used_mp:
             print("WARNING: legacy message-passing checkpoint — the MP architecture "
                   "changed (n_mp stages); MP/final-layer weights will not load, "
                   "evaluating with n_mp=1 (no MP). Re-save hparams with 'n_mp' to load MP.")
+            allow_partial_load = True
         n_mp = 1
 
     model = ECENet(**hp, n_mp=n_mp)
@@ -258,14 +264,44 @@ def main():
     # load just the short-range model.
     if isinstance(state, dict) and 'model' in state and 'lr_module' in state:
         state = state['model']
-    model.load_state_dict(state, strict=False)
+    # Legacy identity-only buffers, dropped exactly as from_checkpoint does.
+    state = {k: v for k, v in state.items()
+             if not k.endswith(('.pre_scale', '.pre_shift'))}
+    # A silent partial load evaluates a half-random model and prints meaningless
+    # MAEs (the footgun from_checkpoint rejects) — fail loudly instead, except
+    # on the announced legacy-MP path above.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if (missing or unexpected) and not allow_partial_load:
+        src = 'checkpoint hparams' if ckpt.get('hparams') else 'CLI arguments'
+        raise RuntimeError(
+            f"Checkpoint weights do not match the model built from {src}: "
+            f"{len(missing)} missing / {len(unexpected)} unexpected keys "
+            f"(e.g. {(list(missing) + list(unexpected))[:3]}).")
     model.eval()
     epoch = ckpt.get('epoch', '?')
     print(f"\nLoaded checkpoint (epoch {epoch}, "
           f"best val F-MAE={ckpt.get('best_val_force_mae', float('nan')):.4f} eV/Å)")
 
-    def energy_fn(pos_list, typ_list):
-        return model.forward_batch_multi(pos_list, typ_list)
+    # ── LES (when the checkpoint carries it) ───────────────────────────────
+    # A checkpoint trained with use_les was fit to E_sr + E_lr; evaluating
+    # the SR part alone silently scores a different PES. E_lr is added by the
+    # SAME code the trainer used — _MultiForwardWrapper owns the batched
+    # E_sr + E_lr contract — unless --ignore_les asks for the SR-only
+    # ablation explicitly. (The wrapper with les_module=None is the plain
+    # batched forward, so one code path serves every case.)
+    les_module = None
+    if 'les' in ckpt:
+        if args.ignore_les:
+            print("\nWARNING: --ignore_les — dropping the checkpoint's E_lr "
+                  "term (SR-only ablation; MAEs are NOT the trained model's).")
+        else:
+            from ecenet.les import load_les_module
+            les_module = load_les_module(ckpt['les'], model, device, dtype)
+            print(f"LES: on (readout={model.les_readout}"
+                  f"{', dipole' if model.les_dipole else ''}) — "
+                  "evaluating E_sr + E_lr")
+
+    energy_fn = _MultiForwardWrapper(model, les_module)
 
     # ── Evaluate ───────────────────────────────────────────────────────────
     print(f"\nEvaluating on test set (batch_size={args.batch_size})...\n")
@@ -278,7 +314,7 @@ def main():
     total_n = sum(r['n'] for r in results.values())
     print(f"\n  {'Overall':30s} (n={total_n:6d}): "
           f"E={total_e/total_n*1000:6.2f} meV/atom  "
-          f"F={total_f_num/total_n*1000:6.1f} meV/Å")
+          f"F={total_f_num/total_n*1000:6.2f} meV/Å")
 
 
 if __name__ == '__main__':
