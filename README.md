@@ -268,26 +268,6 @@ training with a force loss. On CUDA + float32 both dispatch to Triton kernels;
 elsewhere they run equivalent pure-PyTorch fallbacks. Verified bit-identical
 (CPU) / fp32-accurate (kernels) in the kernel test files.
 
-## Tests
-
-The test suite is pure PyTorch and runs on CPU. Each file is runnable as a script:
-
-```bash
-python tests/test_ecenet.py                  # ECENet integration: SO(3) invariance, forces, MP
-python tests/test_bottleneck.py              # low-rank layers: identity at init, SO(3)
-python tests/test_element_film.py            # FiLM gate: identity at init, SO(3), per-m, shift
-python tests/test_spice_trainer.py           # SPICE trainer: atom-budget batching, DDP invariant
-python tests/test_attention_mp.py            # attention MP: SO(3), cutoff continuity, sum vs softmax
-python tests/test_les.py                     # LES: l0/l1 read-out SO(3) + batch/PBC consistency; wrapper lazy import
-python tests/test_edge_frame_kernel.py       # fused edge-frame/e2n: gradchecks, model on/off equality (Triton legs need CUDA)
-python tests/test_realspace_kernel.py        # fused nonlinearity: backward equivalence, DFT precision (Triton legs need CUDA)
-python tests/test_mptrj_trainer.py           # end-to-end MPtrj trainer smoke (synthetic)
-python tests/test_mptrj_shard_batching.py    # shard atom-budget batching: DDP count alignment, sidecar
-python tests/test_xyz_trainer.py             # small-dataset trainer: smoke, LES resume, force-FD through E_lr
-python tests/test_trainer_les.py             # use_les in the rMD17 + MPtrj trainers; stress-FD through the Ewald cell strain
-python tests/test_wbm_eval.py                # WBM relax+score pipeline: slicing/resume, e_form + hull metrics exact on a perfect model
-```
-
 ## License
 
 Copyright ©2026. The Regents of the University of California (Regents). All
