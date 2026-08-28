@@ -5,8 +5,8 @@ score-weighted over each receiver atom's incoming edges, aggregated in the
 global frame, then a per-edge receiver residual. Two aggregations share that
 structure and differ only in the weight:
 
-  'softmax' (default) — softmax over the receiver's in-edges (intensive)
-  'sum'               — raw signed score × cutoff envelope (extensive)
+  'sum' (default) — raw signed score × cutoff envelope (extensive)
+  'softmax'       — softmax over the receiver's in-edges (intensive)
 
 Message and scores come from ONE fused trunk whose zero-init up-projection emits
 n_ch message channels plus one score channel per head.
@@ -67,12 +67,12 @@ def _activate_scores(layer, std=0.5, bias=None):
             layer.msg_up.bias[-layer.n_scores:].fill_(bias)
 
 
-def test_default_is_softmax():
+def test_default_is_sum():
     m = ECENet(**COMMON, n_mp=2).double()
     assert isinstance(m.mp_layers[0], ECENetAttentionMPLayer)
-    assert m.mp_layers[0].aggregation == 'softmax'
-    m_s = ECENet(**COMMON, n_mp=2, mp_type='sum').double()
-    assert m_s.mp_layers[0].aggregation == 'sum'
+    assert m.mp_layers[0].aggregation == 'sum'
+    m_s = ECENet(**COMMON, n_mp=2, mp_type='softmax').double()
+    assert m_s.mp_layers[0].aggregation == 'softmax'
     # the removed 'edge' MP is rejected, with a message that says so
     try:
         ECENet(**COMMON, n_mp=2, mp_type='edge')
@@ -80,7 +80,7 @@ def test_default_is_softmax():
         assert 'edge' in str(e) and 'removed' in str(e)
     else:
         raise AssertionError("expected mp_type='edge' to be rejected")
-    print("  default mp_type='softmax'; 'sum' selects the weighted-sum aggregation; "
+    print("  default mp_type='sum'; 'softmax' selects the attention aggregation; "
           "'edge' is rejected")
 
 
@@ -316,11 +316,14 @@ def test_msg_envelope_restores_absolute_decay():
 
 def test_msg_envelope_defaults_and_flag():
     """On by default for 'softmax'; structurally already on (and not
-    disableable) for 'sum', which warns rather than silently ignoring."""
-    assert ECENet(**COMMON, n_mp=2).mp_layers[0].msg_envelope is True
-    assert ECENet(**COMMON, n_mp=2, mp_msg_envelope=False).mp_layers[0].msg_envelope is False
+    disableable) for 'sum' — the default — which warns rather than silently
+    ignoring."""
+    assert ECENet(**COMMON, n_mp=2,
+                  mp_type='softmax').mp_layers[0].msg_envelope is True
+    assert ECENet(**COMMON, n_mp=2, mp_type='softmax',
+                  mp_msg_envelope=False).mp_layers[0].msg_envelope is False
     # 'sum' never sets the flag — its weight is s*f_cut, so f_cut twice would be f_cut²
-    assert ECENet(**COMMON, n_mp=2, mp_type='sum').mp_layers[0].msg_envelope is False
+    assert ECENet(**COMMON, n_mp=2).mp_layers[0].msg_envelope is False
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         ECENet(**COMMON, n_mp=2, mp_type='sum', mp_msg_envelope=False)
@@ -330,7 +333,7 @@ def test_msg_envelope_defaults_and_flag():
         warnings.simplefilter("always")
         ECENet(**COMMON, n_mp=2, mp_type='sum')
         assert not any('envelope' in str(x.message) for x in w), "plain sum should be quiet"
-    print("  mp_msg_envelope: default on for transformer, structural for sum, warns if disabled there")
+    print("  mp_msg_envelope: default on for softmax, structural for sum, warns if disabled there")
 
 
 def test_sum_is_extensive():
@@ -506,7 +509,7 @@ def test_ignored_flags_warn():
 
 if __name__ == "__main__":
     print("Attention message-passing tests (mp_type='softmax' / 'sum')")
-    test_default_is_softmax()
+    test_default_is_sum()
     test_so3_invariance()
     test_cutoff_continuity()
     test_forces_finite()

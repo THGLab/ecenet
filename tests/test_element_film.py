@@ -221,10 +221,11 @@ def test_gate_runs_on_every_forward_path():
 
 
 def test_ignored_flags_warn():
-    """FiLM knobs with element_film=False configure a gate that is never built."""
+    """FiLM knobs with element_film=False configure a gate that is never built
+    (element_film defaults to True, so the off state must be explicit here)."""
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        ECENet(**COMMON, film_n_rbf=6, film_per_m=True)
+        ECENet(**COMMON, element_film=False, film_n_rbf=6, film_per_m=True)
         assert any('film_n_rbf' in str(x.message) for x in w), "expected an ignored-flag warning"
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")

@@ -168,19 +168,19 @@ def train_ecenet(
     bottleneck_dim=None,
     # Message passing
     n_mp=1,
-    mp_type='softmax',
+    mp_type='sum',
     mp_dim=None,
     mp_n_heads=1,
     mp_msg_envelope=True,
     mp_l_attention=False,
     # FiLM gate
-    element_film=False,
+    element_film=True,
     film_embed_dim=16,
     film_n_rbf=0,
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
-    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
+    les_readout=None,     # None -> 'edge_basis' if use_les else 'sum'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     les_charges=True,      # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
@@ -236,6 +236,11 @@ def train_ecenet(
         if loss_type == 'huber':
             return nn.functional.huber_loss(pred, tgt, delta=huber_delta)
         return ((pred - tgt) ** 2).mean()
+    if les_readout is None:
+        # 'edge_basis' is the LES default; short-range runs take 'sum' so the
+        # model carries no unused charge-head parameters (which would also
+        # break DDP's find_unused_parameters=False).
+        les_readout = 'edge_basis' if use_les else 'sum'
     if optimizer_type not in ('adamw', 'adam', 'sgd'):
         raise ValueError(f"optimizer_type must be 'adamw', 'adam', or 'sgd'; got {optimizer_type!r}")
     if device is None:

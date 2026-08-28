@@ -88,13 +88,14 @@ class ECENet(nn.Module):
                         — a fused message/score trunk and a receiver transform —
                         and differ only in the weight applied to each incoming
                         message:
-                          'softmax' (default): softmax over the receiver's
-                            incoming edges, so the aggregate is a weighted
-                            *average* (intensive in coordination). Zero-init
-                            scores make the attention uniform at init.
-                          'sum': the raw signed score times the cutoff envelope,
-                            summed (extensive in coordination). Zero-init scores
-                            make the layer an exact no-op at init.
+                          'sum' (default): the raw signed score times the cutoff
+                            envelope, summed (extensive in coordination).
+                            Zero-init scores make the layer an exact no-op at
+                            init.
+                          'softmax': softmax over the receiver's incoming edges,
+                            so the aggregate is a weighted *average* (intensive
+                            in coordination). Zero-init scores make the
+                            attention uniform at init.
         mp_dim:         bottleneck width of the fused message/score trunk and of
                         the receiver block (default: n_features_per_m // 4)
         mp_n_heads:     number of attention heads; the value channels
@@ -115,10 +116,11 @@ class ECENet(nn.Module):
                         (without it, a lone neighbour near r_cut still gets weight
                         ≈ 1). mp_type='sum' is already enveloped by construction,
                         so the flag is a no-op there — and cannot be turned off.
-        element_film:   if True, modulate the edge features once — right after
-                        they are built and rotated into the bond frame, before
-                        the layer stack — by an element(+distance)-conditioned
-                        FiLM gate (see ecenet/film.py). Identity at init.
+        element_film:   modulate the edge features once — right after they are
+                        built and rotated into the bond frame, before the layer
+                        stack — by an element(+distance)-conditioned FiLM gate
+                        (see ecenet/film.py). Identity at init. ON by default;
+                        element_film=False disables the gate.
         film_embed_dim: width of each element embedding in the FiLM gate (default 16)
         film_n_rbf:     radial-basis size φ(r) for the FiLM gate (0 → element-only,
                         so the gate depends on the element pair but not the bond
@@ -153,12 +155,12 @@ class ECENet(nn.Module):
         output_hidden_dims: list = None,
         m_max: int = None,
         bottleneck_dim: int = None,
-        mp_type: str = 'softmax',
+        mp_type: str = 'sum',
         mp_dim: int = None,
         mp_n_heads: int = 1,
         mp_msg_envelope: bool = True,
         mp_l_attention: bool = False,
-        element_film: bool = False,
+        element_film: bool = True,
         film_embed_dim: int = 16,
         film_n_rbf: int = 0,
         film_hidden=None,
@@ -235,7 +237,9 @@ class ECENet(nn.Module):
         #   saddle a zero-init head could never leave. Smoothness at r_cut is
         #   inherited from the edge features' own radial envelope, as in
         #   Allegro-LES's EdgewiseReduce.
-        # 'edge_basis': 'edge' upgraded to mirror the energy readout end to
+        # 'edge_basis' (the trainers' default when use_les=True — the
+        #   bare-model default stays 'sum' so short-range models carry no
+        #   unused charge-head parameters): 'edge' upgraded to mirror the energy readout end to
         #   end — an MLP with output_net's architecture (same input: the full
         #   n_features_per_m m=0 invariant set of _contract, not the l'-summed
         #   h_l0; same hidden widths and activation) emits n_max_d channels
