@@ -174,7 +174,7 @@ def train_ecenet(
     mp_msg_envelope=True,
     mp_l_attention=False,
     # FiLM gate
-    element_film=False,
+    element_film=True,
     film_embed_dim=16,
     film_n_rbf=0,
     film_hidden=None,

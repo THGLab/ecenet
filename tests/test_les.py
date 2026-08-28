@@ -575,12 +575,14 @@ def test_smoke_forward():
     e = e_sr + lr(l0, p).sum()
     assert torch.isfinite(e).all(), f"non-finite total energy: {e}"
     # cell=None (fast path, no per-structure det check) must equal an explicit
-    # zero cell (upstream's det<1e-6 branch) — both mean isolated.
+    # zero cell (upstream's det<1e-6 branch) — both mean isolated. The two are
+    # independent implementations with different summation orders, so agreement
+    # is to float64 rounding, not bitwise.
     with torch.no_grad():
         e_none = lr(l0, p)
         e_zero = lr(l0, p, cell=torch.zeros(1, 3, 3, dtype=p.dtype))
     dz = (e_none - e_zero).abs().max()
-    assert dz == 0.0, f"cell=None != zero cell: {dz:.3e}"
+    assert dz < 1e-14, f"cell=None != zero cell: {dz:.3e}"
     f = -torch.autograd.grad(e, p)[0]
     assert f.shape == pos.shape and torch.isfinite(f).all()
     print(f"  smoke: E={e.item():.6f} eV, |F|max={f.abs().max():.3f}")

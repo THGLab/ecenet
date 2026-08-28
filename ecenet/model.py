@@ -115,10 +115,11 @@ class ECENet(nn.Module):
                         (without it, a lone neighbour near r_cut still gets weight
                         ≈ 1). mp_type='sum' is already enveloped by construction,
                         so the flag is a no-op there — and cannot be turned off.
-        element_film:   if True, modulate the edge features once — right after
-                        they are built and rotated into the bond frame, before
-                        the layer stack — by an element(+distance)-conditioned
-                        FiLM gate (see ecenet/film.py). Identity at init.
+        element_film:   modulate the edge features once — right after they are
+                        built and rotated into the bond frame, before the layer
+                        stack — by an element(+distance)-conditioned FiLM gate
+                        (see ecenet/film.py). Identity at init. ON by default;
+                        element_film=False disables the gate.
         film_embed_dim: width of each element embedding in the FiLM gate (default 16)
         film_n_rbf:     radial-basis size φ(r) for the FiLM gate (0 → element-only,
                         so the gate depends on the element pair but not the bond
@@ -158,7 +159,7 @@ class ECENet(nn.Module):
         mp_n_heads: int = 1,
         mp_msg_envelope: bool = True,
         mp_l_attention: bool = False,
-        element_film: bool = False,
+        element_film: bool = True,
         film_embed_dim: int = 16,
         film_n_rbf: int = 0,
         film_hidden=None,

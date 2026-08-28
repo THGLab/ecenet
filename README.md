@@ -129,12 +129,8 @@ trainer; the class and trainer docstrings document the details.
 down → nonlinearity → up (zero-init up, so each layer is the identity at
 initialisation).
 
-**FiLM gate** — `element_film=True` modulates the freshly built edge features
-with a scale (and optionally a shift) predicted by a small MLP on the two
-element types and, with `film_n_rbf > 0`, the bond length. Identity at
-initialisation; equivariance-safe by construction. Sub-options:
-`film_embed_dim`, `film_hidden`, `film_per_m`, `film_shift` (see
-`ecenet/film.py`).
+An element-conditioned FiLM gate on the edge features is on by default
+(`element_film=False` disables it; sub-options in `ecenet/film.py`).
 
 **Message passing** — with `n_mp >= 2`, each MP layer computes a per-edge
 message and an invariant score, aggregates messages at the receiving atom, and
