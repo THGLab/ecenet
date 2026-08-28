@@ -15,8 +15,9 @@ from ase.neighborlist import neighbor_list as ase_neighbor_list
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root → import ecenet
 from ecenet.calculator import load_calculator
+from ecenet.model import _matrix_free_to_angular
 from ecenet.radial import radial_basis
-from ecenet.spherical import build_D_block_from_list, recursive_wigner_D, wigner_rotate
+from ecenet.spherical import RotationWeights, build_D_block_from_list, recursive_wigner_D, wigner_rotate
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--checkpoint', required=True)
@@ -35,6 +36,12 @@ parser.add_argument('--edge_frame_fused', action='store_true',
                     help='Enable the fused gather+Wigner-rotate+reshape edge-frame op '
                          '(set_edge_frame_fused; Triton on CUDA+float32, else eager '
                          'recompute-in-backward).')
+parser.add_argument('--analytic_wigner', action='store_true',
+                    help='Matrix-free analytic Wigner rotation '
+                         '(set_analytic_wigner; m_max <= 1 checkpoints only, '
+                         'single-backward — forces fine, no force-loss '
+                         'training; mutually exclusive with '
+                         '--edge_frame_fused).')
 parser.add_argument('--edge_frame_e2n', action='store_true',
                     help="With --edge_frame_fused: ALSO fuse the MP layers' "
                          'pack+unrotate (their step 3).')
@@ -75,6 +82,13 @@ if args.edge_frame_fused:
     path = ('Triton' if (_ef_triton and device.type == 'cuda') else 'eager recompute')
     e2n = 'on' if args.edge_frame_e2n else 'off'
     print(f"[edge_frame_fused] fused gather+rotate+reshape ({path}, e2n {e2n})")
+
+if args.analytic_wigner:
+    # raises for m_max > 1 or together with --edge_frame_fused (the model's
+    # own guards) — surface those as-is rather than pre-checking here
+    model.set_analytic_wigner(True)
+    print(f"[analytic_wigner] matrix-free rotation (m_max={model.m_max}; "
+          "single-backward — forces profiled, no force-loss training)")
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -165,7 +179,9 @@ time_fn("embed (einsum A×W → A_emb)",
 A_emb = model._embed(A, types)
 A_both = torch.cat([A_emb[edge_i], A_emb[edge_j]], dim=1)
 
-# Wigner rotation breakdown
+# Wigner rotation breakdown — reference full-block decomposition first,
+# then the ACTIVE path if it differs (kept-column slice for m_max < l_max,
+# or matrix-free weights under set_analytic_wigner).
 _, D_list = time_fn("  Wigner D (recursive_wigner_D)",
         lambda: recursive_wigner_D(r_hat, model.l_max))
 _, D_block_main = time_fn("  Wigner D (build_D_block_from_list)",
@@ -175,6 +191,19 @@ time_fn("  Wigner bmm (A_both @ D)",
         lambda: torch.bmm(A_both, D_block_main))
 time_fn("Wigner rotate total (main, w/ cached D)",
         lambda: wigner_rotate(A_both, D_block_main))
+
+D_active = model._build_D(r_hat)
+if isinstance(D_active, RotationWeights):
+    time_fn("Wigner ACTIVE: matrix-free weights (build)",
+            lambda: model._build_D(r_hat))
+    time_fn("Wigner ACTIVE: matrix-free rotate+angular",
+            lambda: _matrix_free_to_angular(A_both, D_active, model.l_max,
+                                            model.sph_to_angular))
+elif D_active.shape[-1] != model.n_sph:
+    time_fn("Wigner ACTIVE: D slice (build)",
+            lambda: model._build_D(r_hat))
+    time_fn("Wigner ACTIVE: bmm (A_both @ D_slice)",
+            lambda: torch.bmm(A_both, D_active))
 
 A_rot = wigner_rotate(A_both, D_block_main)
 
