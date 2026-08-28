@@ -171,6 +171,52 @@ def test_zero_edge_energy_is_atomic_and_consistent():
           f"continuous at r_cut (gap={gap:.1e})")
 
 
+def test_identity_activation():
+    """activation='identity': every RealSpaceNonlinearity — the layer stack AND
+    the MP trunk/receiver — becomes an exact no-op (grid round-trip is exact for
+    bandlimited features), the read-out MLPs keep SiLU, SO(3) invariance holds,
+    and an unknown activation string is rejected loudly."""
+    import torch.nn as nn
+
+    from ecenet.equivariant import RealSpaceNonlinearity
+
+    model = ECENet(**COMMON, n_mp=2, activation='identity').double()
+
+    # every equivariant nonlinearity got Identity — layers and MP alike
+    nls = [m for m in model.modules() if isinstance(m, RealSpaceNonlinearity)]
+    assert len(nls) >= 3, "expected nonlinearities in layers and MP"
+    assert all(isinstance(m.activation, nn.Identity) for m in nls)
+    # ...and each is an exact no-op
+    nl = nls[0]
+    g = torch.Generator().manual_seed(3)
+    a_cos = torch.randn(5, nl.n_features, nl.n_angular, generator=g, dtype=DTYPE)
+    a_sin = torch.randn(5, nl.n_features, nl.n_angular, generator=g, dtype=DTYPE)
+    a_sin[:, :, 0] = 0.0                    # m=0 sin slot is a structural zero
+    o_cos, o_sin = nl(a_cos, a_sin)
+    rt = max((o_cos - a_cos).abs().max(), (o_sin - a_sin).abs().max())
+    assert rt < 1e-12, f"identity nonlinearity is not a no-op: {rt:.3e}"
+
+    # read-out MLPs stay nonlinear (deliberate: identity would collapse them)
+    assert isinstance(model.output_net.activation, nn.SiLU)
+
+    # the linearized model still runs and is SO(3)-invariant
+    pos, types = random_structure()
+    e, f = _energy_and_forces(model, pos, types)
+    Q = rand_rotation()
+    e_rot = model(pos @ Q.T, types)
+    de = (e - e_rot).abs().item()
+    assert torch.isfinite(e) and torch.isfinite(f).all()
+    assert de < 1e-9, f"SO(3) invariance broken under identity activation: {de:.3e}"
+
+    try:
+        ECENet(**COMMON, activation='nope')
+        raise AssertionError("unknown activation should have raised")
+    except ValueError as err:
+        assert 'activation' in str(err)
+    print(f"  identity activation: {len(nls)} nonlinearities no-op (rt={rt:.1e}), "
+          f"MLPs keep SiLU, SO(3) dE={de:.1e}, unknown string rejected")
+
+
 if __name__ == "__main__":
     print("ECENet integration")
     test_constructs_and_runs()
@@ -180,4 +226,5 @@ if __name__ == "__main__":
     test_ecenet_mp()
     test_forward_batch_topology_list_formats()
     test_zero_edge_energy_is_atomic_and_consistent()
+    test_identity_activation()
     print("All tests passed.")
