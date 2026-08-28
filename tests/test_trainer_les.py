@@ -81,8 +81,9 @@ def test_rmd17_use_les():
             assert res['les_module'] is not None
         ck = torch.load(ckpt, map_location='cpu', weights_only=False)
         assert 'les' in ck and ck['les']['state_dict'] is not None
-        # resume with use_les continues from the checkpoint...
-        train_ecenet(use_les=True, checkpoint_path=ckpt,
+        # resume with use_les continues from the checkpoint (les_readout must
+        # match the checkpoint's — the default now resolves to 'edge_basis')...
+        train_ecenet(use_les=True, les_readout='sum', checkpoint_path=ckpt,
                      **{**common, 'n_epochs': 3})
         # ...and a short-range run against an LES checkpoint is refused.
         try:

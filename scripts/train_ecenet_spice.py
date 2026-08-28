@@ -340,7 +340,7 @@ def train_ecenet_spice(
     film_hidden=None,
     film_per_m=False,
     film_shift=False,
-    les_readout='sum',     # (l0,l1) read-out for LES: 'sum' | 'softmax' | 'edge' | 'edge_basis'
+    les_readout=None,     # None -> 'edge_basis' if use_les else 'sum'
     les_charge_scale=1.0,  # fixed multiplier on the edge-mode latent charge (MACELES: 0.1)
     les_dipole=False,      # edge head also emits bond dipoles; l0 packed [q | u]
     les_charges=True,      # False (needs les_dipole): dipoles-only — q hard zero, standard-init dipole head
@@ -439,6 +439,11 @@ def train_ecenet_spice(
     if verbose:
         print_flush(f"  Loaded {len(test_raw):,} test structures")
 
+    if les_readout is None:
+        # 'edge_basis' is the LES default; short-range runs take 'sum' so the
+        # model carries no unused charge-head parameters (which would also
+        # break DDP's find_unused_parameters=False).
+        les_readout = 'edge_basis' if use_les else 'sum'
     # ── Split train → train + val ─────────────────────────────────────────
     idx = np.random.permutation(len(train_raw))
     n_val_actual = min(n_val, len(train_raw) // 10)

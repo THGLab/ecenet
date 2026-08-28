@@ -165,21 +165,10 @@ model, les_module, results = train_ecenet_xyz(
     use_les=True, n_epochs=200)
 ```
 
-`les_readout` selects how the latent charge is produced:
-
-| `les_readout` | aggregation |
-| --- | --- |
-| `'sum'` (default) | parameter-free scatter-sum of edge invariants; upstream's head maps it to charges |
-| `'softmax'` | attention-weighted read-out (intensive, distance-decaying) |
-| `'edge'` | Allegro-LES-style: a linear per-edge charge, summed per atom |
-| `'edge_basis'` | per-edge charge head mirroring the energy readout (learnable distance profile, vanishes at `r_cut`) |
-
-Further knobs (docstrings have the reasoning): `les_charge_scale` (fixed
-multiplier on the edge-mode latent charge, à la MACE-LES's `output_scale`),
-`les_dipole=True` (edge modes: every atom also gets a latent dipole `u`, fed
-to upstream's charge–dipole and dipole–dipole Ewald terms — polarization the
-fixed charges cannot express; molecular dipole `μ = Σ qᵢrᵢ + Σ uᵢ`), and
-`les_charges=False` (dipoles-only ablation).
+The latent charge comes from a per-edge charge head mirroring the energy
+readout (`les_readout='edge_basis'`, the default with `use_les=True`);
+alternative read-outs and the related options — latent dipoles, charge
+scaling, dipoles-only — are documented in the model docstring.
 
 **MD and evaluation.** `ECENetLESCalculator` loads a joint checkpoint and
 evaluates `E = E_sr + E_lr` on one graph — forces from the joint backward,

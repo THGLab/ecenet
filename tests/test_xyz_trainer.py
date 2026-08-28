@@ -104,7 +104,7 @@ def test_smoke_train_les():
         ckpt = os.path.join(td, 'xyz_les.mdl')
         _, les_module, results = train_ecenet_xyz(
             train_structures=[dict(s) for s in structs], n_val=2,
-            use_les=True, checkpoint_path=ckpt,
+            use_les=True, les_readout='sum', checkpoint_path=ckpt,
             n_epochs=2, batch_size=4, lr=5e-3, **COMMON,
         )
         assert les_module is not None
@@ -116,7 +116,7 @@ def test_smoke_train_les():
         # Resume: fresh call restores model + LES + optimizer and continues.
         _, les2, results2 = train_ecenet_xyz(
             train_structures=[dict(s) for s in structs], n_val=2,
-            use_les=True, checkpoint_path=ckpt,
+            use_les=True, les_readout='sum', checkpoint_path=ckpt,
             n_epochs=4, batch_size=4, lr=5e-3, **COMMON,
         )
         assert np.isfinite(results2['val_force_mae'])
@@ -224,7 +224,7 @@ def test_calculator_rejects_les_checkpoint():
         ckpt = os.path.join(td, 'xyz_les.mdl')
         train_ecenet_xyz(
             train_structures=make_structures(8, seed=9), n_val=2,
-            use_les=True, checkpoint_path=ckpt,
+            use_les=True, les_readout='sum', checkpoint_path=ckpt,
             n_epochs=1, batch_size=4, lr=5e-3, **COMMON,
         )
         try:

@@ -237,7 +237,9 @@ class ECENet(nn.Module):
         #   saddle a zero-init head could never leave. Smoothness at r_cut is
         #   inherited from the edge features' own radial envelope, as in
         #   Allegro-LES's EdgewiseReduce.
-        # 'edge_basis': 'edge' upgraded to mirror the energy readout end to
+        # 'edge_basis' (the trainers' default when use_les=True — the
+        #   bare-model default stays 'sum' so short-range models carry no
+        #   unused charge-head parameters): 'edge' upgraded to mirror the energy readout end to
         #   end — an MLP with output_net's architecture (same input: the full
         #   n_features_per_m m=0 invariant set of _contract, not the l'-summed
         #   h_l0; same hidden widths and activation) emits n_max_d channels
