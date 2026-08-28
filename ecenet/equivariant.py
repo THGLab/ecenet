@@ -65,7 +65,10 @@ class RealSpaceNonlinearity(nn.Module):
         n_features: number of feature channels
         m_max: maximum angular frequency
         n_grid: number of θ grid points (default: 4*m_max + 1)
-        activation: pointwise nonlinearity ('silu', 'relu', 'tanh', 'gelu')
+        activation: pointwise nonlinearity ('silu', 'relu', 'tanh', 'gelu'),
+                    or 'identity' — an exact no-op: synthesis→analysis is an
+                    exact round-trip for bandlimited features (the grid
+                    oversamples), so the block reduces to its linear part
     """
 
     def __init__(self, n_features, m_max, n_grid=None, activation='silu'):
@@ -94,8 +97,16 @@ class RealSpaceNonlinearity(nn.Module):
         # n_features, n_grid) grid tensor for nothing. Removed; checkpoints that
         # still carry the buffers load fine (see calculator.from_checkpoint).
 
-        # Nonlinearity
-        act_map = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh, 'gelu': nn.GELU}
+        # Nonlinearity. 'identity' makes the whole block an exact no-op (the
+        # round-trip through the θ grid is exact for bandlimited features), so
+        # the enclosing layer reduces to its linear part — the linearized-
+        # model ablation. The Triton fast path dispatches only for silu, so
+        # every other choice (identity included) takes the generic paths.
+        act_map = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh,
+                   'gelu': nn.GELU, 'identity': nn.Identity}
+        if activation not in act_map:
+            raise ValueError(f"activation must be one of {sorted(act_map)}, "
+                             f"got {activation!r}")
         self.activation = act_map[activation]()
 
         # Opt-in fused path (recompute-in-backward; Triton on CUDA). Set via

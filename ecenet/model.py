@@ -71,7 +71,12 @@ class ECENet(nn.Module):
         m_max:          max angular mode |m| kept after the equivariant layers
                         (default: l_max); lower it to cut cost at large l_max
         cutoff_type:    'cosine' or 'poly'
-        activation:     pointwise activation in the realspace nonlinearity ('silu', 'tanh', ...)
+        activation:     pointwise activation in the realspace nonlinearity ('silu', 'tanh',
+                        'relu', 'gelu'); 'identity' turns every RealSpaceNonlinearity — the
+                        layer stack AND the MP trunk/receiver — into an exact no-op, so the
+                        equivariant stack is purely linear (ablation; read-out MLPs keep
+                        SiLU). Broader than use_nonlinearity=False, which skips the
+                        nonlinearity in the main layer stack only (MP keeps its own).
         n_grid:         θ-grid points for the realspace nonlinearity (default: 4*m_max+1)
         output_hidden_dims: hidden widths of the readout MLP (default: [64])
         analytic_ace_basis: use ACEBasisAnalytic (recommended for force training)
@@ -424,8 +429,12 @@ class ECENet(nn.Module):
         in_dim = self.n_features_per_m
         n_output_out = n_max_d if n_max_d is not None else 1
         mlp_dims = [in_dim] + list(hidden_dims) + [n_output_out]
+        # 'identity' linearizes only the equivariant stack (RealSpaceNonlinearity
+        # becomes an exact no-op there, incl. the MP trunk/receiver); the scalar
+        # read-out MLPs keep SiLU — an identity MLP would just collapse to one
+        # linear map. Unknown strings already raised in RealSpaceNonlinearity.
         act = {'silu': nn.SiLU, 'tanh': nn.Tanh, 'relu': nn.ReLU,
-               'gelu': nn.GELU}.get(activation, nn.SiLU)
+               'gelu': nn.GELU, 'identity': nn.SiLU}[activation]
         self.output_net = OutputMLP(mlp_dims, activation=act())
 
         # 'edge_basis' charge head: same dims/activation as output_net (built
