@@ -270,3 +270,137 @@ def wigner_rotate(A_flat: torch.Tensor, D_block: torch.Tensor) -> torch.Tensor:
         (N, C, n_sph) rotated features.
     """
     return torch.bmm(A_flat, D_block)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Truncated (m_max < l_max) Wigner-D: only the columns the model consumes
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# With the angular layout truncated at m_max, the layers only ever read the
+# bond-frame components with |m| <= min(l, m_max) — and, in the reverse
+# direction, the packed features are exactly zero outside those slots. So both
+# the rotate (A @ D) and the unrotate (h @ D^T) consume only the corresponding
+# COLUMNS of each D^l block: a rectangular (n_sph, n_kept) slice of the
+# block-diagonal, n_kept = Σ_l (2·min(l, m_max)+1). The kept layout keeps the
+# per-l blocks contiguous in the SH ordering (m = -mk..mk), so index maps
+# mirror the full-layout ones with the block base l²+l replaced by
+# kept_offset(l) + min(l, m_max).
+
+
+def n_kept_columns(l_max: int, m_max: int) -> int:
+    """Width of the kept-column layout: Σ_l (2·min(l, m_max)+1)."""
+    return sum(2 * min(l, m_max) + 1 for l in range(l_max + 1))
+
+
+def kept_offsets(l_max: int, m_max: int):
+    """Start of each l's block in the kept layout (list of l_max+2 ints;
+    the last entry is n_kept)."""
+    off = [0]
+    for l in range(l_max + 1):
+        off.append(off[-1] + 2 * min(l, m_max) + 1)
+    return off
+
+
+def build_D_slice(r_hat: torch.Tensor, l_max: int, m_max: int) -> torch.Tensor:
+    """Kept columns of the block-diagonal Wigner-D: (N, n_sph, n_kept).
+
+    ``A @ build_D_slice(...)`` equals the kept columns of
+    ``A @ build_D_block(...)`` exactly (same recursion, column slice) — pure
+    differentiable torch, safe for double-backward force-loss training.
+    """
+    D_list = recursive_wigner_D(r_hat, l_max)
+    N = r_hat.shape[0]
+    n_sph = (l_max + 1) ** 2
+    blocks = []
+    for l, Dl in enumerate(D_list):
+        mk = min(l, m_max)
+        blk = torch.zeros(N, n_sph, 2 * mk + 1,
+                          dtype=r_hat.dtype, device=r_hat.device)
+        blk[:, l * l:(l + 1) * (l + 1), :] = Dl[:, :, l - mk:l + mk + 1]
+        blocks.append(blk)
+    return torch.cat(blocks, dim=2)
+
+
+class _SphYGrad(torch.autograd.Function):
+    """Y and its Cartesian gradient as *values*, with a first-order backward
+    via sphericart's Hessians. once_differentiable: a second backward (force-
+    loss training) raises rather than silently returning wrong gradients —
+    this is the single-backward leg of the analytic D-slice below."""
+
+    @staticmethod
+    def forward(ctx, r_hat, l_max):
+        sph = _get_sph_cache(l_max)
+        Y, dY = sph.compute_with_gradients(r_hat.detach().contiguous())
+        ctx.save_for_backward(r_hat)
+        ctx.l_max = l_max
+        return Y, dY
+
+    @staticmethod
+    def backward(ctx, gY, gdY):
+        # Grad mode is enabled inside backward only under create_graph — i.e.
+        # when someone is building a force graph to differentiate again
+        # (force-loss training). once_differentiable would be SILENT here:
+        # the analytic D mixes this Function with differentiable ops (the D1
+        # block), so a double backward would quietly drop this branch's
+        # second derivative instead of erroring. Raise loudly instead.
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "analytic Wigner-D is single-backward only (its gradient "
+                "runs through sphericart Hessians; no third derivatives). "
+                "For force-loss training use the recursion path: "
+                "model.set_analytic_wigner(False).")
+        (r_hat,) = ctx.saved_tensors
+        sph = _get_sph_cache(ctx.l_max)
+        _, dY, H = sph.compute_with_hessians(r_hat.detach().contiguous())
+        grad = torch.einsum('ns,ncs->nc', gY, dY)
+        grad = grad + torch.einsum('nds,ncds->nc', gdY, H)
+        return grad, None
+
+
+def build_D_slice_analytic(r_hat: torch.Tensor, l_max: int,
+                           m_max: int) -> torch.Tensor:
+    """Analytic kept columns for m_max <= 1 — no CG recursion.
+
+    Closed forms (discovered numerically against ``recursive_wigner_D`` and
+    verified to ~1e-15 in tests/test_wigner_slice.py; the code's gauge is the
+    two-chart frame of ``build_D1_from_rhat``, whose ±1 columns are exactly
+    the tangent frame e_±):
+
+        D^l[:, m=0]  = sqrt(4π/(2l+1)) · Y_l(r̂)
+        D^l[:, m=±1] = sqrt(4π/(2l+1)) · sqrt(2/(l(l+1))) · (∇Y_l(r̂) · e_±)
+
+    One sphericart call replaces the recursion. SINGLE-BACKWARD ONLY (the
+    gradient path runs through sphericart Hessians): fine for MD / inference
+    forces and the stress strain pass, but a force-loss training step (double
+    backward) raises. Use ``build_D_slice`` for training.
+    """
+    if m_max > 1:
+        raise ValueError(f"build_D_slice_analytic supports m_max <= 1 "
+                         f"(closed forms for |m| <= 1), got m_max={m_max}")
+    N = r_hat.shape[0]
+    n_sph = (l_max + 1) ** 2
+    Y, dY = _SphYGrad.apply(r_hat, l_max)
+    if m_max >= 1 and l_max >= 1:
+        D1 = build_D1_from_rhat(r_hat)          # differentiable; defines gauge
+        # frame vectors in Cartesian from the (y, z, x) real-SH basis rows
+        e_p = torch.stack([D1[:, 2, 2], D1[:, 0, 2], D1[:, 1, 2]], dim=1)
+        e_m = torch.stack([D1[:, 2, 0], D1[:, 0, 0], D1[:, 1, 0]], dim=1)
+        g_p = torch.einsum('nc,ncs->ns', e_p, dY)
+        g_m = torch.einsum('nc,ncs->ns', e_m, dY)
+    blocks = []
+    for l in range(l_max + 1):
+        s, e = l * l, (l + 1) * (l + 1)
+        a = math.sqrt(4.0 * math.pi / (2 * l + 1))
+        col0 = a * Y[:, s:e]
+        if l == 0 or m_max == 0:
+            cols = col0.unsqueeze(2)
+        elif l == 1:
+            cols = D1                            # exact, differentiable, cheap
+        else:
+            b = a * math.sqrt(2.0 / (l * (l + 1)))
+            cols = torch.stack([b * g_m[:, s:e], col0, b * g_p[:, s:e]], dim=2)
+        blk = torch.zeros(N, n_sph, cols.shape[2],
+                          dtype=r_hat.dtype, device=r_hat.device)
+        blk[:, s:e, :] = cols
+        blocks.append(blk)
+    return torch.cat(blocks, dim=2)
