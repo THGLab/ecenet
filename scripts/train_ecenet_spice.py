@@ -328,7 +328,7 @@ def train_ecenet_spice(
     bottleneck_dim=None,
     # Message passing
     n_mp=1,
-    mp_type='softmax',
+    mp_type='sum',
     mp_dim=None,
     mp_n_heads=1,
     mp_msg_envelope=True,

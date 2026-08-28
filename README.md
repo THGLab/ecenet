@@ -133,25 +133,10 @@ An element-conditioned FiLM gate on the edge features is on by default
 (`element_film=False` disables it; sub-options in `ecenet/film.py`).
 
 **Message passing** — with `n_mp >= 2`, each MP layer computes a per-edge
-message and an invariant score, aggregates messages at the receiving atom, and
-applies a receiver transform. `mp_type` selects the weighting:
-
-| `mp_type` | behaviour |
-| --- | --- |
-| `'softmax'` (default) | attention over the receiver's incoming edges — a weighted average, intensive in coordination |
-| `'sum'` | signed score × cutoff envelope — extensive, and a neighbour can contribute negatively |
-
-Both are smooth as edges cross `r_cut_edge`. `mp_dim` sets the message trunk's
-bottleneck width, `mp_n_heads` the number of attention heads, and
-`mp_l_attention` gives each head one score per degree `l`. Zero-init at the
-trunk output, so message passing is a no-op at initialisation. (The older
-`mp_type='edge'` has been removed; its checkpoints are rejected with an
-explicit error.)
-
-**Nonlinearity** — `activation` selects the pointwise nonlinearity
-(`'silu'` default); `activation='identity'` linearizes the full equivariant
-stack (ablation), and `use_nonlinearity=False` skips it in the main layer
-stack only.
+message weighted by an invariant score, aggregates at the receiving atom, and
+applies a receiver transform; smooth as edges cross `r_cut_edge`, and a no-op
+at initialisation. `mp_type='sum'` by default (`'softmax'`, `mp_dim`,
+`mp_n_heads`, `mp_l_attention` in the docstring).
 
 ## Long-range electrostatics (LES, optional)
 

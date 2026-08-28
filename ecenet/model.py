@@ -88,13 +88,14 @@ class ECENet(nn.Module):
                         — a fused message/score trunk and a receiver transform —
                         and differ only in the weight applied to each incoming
                         message:
-                          'softmax' (default): softmax over the receiver's
-                            incoming edges, so the aggregate is a weighted
-                            *average* (intensive in coordination). Zero-init
-                            scores make the attention uniform at init.
-                          'sum': the raw signed score times the cutoff envelope,
-                            summed (extensive in coordination). Zero-init scores
-                            make the layer an exact no-op at init.
+                          'sum' (default): the raw signed score times the cutoff
+                            envelope, summed (extensive in coordination).
+                            Zero-init scores make the layer an exact no-op at
+                            init.
+                          'softmax': softmax over the receiver's incoming edges,
+                            so the aggregate is a weighted *average* (intensive
+                            in coordination). Zero-init scores make the
+                            attention uniform at init.
         mp_dim:         bottleneck width of the fused message/score trunk and of
                         the receiver block (default: n_features_per_m // 4)
         mp_n_heads:     number of attention heads; the value channels
@@ -154,7 +155,7 @@ class ECENet(nn.Module):
         output_hidden_dims: list = None,
         m_max: int = None,
         bottleneck_dim: int = None,
-        mp_type: str = 'softmax',
+        mp_type: str = 'sum',
         mp_dim: int = None,
         mp_n_heads: int = 1,
         mp_msg_envelope: bool = True,
