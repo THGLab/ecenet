@@ -404,3 +404,60 @@ def build_D_slice_analytic(r_hat: torch.Tensor, l_max: int,
         blk[:, s:e, :] = cols
         blocks.append(blk)
     return torch.cat(blocks, dim=2)
+
+
+class RotationWeights:
+    """Matrix-free bond-frame rotation for m_max <= 1.
+
+    Wraps the (N, k, n_sph) weight tensor of ``analytic_rotation_weights``
+    (k = 1 for m_max=0, 3 for m_max=1; rows [W0, W+, W-]). A distinct type —
+    not a bare tensor — so consumers (the model's edge frame, the MP layers'
+    frame crossings) can dispatch on it unambiguously instead of sniffing
+    shapes that can collide with D-slice widths.
+    """
+    __slots__ = ('w',)
+
+    def __init__(self, w):
+        self.w = w
+
+
+def analytic_rotation_weights(r_hat, l_max: int, m_max: int) -> RotationWeights:
+    """The m_max <= 1 bond-frame rotation as three weight VECTORS — no matrix.
+
+    Contracting the analytic D columns with the features shows the rotation is
+    a point evaluation: per channel and degree l, the m=0 output is the
+    channel's spherical function evaluated at r̂ and the m=±1 outputs are its
+    two tangential derivatives there. So all any consumer needs is
+
+        W0[s] = a_{l(s)} · Y[s]           (→ cos m=0)
+        W+[s] = b_{l(s)} · (∇Y[s] · e_+)  (→ cos m=1)
+        W-[s] = b_{l(s)} · (∇Y[s] · e_-)  (→ sin m=1)
+
+    with a_l, b_l the coefficients of ``build_D_slice_analytic`` and e_± the
+    gauge frame. Rotate-in / unrotate become elementwise-multiply + per-l
+    segment sums — Σ_l (2l+1)·k flops per channel instead of the slice bmm's
+    n_sph·n_kept, and no D tensor is materialized. Same single-backward
+    contract as the analytic slice (∇Y values; Hessians in backward).
+    """
+    if m_max > 1:
+        raise ValueError(f"analytic_rotation_weights supports m_max <= 1, "
+                         f"got m_max={m_max}")
+    Y, dY = _SphYGrad.apply(r_hat, l_max)
+    a = torch.cat([torch.full((2 * l + 1,),
+                              math.sqrt(4.0 * math.pi / (2 * l + 1)),
+                              dtype=r_hat.dtype, device=r_hat.device)
+                   for l in range(l_max + 1)])
+    W0 = a * Y
+    if m_max == 0:
+        return RotationWeights(W0.unsqueeze(1))
+    b = torch.cat([torch.full((2 * l + 1,),
+                              (math.sqrt(4.0 * math.pi / (2 * l + 1))
+                               * math.sqrt(2.0 / (l * (l + 1)))) if l > 0 else 0.0,
+                              dtype=r_hat.dtype, device=r_hat.device)
+                   for l in range(l_max + 1)])
+    D1 = build_D1_from_rhat(r_hat)
+    e_p = torch.stack([D1[:, 2, 2], D1[:, 0, 2], D1[:, 1, 2]], dim=1)
+    e_m = torch.stack([D1[:, 2, 0], D1[:, 0, 0], D1[:, 1, 0]], dim=1)
+    Wp = b * torch.einsum('nc,ncs->ns', e_p, dY)
+    Wm = b * torch.einsum('nc,ncs->ns', e_m, dY)
+    return RotationWeights(torch.stack([W0, Wp, Wm], dim=1))

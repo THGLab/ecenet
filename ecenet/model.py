@@ -40,10 +40,11 @@ from ecenet.equivariant import EquivariantLinear, RealSpaceNonlinearity
 from ecenet.film import ElementFiLM
 from ecenet.radial import find_edges, get_cutoff_fn, radial_basis
 from ecenet.spherical import (
+    RotationWeights,
+    analytic_rotation_weights,
     build_D1_from_rhat,
     build_D_block,
     build_D_slice,
-    build_D_slice_analytic,
     kept_offsets,
     spherical_harmonics_float64,
 )
@@ -805,10 +806,12 @@ class ECENet(nn.Module):
         return self
 
     def set_analytic_wigner(self, enabled: bool = True):
-        """Toggle the analytic Wigner-D slice (m_max <= 1 only): the kept
-        columns come from one sphericart call — Y for m=0, tangential
-        gradients along the gauge frame for m=±1 — instead of the CG
-        recursion (see spherical.build_D_slice_analytic). SINGLE-BACKWARD
+        """Toggle the analytic, MATRIX-FREE Wigner rotation (m_max <= 1
+        only): no D tensor is built at all — the rotation is applied as
+        three weight vectors from one sphericart call (Y for m=0,
+        tangential gradients along the gauge frame for m=±1; see
+        spherical.analytic_rotation_weights), used by the edge frame and
+        both MP frame crossings. SINGLE-BACKWARD
         ONLY: forces for MD/inference and the stress strain pass are fine,
         but force-loss training (double backward) raises — like
         set_activation_fused, leave it off for training. Returns self."""
@@ -841,7 +844,9 @@ class ECENet(nn.Module):
         path is active (analytic when requested), full block otherwise."""
         if self._d_slice_active():
             if getattr(self, '_analytic_wigner', False):
-                return build_D_slice_analytic(r_hat, self.l_max, self.m_max)
+                # matrix-free: the rotation as three weight vectors — see
+                # spherical.analytic_rotation_weights (single-backward)
+                return analytic_rotation_weights(r_hat, self.l_max, self.m_max)
             return build_D_slice(r_hat, self.l_max, self.m_max)
         return build_D_block(r_hat, self.l_max)
 
@@ -851,7 +856,11 @@ class ECENet(nn.Module):
         or the kept-column slice when m_max < l_max) is built here so callers
         can reuse it (MP layers, node aggregation)."""
         D = self._build_D(r_hat)
-        if getattr(self, '_edge_frame_fused', False):
+        if isinstance(D, RotationWeights):
+            A_both = torch.cat([A_emb[edge_i], A_emb[edge_j]], dim=1)
+            A_cos, A_sin = _matrix_free_to_angular(
+                A_both, D, self.l_max, self.sph_to_angular)
+        elif getattr(self, '_edge_frame_fused', False):
             A_cos, A_sin = edge_frame_fused(A_emb, edge_i, edge_j, D,
                                             self.sph_to_angular)
         else:
@@ -1319,11 +1328,14 @@ class ECENet(nn.Module):
         r_hat_flat  = r_hat.reshape(B * n_edges, 3)
         A_both_flat = A_both.reshape(B * n_edges, 2 * self.embed_dim, self.n_sph)
         D_block = self._build_D(r_hat_flat)
-        A_rot_flat  = torch.bmm(A_both_flat, D_block)
-
-        # ── Step 4: Reshape to A_cos / A_sin ─────────────────────────────
-        A_cos_flat, A_sin_flat = self.sph_to_angular(
-            A_rot_flat, sliced=D_block.shape[-1] != self.n_sph)
+        if isinstance(D_block, RotationWeights):
+            A_cos_flat, A_sin_flat = _matrix_free_to_angular(
+                A_both_flat, D_block, self.l_max, self.sph_to_angular)
+        else:
+            A_rot_flat = torch.bmm(A_both_flat, D_block)
+            # ── Step 4: Reshape to A_cos / A_sin ─────────────────────────
+            A_cos_flat, A_sin_flat = self.sph_to_angular(
+                A_rot_flat, sliced=D_block.shape[-1] != self.n_sph)
         # shapes: (B*n_edges, n_features_per_m, n_angular)
 
         # ── Step 5: Equivariant layers ────────────────────────────────────
@@ -1565,6 +1577,50 @@ def _unpack_kept_to_angular(v_rot, n_base, l_max, m_max, n_angular):
     return d_cos, d_sin
 
 
+@functools.lru_cache(maxsize=None)
+def _l_index_of_s(l_max, device):
+    """(n_sph,) map from flat SH index to its degree l."""
+    return torch.cat([torch.full((2 * l + 1,), l, dtype=torch.long)
+                      for l in range(l_max + 1)]).to(torch.device(device))
+
+
+def _matrix_free_segments(X, W, l_max):
+    """Per-l weighted segment sums: X (E, C, n_sph) ⊙ each weight row of
+    W.w (E, k, n_sph), summed within each degree → (E, C, k, l_max+1).
+
+    This IS the bond-frame rotation for m_max <= 1 (the kept components are
+    the channel functions' values / tangential derivatives at r̂); a small
+    k-loop keeps the transient at one X-sized tensor per row."""
+    E, C, S = X.shape
+    l_idx = _l_index_of_s(l_max, X.device)
+    outs = []
+    for k in range(W.w.shape[1]):
+        P = X * W.w[:, k].unsqueeze(1)                       # (E, C, S)
+        o = torch.zeros(E, C, l_max + 1, dtype=X.dtype, device=X.device)
+        outs.append(o.index_add_(2, l_idx, P))
+    return torch.stack(outs, dim=2)                          # (E, C, k, l+1)
+
+
+def _matrix_free_to_angular(A_both, W, l_max, sph_to_angular):
+    """Matrix-free rotate-in straight to the angular layout: (E, Cb, n_sph) →
+    A_cos/A_sin (E, Cb·(l_max+1), n_angular). Row order of W.w is
+    [W0 → cos m=0, W+ → cos m=1, W- → sin m=1]; the l=0 rows of W± are
+    exactly zero (b_0 = 0), so the structural slots stay zero — the valid
+    masks are applied anyway for bit-parity with the sliced path."""
+    E, Cb, _ = A_both.shape
+    seg = _matrix_free_segments(A_both, W, l_max)            # (E, Cb, k, l+1)
+    n_ch = Cb * (l_max + 1)
+    if W.w.shape[1] == 1:                                    # m_max = 0
+        A_cos = seg[:, :, 0].reshape(E, n_ch, 1)
+        A_sin = torch.zeros_like(A_cos)
+    else:
+        A_cos = torch.stack([seg[:, :, 0], seg[:, :, 1]],
+                            dim=-1).reshape(E, n_ch, 2)
+        A_sin = torch.stack([torch.zeros_like(seg[:, :, 2]), seg[:, :, 2]],
+                            dim=-1).reshape(E, n_ch, 2)
+    return A_cos * sph_to_angular.cos_valid, A_sin * sph_to_angular.sin_valid
+
+
 class ECENetAttentionMPLayer(nn.Module):
     """Attention-style message passing for ECENet.
 
@@ -1750,11 +1806,29 @@ class ECENetAttentionMPLayer(nn.Module):
         # materializes); the weighting below acts on h_global either way — the
         # gate is applied in the node frame, so 'sum'/'softmax'/l_attention all
         # compose with the fusion unchanged.
-        d_sliced = D_block.shape[-1] != self.n_sph
+        mfree = isinstance(D_block, RotationWeights)
+        d_sliced = (not mfree) and D_block.shape[-1] != self.n_sph
         if getattr(self, 'edge_frame_fused_e2n', False):
-            assert not d_sliced, "fused e2n needs the full D block"
+            assert not (d_sliced or mfree), "fused e2n needs the full D block"
             h_global = pack_unrotate_fused(m_cos, m_sin, D_block,
                                            self.l_max, self.m_max)
+        elif mfree:
+            # transpose of the matrix-free rotate: broadcast each kept
+            # component over its l-block and sum the weighted copies. The
+            # l=0 rows of W± are zero, so any structural-scratch content in
+            # those input slots is annihilated exactly.
+            lp1 = self.l_max + 1
+            l_idx = _l_index_of_s(self.l_max, m_cos.device)
+            mc = m_cos.view(n_e, self.n_base, lp1, self.n_angular)
+            h_global = (mc[..., 0].index_select(2, l_idx)
+                        * D_block.w[:, 0].unsqueeze(1))
+            if D_block.w.shape[1] == 3:
+                ms = m_sin.view(n_e, self.n_base, lp1, self.n_angular)
+                h_global = (h_global
+                            + mc[..., 1].index_select(2, l_idx)
+                            * D_block.w[:, 1].unsqueeze(1)
+                            + ms[..., 1].index_select(2, l_idx)
+                            * D_block.w[:, 2].unsqueeze(1))
         elif d_sliced:
             # packed features are zero outside the kept |m| <= min(l, m_max)
             # slots, so packing into the kept layout and multiplying the D
@@ -1820,9 +1894,21 @@ class ECENetAttentionMPLayer(nn.Module):
 
         # 6. Gather to edges (source atom), rotate back to the edge frame.
         if getattr(self, 'edge_frame_fused', False):
-            assert not d_sliced, "fused rotate-back needs the full D block"
+            assert not (d_sliced or mfree), \
+                "fused rotate-back needs the full D block"
             d_cos, d_sin = edge_frame_fused_single(
                 Delta, edge_i, D_block, self.l_max, self.m_max)
+        elif mfree:
+            seg = _matrix_free_segments(Delta[edge_i], D_block, self.l_max)
+            if D_block.w.shape[1] == 1:
+                d_cos = seg[:, :, 0].reshape(n_e, self.n_ch, 1)
+                d_sin = torch.zeros_like(d_cos)
+            else:
+                d_cos = torch.stack([seg[:, :, 0], seg[:, :, 1]],
+                                    dim=-1).reshape(n_e, self.n_ch, 2)
+                d_sin = torch.stack(
+                    [torch.zeros_like(seg[:, :, 2]), seg[:, :, 2]],
+                    dim=-1).reshape(n_e, self.n_ch, 2)
         elif d_sliced:
             v_rot = torch.bmm(Delta[edge_i], D_block)        # (n_e, n_base, n_kept)
             dk_cos, dk_sin = _unpack_kept_to_angular(

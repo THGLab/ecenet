@@ -192,6 +192,33 @@ def test_model_slice_bit_identical():
               f"exact), SO(3) {de:.1e}")
 
 
+def test_matrix_free_weights():
+    """analytic_rotation_weights: the weight-vector contraction equals the
+    analytic D-slice columns exactly (it is the same rotation, matrix-free),
+    for m_max 0 and 1, hard directions included."""
+    from ecenet.spherical import analytic_rotation_weights
+
+    r = hard_directions(16)
+    A = torch.randn(16, 6, 16, dtype=DTYPE)
+    for m_max in (0, 1):
+        ref = torch.bmm(A, build_D_slice_analytic(r, 3, m_max))
+        W = analytic_rotation_weights(r, 3, m_max).w
+        off = kept_offsets(3, m_max)
+        worst = 0.0
+        for l in range(4):
+            s, e = l * l, (l + 1) * (l + 1)
+            mk = min(l, m_max)
+            def seg(w):
+                return torch.einsum('ecs,es->ec', A[:, :, s:e], w[:, s:e])
+            rows = ([seg(W[:, 2])] if mk >= 1 else []) + [seg(W[:, 0])] \
+                + ([seg(W[:, 1])] if mk >= 1 else [])
+            for k, gcol in enumerate(rows):
+                worst = max(worst,
+                            (gcol - ref[:, :, off[l] + k]).abs().max().item())
+        assert worst < 1e-14, f"m_max={m_max}: weights != slice ({worst:.2e})"
+    print("  matrix-free weights == analytic slice columns (m_max 0 and 1)")
+
+
 def test_model_analytic():
     pos, types = random_structure()
     torch.manual_seed(0)
@@ -248,5 +275,6 @@ if __name__ == "__main__":
     test_slice_matches_block_columns()
     test_analytic_matches_recursion()
     test_model_slice_bit_identical()
+    test_matrix_free_weights()
     test_model_analytic()
     print("All tests passed.")
