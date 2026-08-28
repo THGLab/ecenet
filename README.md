@@ -146,8 +146,8 @@ interaction between those charges (reciprocal-space Ewald for periodic systems)
 joins the total energy on one autograd graph, so forces and stress need no
 extra code.
 
-The implementation is **not vendored** — `ecenet.les.LESLongRange` wraps the
-inventors' reference package, installed separately (pinned; it is not on PyPI):
+`ecenet.les.LESLongRange` wraps the inventors' reference package, installed
+separately (pinned; it is not on PyPI):
 
 ```bash
 pip install -e ".[les]"     # or directly:
