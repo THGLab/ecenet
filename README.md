@@ -211,31 +211,6 @@ pinned.
 > (academic use unrestricted). This repository's own license covers only the
 > code in this repository and grants no rights to either.
 
-## Trainer options
-
-**Learning-rate schedules** — `lr_schedule='plateau'` (default) |
-`'multistep'` (`lr_milestones`, `lr_gamma`) | `'cosine'` (`lr_min_factor`),
-plus `warmup_epochs` for the latter two. `multistep` and `cosine` are pure
-functions of the epoch index — resume-exact, nothing in the checkpoint, and
-every DDP rank computes the same LR independently.
-
-```python
-train_ecenet(..., lr_schedule='cosine', warmup_epochs=5, lr_min_factor=0.01)
-```
-
-**Size-aware batching** (SPICE trainer, and the MPtrj prepared-shard mode) —
-`bucket=True` batches similar-sized structures; `max_atoms_per_batch=250`
-packs to a total-atom budget so per-step memory/compute is roughly uniform;
-`max_batch_count` caps structures per batch; `bucket_sort=False` trades a
-little load balance for batch diversity. All modes keep every DDP rank on the
-same batch count (the collective in backward deadlocks otherwise) via a
-deterministic round-alignment scheme — see the trainer docstrings.
-
-**Other** — `precompute_topology=True` (SPICE) builds neighbour lists once at
-startup (numerics-identical, skips per-step GPU syncs); `tf32=True` routes
-float32 matmuls to TF32 tensor cores (A/B the validation MAE before trusting
-it; float64 warns and changes nothing).
-
 ## Fused kernels (optional)
 
 Two opt-in fused paths trade nothing numerically for memory (and, with Triton
