@@ -165,22 +165,33 @@ time_fn("embed (einsum A×W → A_emb)",
 A_emb = model._embed(A, types)
 A_both = torch.cat([A_emb[edge_i], A_emb[edge_j]], dim=1)
 
-# Wigner rotation breakdown
+# Wigner rotation breakdown. When --edge_frame_fused is on, the real forward
+# replaces the gather+cat, the bmm rotate, and sph_to_angular with one fused op
+# — those lines are then labeled "(unfused ref)" and the fused op is timed too,
+# so the sub-components reflect the path that actually runs.
+_ef = ' (unfused ref)' if args.edge_frame_fused else ''
 _, D_list = time_fn("  Wigner D (recursive_wigner_D)",
         lambda: recursive_wigner_D(r_hat, model.l_max))
 _, D_block_main = time_fn("  Wigner D (build_D_block_from_list)",
         lambda: build_D_block_from_list(D_list, len(r_hat), model.l_max,
                                         r_hat.device, r_hat.dtype))
-time_fn("  Wigner bmm (A_both @ D)",
+time_fn(f"  Wigner bmm (A_both @ D){_ef}",
         lambda: torch.bmm(A_both, D_block_main))
-time_fn("Wigner rotate total (main, w/ cached D)",
+time_fn(f"Wigner rotate total (main, w/ cached D){_ef}",
         lambda: wigner_rotate(A_both, D_block_main))
 
 A_rot = wigner_rotate(A_both, D_block_main)
 
 # sph_to_angular
-time_fn("sph_to_angular (repeat_interleave + gather)",
+time_fn(f"sph_to_angular (repeat_interleave + gather){_ef}",
         lambda: model.sph_to_angular(A_rot))
+
+if args.edge_frame_fused:
+    from ecenet.edge_frame_kernel import edge_frame_fused, edge_frame_fused_single, \
+        pack_unrotate_fused
+    time_fn("edge-frame fused (gather+rotate+reshape)",
+            lambda: edge_frame_fused(A_emb, edge_i, edge_j, D_block_main,
+                                     model.sph_to_angular))
 
 A_cos, A_sin = model.sph_to_angular(A_rot)
 
@@ -200,12 +211,16 @@ for gi, layer_group in enumerate(stages):
         # Low-rank (bottleneck_dim) layers have linear_down/linear_up instead
         # of a single full-width linear; the nonlinearity runs at the
         # bottleneck width, between the two.
+        # The nonlin lines call the real module, so they already time the fused
+        # path when --fuse_nonlin is on — the suffix just says which path ran.
+        nl_tag = (' (fused)' if layer.use_nonlinearity
+                  and getattr(layer.nonlin, 'fused', False) else '')
         if layer.bottleneck_dim is not None:
             time_fn(f"  EquivariantLinear down [{gi},{li}]",
                     lambda l=layer: l.linear_down(A_cos, A_sin))
             lin_out = layer.linear_down(A_cos, A_sin)
             if layer.use_nonlinearity:
-                time_fn(f"  RealSpaceNonlinearity [{gi},{li}]",
+                time_fn(f"  RealSpaceNonlinearity [{gi},{li}]{nl_tag}",
                         lambda l=layer, c=lin_out: l.nonlin(*c))
             nl_out = layer.nonlin(*lin_out) if layer.use_nonlinearity else lin_out
             time_fn(f"  EquivariantLinear up [{gi},{li}]",
@@ -215,7 +230,7 @@ for gi, layer_group in enumerate(stages):
                     lambda l=layer: l.linear(A_cos, A_sin))
             lin_out = layer.linear(A_cos, A_sin)
             if layer.use_nonlinearity:
-                time_fn(f"  RealSpaceNonlinearity [{gi},{li}]",
+                time_fn(f"  RealSpaceNonlinearity [{gi},{li}]{nl_tag}",
                         lambda l=layer, c=lin_out: l.nonlin(*c))
         A_cos, A_sin = layer(A_cos, A_sin)
 
@@ -236,12 +251,20 @@ for gi, layer_group in enumerate(stages):
         m_sin = u_sin[:, :mp.n_ch] + A_sin
         s = u_cos[:, mp.n_ch:mp.n_ch + mp.n_scores, 0]
 
-        _, h_packed = time_fn("  MP pack cos/sin → n_sph",
+        # With e2n fusion the real forward runs pack+unrotate as one fused op;
+        # the two reference lines are kept (labeled) for comparison and the
+        # fused op is timed as its own line.
+        _e2n = ' (unfused ref)' if getattr(mp, 'edge_frame_fused_e2n', False) else ''
+        _, h_packed = time_fn(f"  MP pack cos/sin → n_sph{_e2n}",
                               lambda: mp._pack(m_cos, m_sin))
 
         D_block_main_T = D_block_main.transpose(-1, -2)
-        time_fn("  MP bmm unrotate (h @ D^T)",
+        time_fn(f"  MP bmm unrotate (h @ D^T){_e2n}",
                 lambda: torch.bmm(h_packed, D_block_main_T))
+        if getattr(mp, 'edge_frame_fused_e2n', False):
+            time_fn("  MP pack+unrotate (fused e2n)",
+                    lambda: pack_unrotate_fused(m_cos, m_sin, D_block_main,
+                                                mp.l_max, mp.m_max))
         h_global = torch.bmm(h_packed, D_block_main_T)
 
         def _weights():
@@ -275,10 +298,18 @@ for gi, layer_group in enumerate(stages):
         Delta = torch.zeros(n_atoms, H, hb, mp.n_sph, device=device, dtype=dtype
                             ).scatter_add(0, idx, contrib).reshape(n_atoms, mp.n_base, mp.n_sph)
 
-        time_fn("  MP bmm rotate back (Delta @ D)",
+        # Same for the return leg: gather+rotate-back+unpack is one fused op in
+        # the real forward when edge_frame_fused is on.
+        _eff = ' (unfused ref)' if getattr(mp, 'edge_frame_fused', False) else ''
+        time_fn(f"  MP bmm rotate back (Delta @ D){_eff}",
                 lambda: torch.bmm(Delta[edge_i], D_block_main))
         v_rot = torch.bmm(Delta[edge_i], D_block_main)
-        _, d = time_fn("  MP unpack n_sph → cos/sin", lambda: mp._unpack(v_rot, n_e))
+        _, d = time_fn(f"  MP unpack n_sph → cos/sin{_eff}",
+                       lambda: mp._unpack(v_rot, n_e))
+        if getattr(mp, 'edge_frame_fused', False):
+            time_fn("  MP gather+rotate+unpack (fused)",
+                    lambda: edge_frame_fused_single(Delta, edge_i, D_block_main,
+                                                    mp.l_max, mp.m_max))
         time_fn("  MP receiver block", lambda: mp.receiver(*d))
 
         A_cos, A_sin = mp(A_cos, A_sin, r_hat, dist_ij, edge_i, edge_j,
