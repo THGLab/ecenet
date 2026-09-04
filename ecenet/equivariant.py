@@ -37,9 +37,16 @@ class EquivariantLinear(nn.Module):
     batch-contiguity requirement copied the full per-edge activation on every
     call and emitted an m-major output that downstream consumers (the fused
     nonlinearity, residual adds, the next einsum) paid to re-normalize —
-    profiling showed that layout churn at ~29% of the whole force step. Here
-    input and output are both plain row-major views: no permutes, no copies,
-    and the layout every consumer wants.
+    profiling showed that layout churn at ~29% of the whole force step. The
+    dense form's input and output are both plain row-major views: no
+    permutes, no copies, and the layout every consumer wants.
+
+    The trade only pays where the padded GEMM is (near-)free: on CUDA tensor
+    cores. On fp32 CUDA cores (TF32 off) and in float64 the 3x padding costs
+    exactly 3x — measured slower than the einsum path despite the copies —
+    so dispatch is automatic: dense for CUDA fp16/bf16, and for CUDA fp32
+    with TF32 enabled; einsum otherwise. ``dense_gemm`` (True/False)
+    overrides the automatic choice.
     """
 
     def __init__(self, in_features, out_features, n_angular, m_max):
@@ -48,12 +55,23 @@ class EquivariantLinear(nn.Module):
         self.out_features = out_features
         self.n_angular = n_angular
         self.m_max = m_max
+        self.dense_gemm = None       # None = auto (see _use_dense)
 
         # (n_angular, out_features, in_features)
         std = (2.0 / (in_features + out_features)) ** 0.5
         self.weights = nn.Parameter(torch.randn(n_angular, out_features, in_features) * std)
 
         self.bias = nn.Parameter(torch.zeros(out_features))
+
+    def _use_dense(self, x):
+        if self.dense_gemm is not None:
+            return self.dense_gemm
+        if not x.is_cuda:
+            return False
+        if x.dtype in (torch.float16, torch.bfloat16):
+            return True
+        return (x.dtype == torch.float32
+                and torch.backends.cuda.matmul.allow_tf32)
 
     def _dense_weight(self):
         """(in·n_ang, out·n_ang) block-diagonal-per-m weight, row-major flat
@@ -65,6 +83,12 @@ class EquivariantLinear(nn.Module):
         return Wd.reshape(Fi * na, Fo * na)
 
     def forward(self, A_cos, A_sin):
+        if not self._use_dense(A_cos):
+            A_cos_out = torch.einsum('...id,doi->...od', A_cos, self.weights)
+            A_sin_out = torch.einsum('...id,doi->...od', A_sin, self.weights)
+            A_cos_out[..., 0] = A_cos_out[..., 0] + self.bias   # bias on m=0 only
+            return A_cos_out, A_sin_out
+
         na, Fo = self.n_angular, self.out_features
         lead = A_cos.shape[:-2]
         Wd = self._dense_weight()

@@ -38,6 +38,7 @@ def reference(A_cos, A_sin, weights, bias):
 def make_layer(Fi=12, Fo=9, m_max=2, seed=0):
     torch.manual_seed(seed)
     lin = EquivariantLinear(Fi, Fo, m_max + 1, m_max).to(DTYPE)
+    lin.dense_gemm = True     # force the dense path (auto picks einsum on CPU)
     with torch.no_grad():                # non-trivial bias
         lin.bias.add_(torch.randn_like(lin.bias))
     return lin
@@ -120,10 +121,38 @@ def test_batched_leading_dims():
     print(f"  batched leading dims match flat ({e:.1e})")
 
 
+def test_dispatch():
+    """Auto-dispatch: einsum on CPU / strict fp32 / fp64; dense only where the
+    padded GEMM rides tensor cores (CUDA fp16/bf16, or fp32 with TF32 on).
+    dense_gemm=True/False overrides both ways."""
+    lin = EquivariantLinear(4, 4, 3, 2)
+    x64 = torch.randn(2, 4, 3, dtype=torch.float64)
+    assert not lin._use_dense(x64), "CPU/fp64 must take the einsum path"
+    lin.dense_gemm = True
+    assert lin._use_dense(x64), "dense_gemm=True must override"
+    lin.dense_gemm = False
+    assert not lin._use_dense(x64), "dense_gemm=False must override"
+    lin.dense_gemm = None
+    if torch.cuda.is_available():
+        x32 = torch.randn(2, 4, 3, dtype=torch.float32, device='cuda')
+        old = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            assert not lin._use_dense(x32), "CUDA fp32 without TF32 → einsum"
+            torch.backends.cuda.matmul.allow_tf32 = True
+            assert lin._use_dense(x32), "CUDA fp32 with TF32 → dense"
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = old
+        print("  dispatch: einsum on CPU/strict-fp32, dense on TF32; overrides work")
+    else:
+        print("  dispatch: einsum on CPU, overrides work (CUDA cases skipped)")
+
+
 if __name__ == "__main__":
     print("EquivariantLinear block-diagonal-GEMM tests")
     test_forward_equivalence()
     test_gradient_equivalence()
     test_noncontiguous_input()
     test_batched_leading_dims()
+    test_dispatch()
     print("All tests passed.")
