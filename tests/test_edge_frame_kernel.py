@@ -441,6 +441,25 @@ def test_triton_paths():
     print("test_triton_paths[pack_unrotate]: OK")
 
 
+def test_triton_packed_d():
+    """CUDA-only: the ECENET_EF_PACKD merged-backward variants (dense packed-D
+    tile IO instead of per-element table gathers) pass the same fp64
+    comparisons as the default kernels — test_triton_paths rerun with the
+    module flag on covers both EdgeFrameFused and PackUnrotateFused merged
+    backwards."""
+    if not torch.cuda.is_available():
+        print("test_triton_packed_d: SKIP (no CUDA)")
+        return
+    import ecenet.edge_frame_kernel as efk
+    old = efk._EF_PACKD
+    efk._EF_PACKD = True
+    try:
+        test_triton_paths()
+    finally:
+        efk._EF_PACKD = old
+    print("test_triton_packed_d: OK (packed-D merged backward)")
+
+
 def test_model_integration():
     """Full ECENet (no MP): energy and autograd forces identical flag on/off."""
     import ecenet as _ecenet
@@ -524,6 +543,7 @@ if __name__ == "__main__":
     test_pack_unrotate_matches_mp_ops()
     test_pack_unrotate_gradchecks()
     test_triton_paths()
+    test_triton_packed_d()
     test_model_integration()
     test_mp_integration()
     print("\nAll tests passed.")

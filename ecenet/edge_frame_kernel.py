@@ -348,6 +348,109 @@ if _HAS_TRITON:
         tl.store(dd_base + sin_col[None, :], acc_s,
                  mask=k_ok[:, None] & (sin_ok[None, :] > 0))
 
+    # ── Packed-D variants (ECENET_EF_PACKD=1) ────────────────────────────────
+    # ncu on the merged backward kernels (A100, 44k edges): L1/TEX throughput
+    # 75-86%, DRAM 9-18%, compute ~30% — L1-bound, with MIO short-scoreboard
+    # stalls. The scalar per-element gathers of D through the column tables
+    # (and the matching dD scatter-stores) are the amplification: hundreds of
+    # non-vectorizable L1 transactions per program while DRAM idles. These
+    # variants trade that for DRAM headroom: the wrapper pre-packs D into
+    # dense (E, S, P) / (E, P, S) tensors once per call (plain torch indexing)
+    # and unpacks dD afterwards, so the kernel does only vectorized coalesced
+    # tile IO. Math and masks identical to the table-gather kernels.
+
+    @triton.jit
+    def _ef_bwd_merged_packed_kernel(dc_ptr, ds_ptr, a_ptr, ei_ptr, ej_ptr,
+                                     dct_ptr, dst_ptr, cosk_ptr, sink_ptr,
+                                     dab_ptr, ddc_ptr, dds_ptr,
+                                     C, R, S, P,
+                                     SP: tl.constexpr, P16: tl.constexpr,
+                                     BLOCK_R: tl.constexpr):
+        e = tl.program_id(0)
+        offs_r = tl.arange(0, BLOCK_R)
+        offs_k = tl.arange(0, SP)
+        offs_p = tl.arange(0, P16)
+        row_ok = offs_r < R
+        p_ok = offs_p < P
+        k_ok = offs_k < S
+
+        cos_ok = tl.load(cosk_ptr + offs_p, mask=p_ok, other=0)
+        sin_ok = tl.load(sink_ptr + offs_p, mask=p_ok, other=0)
+
+        g_off = e * (R * P) + offs_r[:, None] * P + offs_p[None, :]
+        dC = tl.load(dc_ptr + g_off,
+                     mask=row_ok[:, None] & (cos_ok[None, :] > 0), other=0.0)
+        dS = tl.load(ds_ptr + g_off,
+                     mask=row_ok[:, None] & (sin_ok[None, :] > 0), other=0.0)
+
+        # dA_both = dC @ DcT + dS @ DsT — DxT pre-packed (E, P, S): plain tiles
+        t_off = e * (P * S) + offs_p[:, None] * S + offs_k[None, :]
+        t_mask = p_ok[:, None] & k_ok[None, :]
+        DcT = tl.load(dct_ptr + t_off, mask=t_mask, other=0.0)
+        DsT = tl.load(dst_ptr + t_off, mask=t_mask, other=0.0)
+        dA = tl.dot(dC, DcT, input_precision="ieee") \
+           + tl.dot(dS, DsT, input_precision="ieee")
+        dab_off = e * (R * S) + offs_r[:, None] * S + offs_k[None, :]
+        tl.store(dab_ptr + dab_off, dA, mask=row_ok[:, None] & k_ok[None, :])
+
+        # dD = Aᵀ @ grads, stored packed (E, S, P); wrapper unpacks to columns
+        ei = tl.load(ei_ptr + e)
+        ej = tl.load(ej_ptr + e)
+        atom = tl.where(offs_r < C, ei, ej)
+        ch = tl.where(offs_r < C, offs_r, offs_r - C)
+        a_ptrs = a_ptr + (atom * C + ch)[:, None] * S + offs_k[None, :]
+        A = tl.load(a_ptrs, mask=row_ok[:, None] & k_ok[None, :], other=0.0)
+        acc_c = tl.dot(tl.trans(A), dC, input_precision="ieee")   # (SP, P16)
+        acc_s = tl.dot(tl.trans(A), dS, input_precision="ieee")
+        o_off = e * (S * P) + offs_k[:, None] * P + offs_p[None, :]
+        o_mask = k_ok[:, None] & p_ok[None, :]
+        tl.store(ddc_ptr + o_off, acc_c, mask=o_mask)
+        tl.store(dds_ptr + o_off, acc_s, mask=o_mask)
+
+    @triton.jit
+    def _pu_bwd_merged_packed_kernel(dh_ptr, mc_ptr, ms_ptr,
+                                     dcp_ptr, dsp_ptr, cosk_ptr, sink_ptr,
+                                     dmc_ptr, dms_ptr, ddc_ptr, dds_ptr,
+                                     R, S, P,
+                                     SP: tl.constexpr, P16: tl.constexpr,
+                                     BLOCK_R: tl.constexpr):
+        e = tl.program_id(0)
+        offs_r = tl.arange(0, BLOCK_R)
+        offs_k = tl.arange(0, SP)
+        offs_p = tl.arange(0, P16)
+        row_ok = offs_r < R
+        p_ok = offs_p < P
+        k_ok = offs_k < S
+
+        cos_ok = tl.load(cosk_ptr + offs_p, mask=p_ok, other=0)
+        sin_ok = tl.load(sink_ptr + offs_p, mask=p_ok, other=0)
+
+        dh_off = e * (R * S) + offs_r[:, None] * S + offs_k[None, :]
+        dh = tl.load(dh_ptr + dh_off,
+                     mask=row_ok[:, None] & k_ok[None, :], other=0.0)
+
+        # dm = dh @ D-cols — Dx pre-packed (E, S, P): plain tiles
+        d_off = e * (S * P) + offs_k[:, None] * P + offs_p[None, :]
+        d_mask = k_ok[:, None] & p_ok[None, :]
+        Dc = tl.load(dcp_ptr + d_off, mask=d_mask, other=0.0)
+        Ds = tl.load(dsp_ptr + d_off, mask=d_mask, other=0.0)
+        dmc = tl.dot(dh, Dc, input_precision="ieee")              # (BLOCK_R, P16)
+        dms = tl.dot(dh, Ds, input_precision="ieee")
+        out_off = e * (R * P) + offs_r[:, None] * P + offs_p[None, :]
+        st_mask = row_ok[:, None] & p_ok[None, :]
+        tl.store(dmc_ptr + out_off, dmc, mask=st_mask)
+        tl.store(dms_ptr + out_off, dms, mask=st_mask)
+
+        # dD = dhᵀ @ h, stored packed (E, S, P); wrapper unpacks to columns
+        mC = tl.load(mc_ptr + out_off,
+                     mask=row_ok[:, None] & (cos_ok[None, :] > 0), other=0.0)
+        mS = tl.load(ms_ptr + out_off,
+                     mask=row_ok[:, None] & (sin_ok[None, :] > 0), other=0.0)
+        acc_c = tl.dot(tl.trans(dh), mC, input_precision="ieee")  # (SP, P16)
+        acc_s = tl.dot(tl.trans(dh), mS, input_precision="ieee")
+        tl.store(ddc_ptr + d_off, acc_c, mask=d_mask)
+        tl.store(dds_ptr + d_off, acc_s, mask=d_mask)
+
     @triton.jit
     def _e2n_fwd_kernel(gc_ptr, gs_ptr, d_ptr, perm_ptr, aptr_ptr,
                         srcoff_ptr, okc_ptr, oks_ptr,
@@ -398,6 +501,31 @@ _EF_TABLES: dict = {}
 # The kernels' tiles are small ((BLOCK_R, 16)-ish), so fewer warps than the
 # Triton default of 4 may win; sweep alongside profile_step.
 _EF_WARPS = int(os.environ.get('ECENET_EF_WARPS', 4))
+
+# Packed-D variants of the merged backward kernels (see the kernel comment
+# block): trades the scalar table-gathered D loads / dD scatter-stores
+# (L1-bound per ncu) for dense pre-packed tensors and vectorized tile IO.
+# Off by default until benchmarked; module-level so tests can toggle it.
+_EF_PACKD = os.environ.get('ECENET_EF_PACKD', '0') == '1'
+
+
+def _pack_D(D_block, cos_col, cos_ok, sin_col, sin_ok):
+    """Dense per-edge packed D: Dx[e, k, p] = D[e, k, col(p)]·ok(p), (E, S, P)."""
+    Dc = D_block[:, :, cos_col.long()] * cos_ok.to(D_block.dtype)
+    Ds = D_block[:, :, sin_col.long()] * sin_ok.to(D_block.dtype)
+    return Dc.contiguous(), Ds.contiguous()
+
+
+def _unpack_dD(ddc, dds, cos_col, cos_ok, sin_col, sin_ok, S):
+    """Inverse of _pack_D for the gradient: scatter packed (E, S, P) columns
+    back into (E, S, S). cos and sin column sets are disjoint; slots no p
+    touches stay 0 (matches the zeros-init of the table-scatter path)."""
+    dD = ddc.new_zeros(ddc.shape[0], S, S)
+    vc = cos_ok.bool()
+    vs = sin_ok.bool()
+    dD[:, :, cos_col[vc].long()] = ddc[:, :, vc]
+    dD[:, :, sin_col[vs].long()] = dds[:, :, vs]
+    return dD
 
 
 def _next_pow2(x: int) -> int:
@@ -587,6 +715,18 @@ def _ef_backward_triton(dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block,
     # to cover the edge (block_r ≥ R; true for n_base/2C ≤ 128).
     if need_dx and need_dd and block_r >= R:
         dA_both = torch.empty(E, R, S, dtype=dA_cos.dtype, device=dA_cos.device)
+        if _EF_PACKD:
+            Dc, Ds = _pack_D(D_block, *args)
+            DcT = Dc.transpose(1, 2).contiguous()
+            DsT = Ds.transpose(1, 2).contiguous()
+            ddc = torch.empty(E, S, P, dtype=dA_cos.dtype, device=dA_cos.device)
+            dds = torch.empty_like(ddc)
+            _ef_bwd_merged_packed_kernel[(E,)](
+                dA_cos, dA_sin, A_emb_c, edge_i.contiguous(),
+                edge_j.contiguous(), DcT, DsT, args[1], args[3],
+                dA_both, ddc, dds,
+                C, R, S, P, **kw)
+            return _scatter(dA_both), _unpack_dD(ddc, dds, *args, S)
         dD = torch.zeros_like(D_block)     # columns no p touches stay 0
         _ef_bwd_merged_kernel[(E,)](
             dA_cos, dA_sin, A_emb_c, edge_i.contiguous(), edge_j.contiguous(),
@@ -941,6 +1081,17 @@ class PackUnrotateFused(torch.autograd.Function):
                 dm_cos = torch.empty(E, n_ch, n_ang, dtype=dh.dtype,
                                      device=dh.device)
                 dm_sin = torch.empty_like(dm_cos)
+                if _EF_PACKD:
+                    Dc, Ds = _pack_D(D_block, *tabs)
+                    ddc = torch.empty(E, S, P, dtype=dh.dtype, device=dh.device)
+                    dds = torch.empty_like(ddc)
+                    _pu_bwd_merged_packed_kernel[(E,)](
+                        dh_c, m_cos.contiguous(), m_sin.contiguous(),
+                        Dc, Ds, tabs[1], tabs[3],
+                        dm_cos, dm_sin, ddc, dds,
+                        n_base, S, P, **kw)
+                    return (dm_cos, dm_sin, _unpack_dD(ddc, dds, *tabs, S),
+                            None, None, None, None)
                 dD = torch.zeros_like(D_block)
                 _pu_bwd_merged_kernel[(E,)](
                     dh_c, m_cos.contiguous(), m_sin.contiguous(),
