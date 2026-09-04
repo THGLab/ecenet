@@ -169,6 +169,13 @@ def main():
                    help='replicate the box into an AxBxC supercell (size scaling)')
     p.add_argument('--float32', action='store_true',
                    help='float32 where the factory supports it (state it in the table)')
+    p.add_argument('--tf32', action='store_true',
+                   help='enable TF32 matmuls process-wide (torch backends flag; '
+                        'float32 only). ecenet: also required for the dense '
+                        'EquivariantLinear GEMM path to auto-dispatch. Recorded '
+                        'in the CSV dtype column. Note --calc dpa ignores torch '
+                        "flags — DeePMD's precision is set via DP_TF32_INFER "
+                        'and friends in its own environment.')
     p.add_argument('--fuse', action='store_true',
                    help="enable the model's fast paths (ecenet: edge-frame + "
                         'activation fusion; mace: enable_cueq; no-op for '
@@ -185,6 +192,16 @@ def main():
     p.add_argument('--label', default=None, help='row label for --csv (default: --calc)')
     p.add_argument('--csv', default=None, help='append one result row (collate runs)')
     args = p.parse_args()
+
+    if args.tf32:
+        if torch is None:
+            sys.exit('--tf32 needs torch installed')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+        if not args.float32:
+            print('[tf32] set, but without --float32 most factories run float64 '
+                  '— TF32 will not apply there')
 
     atoms = read(args.box, index=args.frame_idx)
     if args.repeat:
@@ -248,7 +265,8 @@ def main():
                'checkpoint': args.checkpoint or '', 'box': os.path.basename(args.box),
                'repeat': 'x'.join(map(str, args.repeat)) if args.repeat else '',
                'n_atoms': n_atoms,
-               'dtype': 'float32' if args.float32 else 'default/float64',
+               'dtype': (('float32' if args.float32 else 'default/float64')
+                         + ('+tf32' if args.tf32 else '')),
                'fuse': args.fuse, 'device': gpu,
                'host': os.uname().nodename,  # login vs compute node — shared-GPU
                                              # login timings are contended garbage

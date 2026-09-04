@@ -174,6 +174,10 @@ def main():
     # Eval options
     parser.add_argument('--batch_size',       type=int,   default=8)
     parser.add_argument('--float32',          action='store_true')
+    parser.add_argument('--tf32',             action='store_true',
+                        help='Enable TF32 matmuls (CUDA + --float32 only) — '
+                             'measure the test MAEs at the same precision the '
+                             'model is benchmarked/deployed at.')
     parser.add_argument('--device',           default=None)
     parser.add_argument('--ignore_les',       action='store_true',
                         help='Evaluate the short-range part of an LES checkpoint '
@@ -183,7 +187,15 @@ def main():
     dtype  = torch.float32 if args.float32 else torch.float64
     device = torch.device(args.device if args.device else
                           ('cuda' if torch.cuda.is_available() else 'cpu'))
-    print(f"Device: {device}, dtype: {dtype}")
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+        if dtype == torch.float64:
+            print('[tf32] requested but dtype=float64 → no effect '
+                  '(TF32 is float32-only); add --float32 to use it')
+    print(f"Device: {device}, dtype: {dtype}"
+          f"{' +tf32' if args.tf32 and dtype == torch.float32 else ''}")
 
     # ── Load checkpoint ────────────────────────────────────────────────────
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

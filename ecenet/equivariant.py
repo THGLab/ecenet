@@ -26,6 +26,27 @@ class EquivariantLinear(nn.Module):
 
     Same weights for cos/sin parts. Bias only on m=0 (invariant).
     Angular channels: m = 0, 1, ..., m_max (index 0 is m=0).
+
+    The map y[e,o,m] = Σ_i x[e,i,m]·W[m,o,i] never mixes angular modes, so it
+    is evaluated as ONE dense row-major GEMM over the flattened (feature,
+    angular) axis, against a (in·n_ang, out·n_ang) weight that is
+    block-diagonal per m (assembled from the parameter each call — ~MB-scale,
+    autograd flows through the assembly; the zero blocks cost n_ang× the
+    strictly needed flops, which TF32/tensor cores absorb). The earlier
+    einsum formulation lowered to a batched bmm over the angular axis, whose
+    batch-contiguity requirement copied the full per-edge activation on every
+    call and emitted an m-major output that downstream consumers (the fused
+    nonlinearity, residual adds, the next einsum) paid to re-normalize —
+    profiling showed that layout churn at ~29% of the whole force step. The
+    dense form's input and output are both plain row-major views: no
+    permutes, no copies, and the layout every consumer wants.
+
+    The trade only pays where the padded GEMM is (near-)free: on CUDA tensor
+    cores. On fp32 CUDA cores (TF32 off) and in float64 the 3x padding costs
+    exactly 3x — measured slower than the einsum path despite the copies —
+    so dispatch is automatic: dense for CUDA fp16/bf16, and for CUDA fp32
+    with TF32 enabled; einsum otherwise. ``dense_gemm`` (True/False)
+    overrides the automatic choice.
     """
 
     def __init__(self, in_features, out_features, n_angular, m_max):
@@ -34,6 +55,7 @@ class EquivariantLinear(nn.Module):
         self.out_features = out_features
         self.n_angular = n_angular
         self.m_max = m_max
+        self.dense_gemm = None       # None = auto (see _use_dense)
 
         # (n_angular, out_features, in_features)
         std = (2.0 / (in_features + out_features)) ** 0.5
@@ -41,14 +63,44 @@ class EquivariantLinear(nn.Module):
 
         self.bias = nn.Parameter(torch.zeros(out_features))
 
+    def _use_dense(self, x):
+        if self.dense_gemm is not None:
+            return self.dense_gemm
+        if not x.is_cuda:
+            return False
+        if x.dtype in (torch.float16, torch.bfloat16):
+            return True
+        return (x.dtype == torch.float32
+                and torch.backends.cuda.matmul.allow_tf32)
+
+    def _dense_weight(self):
+        """(in·n_ang, out·n_ang) block-diagonal-per-m weight, row-major flat
+        index c = feature·n_ang + m on both sides."""
+        na, Fo, Fi = self.weights.shape
+        Wd = self.weights.new_zeros(Fi, na, Fo, na)
+        m = torch.arange(na, device=self.weights.device)
+        Wd[:, m, :, m] = self.weights.permute(0, 2, 1)   # (na, Fi, Fo) slot
+        return Wd.reshape(Fi * na, Fo * na)
+
     def forward(self, A_cos, A_sin):
-        A_cos_out = torch.einsum('...id,doi->...od', A_cos, self.weights)
-        A_sin_out = torch.einsum('...id,doi->...od', A_sin, self.weights)
+        if not self._use_dense(A_cos):
+            A_cos_out = torch.einsum('...id,doi->...od', A_cos, self.weights)
+            A_sin_out = torch.einsum('...id,doi->...od', A_sin, self.weights)
+            A_cos_out[..., 0] = A_cos_out[..., 0] + self.bias   # bias on m=0 only
+            return A_cos_out, A_sin_out
 
-        # Bias only on m=0 (index 0)
-        A_cos_out[..., 0] = A_cos_out[..., 0] + self.bias
-
-        return A_cos_out, A_sin_out
+        na, Fo = self.n_angular, self.out_features
+        lead = A_cos.shape[:-2]
+        Wd = self._dense_weight()
+        # Bias enters the GEMM epilogue (addmm), on the m=0 slots of the cos
+        # part only — sin has no invariant channel.
+        bias_full = self.bias.new_zeros(Fo, na)
+        bias_full[:, 0] = self.bias
+        x_cos = A_cos.reshape(-1, self.in_features * na)
+        x_sin = A_sin.reshape(-1, self.in_features * na)
+        y_cos = torch.addmm(bias_full.reshape(-1), x_cos, Wd)
+        y_sin = x_sin @ Wd
+        return y_cos.view(*lead, Fo, na), y_sin.view(*lead, Fo, na)
 
 
 class RealSpaceNonlinearity(nn.Module):
