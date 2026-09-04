@@ -528,6 +528,30 @@ def _unpack_dD(ddc, dds, cos_col, cos_ok, sin_col, sin_ok, S):
     return dD
 
 
+def _get_packed_D(D_block, n_ang):
+    """Once-per-step packed D — (Dc, Ds, DcT, DsT), each (E, S, P)/(E, P, S).
+
+    Cached on the D_block PYTHON OBJECT: the model builds D_block once per
+    step and hands the same object to every fused edge-frame op (4x
+    EdgeFrameFused + 3x PackUnrotateFused at n_mp=4), so the packing cost is
+    paid once, not per backward — per-call packing was measured to eat the
+    packed kernels' entire ~5 ms/step win. A new step's fresh D_block starts
+    with no attribute, so there is no cross-step staleness. The attribute
+    does NOT survive save_for_backward's re-wrapping, so Functions must carry
+    the packed tensors through ctx themselves."""
+    packed = getattr(D_block, '_ecenet_packed', None)
+    if packed is None or packed[0].shape[-1] != _ef_tables(
+            D_block.shape[-1], n_ang, D_block.device)[0].shape[0]:
+        with torch.no_grad():
+            tabs = _ef_tables(D_block.shape[-1], n_ang, D_block.device)
+            Dc, Ds = _pack_D(D_block, *tabs)
+            packed = (Dc, Ds,
+                      Dc.transpose(1, 2).contiguous(),
+                      Ds.transpose(1, 2).contiguous())
+        D_block._ecenet_packed = packed
+    return packed
+
+
 def _next_pow2(x: int) -> int:
     """Smallest power of two ≥ x, floored at 16. tl.arange REQUIRES a power
     of two (a multiple of 16 like 48 or 96 compiles to "arange's range must
@@ -683,7 +707,7 @@ def _ef_forward_triton(A_emb, edge_i, edge_j, D_block, n_ch, n_ang):
 
 
 def _ef_backward_triton(dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block,
-                        n_ang, single, need_dx, need_dd):
+                        n_ang, single, need_dx, need_dd, packedT=None):
     E = edge_i.shape[0]
     C = A_emb.shape[1]
     R = C if single else 2 * C
@@ -715,10 +739,8 @@ def _ef_backward_triton(dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block,
     # to cover the edge (block_r ≥ R; true for n_base/2C ≤ 128).
     if need_dx and need_dd and block_r >= R:
         dA_both = torch.empty(E, R, S, dtype=dA_cos.dtype, device=dA_cos.device)
-        if _EF_PACKD:
-            Dc, Ds = _pack_D(D_block, *args)
-            DcT = Dc.transpose(1, 2).contiguous()
-            DsT = Ds.transpose(1, 2).contiguous()
+        if packedT is not None:
+            DcT, DsT = packedT
             ddc = torch.empty(E, S, P, dtype=dA_cos.dtype, device=dA_cos.device)
             dds = torch.empty_like(ddc)
             _ef_bwd_merged_packed_kernel[(E,)](
@@ -778,17 +800,28 @@ class EdgeFrameFused(torch.autograd.Function):
                          .view(-1, n_ch, n_ang)) * cos_valid
                 A_sin = (A_flat.index_select(1, sin_flat_idx)
                          .view(-1, n_ch, n_ang)) * sin_valid
+        # Packed-D path: fetch the per-step packed D (amortized on the shared
+        # D_block object) in the FORWARD and carry it through ctx — attributes
+        # do not survive save_for_backward's re-wrapping.
+        extra = ()
+        ctx.packed = _EF_PACKD and _ef_triton_ok(A_emb, edge_i.shape[0])
+        if ctx.packed:
+            _, _, DcT, DsT = _get_packed_D(D_block, n_ang)
+            extra = (DcT, DsT)
         ctx.save_for_backward(A_emb, edge_i,
                               edge_i if single else edge_j, D_block,
-                              cos_flat_idx, sin_flat_idx, cos_valid, sin_valid)
+                              cos_flat_idx, sin_flat_idx, cos_valid, sin_valid,
+                              *extra)
         ctx.n_ang = n_ang
         ctx.single = single
         return A_cos, A_sin
 
     @staticmethod
     def backward(ctx, dA_cos, dA_sin):
+        saved = ctx.saved_tensors
         (A_emb, edge_i, edge_j, D_block,
-         cos_flat_idx, sin_flat_idx, cos_valid, sin_valid) = ctx.saved_tensors
+         cos_flat_idx, sin_flat_idx, cos_valid, sin_valid) = saved[:8]
+        packedT = saved[8:10] if ctx.packed else None
         E = dA_cos.shape[0]
         C = A_emb.shape[1]
         single = ctx.single
@@ -803,7 +836,8 @@ class EdgeFrameFused(torch.autograd.Function):
                 dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block, ctx.n_ang,
                 single=single,
                 need_dx=ctx.needs_input_grad[0],
-                need_dd=ctx.needs_input_grad[3])
+                need_dd=ctx.needs_input_grad[3],
+                packedT=packedT)
             return dA_emb, None, None, dD, None, None, None, None
 
         # Adjoint of select: scatter masked grads into the rotated layout.
@@ -1053,14 +1087,22 @@ class PackUnrotateFused(torch.autograd.Function):
                                 cos_valid, sin_valid,
                                 n_base * S).view(E, n_base, S)
                 h_global = torch.bmm(h, D_block.transpose(-1, -2))
+        extra = ()
+        ctx.packed = _EF_PACKD and _ef_triton_ok(m_cos, E)
+        if ctx.packed:
+            Dc, Ds, _, _ = _get_packed_D(D_block, n_ang)
+            extra = (Dc, Ds)
         ctx.save_for_backward(m_cos, m_sin, D_block,
-                              cos_flat_idx, sin_flat_idx, cos_valid, sin_valid)
+                              cos_flat_idx, sin_flat_idx, cos_valid, sin_valid,
+                              *extra)
         return h_global
 
     @staticmethod
     def backward(ctx, dh):
+        saved = ctx.saved_tensors
         (m_cos, m_sin, D_block,
-         cos_flat_idx, sin_flat_idx, cos_valid, sin_valid) = ctx.saved_tensors
+         cos_flat_idx, sin_flat_idx, cos_valid, sin_valid) = saved[:7]
+        packed = saved[7:9] if ctx.packed else None
         E = m_cos.shape[0]
         n_ch, n_ang = cos_valid.shape
         S = D_block.shape[-1]
@@ -1081,8 +1123,8 @@ class PackUnrotateFused(torch.autograd.Function):
                 dm_cos = torch.empty(E, n_ch, n_ang, dtype=dh.dtype,
                                      device=dh.device)
                 dm_sin = torch.empty_like(dm_cos)
-                if _EF_PACKD:
-                    Dc, Ds = _pack_D(D_block, *tabs)
+                if packed is not None:
+                    Dc, Ds = packed
                     ddc = torch.empty(E, S, P, dtype=dh.dtype, device=dh.device)
                     dds = torch.empty_like(ddc)
                     _pu_bwd_merged_packed_kernel[(E,)](
