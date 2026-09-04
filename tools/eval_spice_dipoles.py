@@ -171,11 +171,22 @@ def main():
                          "(reference frames are neutral; removal is upstream "
                          "BEC's remove_mean=True convention)")
     ap.add_argument('--device', default='cpu')
+    ap.add_argument('--tf32', action='store_true',
+                    help='enable TF32 matmuls (CUDA + float32 checkpoints only) '
+                         '— evaluate at the same precision the model is '
+                         'benchmarked/deployed at')
     ap.add_argument('--save', default=None,
                     help='write per-frame sign-aligned results to this file: '
                          '.csv (one row per frame, ready for a correlation '
                          'plot) or .npz (arrays)')
     args = ap.parse_args()
+
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
+        if not args.device.startswith('cuda'):
+            print('[tf32] requested but device is not CUDA — no effect')
 
     data_dir = os.path.expanduser(args.data_dir)
     if args.files:
