@@ -873,7 +873,8 @@ def _ef_backward_triton(dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block,
 
 class EdgeFrameFused(torch.autograd.Function):
     """Fused gather → rotate → select with analytic, double-differentiable
-    backward. Saves (A_emb, D_block, indices) — NOT the (E, R, n_sph)
+    backward. Saves (A_emb, D_block, indices; plus the per-step packed D
+    under _EF_PACKD) — NOT the (E, R, n_sph)
     intermediates; the gathered rows are re-gathered in the backward.
 
     edge_j=None → single-source mode (MP steps 5-6): rows are A_emb[edge_i]'s
@@ -1151,9 +1152,11 @@ class PackUnrotateFused(torch.autograd.Function):
     No gather, no scatter, no gate — the attention/message weighting and the
     node accumulation stay eager in the node frame exactly as the unfused
     path. The win is dropping the packed intermediate h from HBM (forward) and
-    from the bmm's saved set (backward). All three kernels are the existing
-    ones: forward = _ef_bwd_dx (its "grads" input is any per-edge (E, R, P)
-    tensor), backward dm = _ef_fwd with identity indices, dD = _ef_bwd_dd."""
+    from the bmm's saved set (backward). The kernels are shared with the edge
+    frame: forward = _ef_bwd_dx (its "grads" input is any per-edge (E, R, P)
+    tensor) — or its packed-D variant under _EF_PACKD (default) — backward =
+    the merged _pu kernel (packed or table-gather), with dm = _ef_fwd with
+    identity indices / dD = _ef_bwd_dd as the non-merged fallbacks."""
 
     @staticmethod
     def forward(ctx, m_cos, m_sin, D_block,
