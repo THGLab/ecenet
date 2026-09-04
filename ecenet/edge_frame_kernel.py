@@ -40,6 +40,8 @@ index the flattened (2C·n_sph) axis and already encode the per-l channel
 repeat; ``cos_valid``/``sin_valid`` zero the |m| > l (and m=0 sin) slots.
 """
 
+import os
+
 import torch
 from torch.profiler import record_function
 
@@ -391,6 +393,13 @@ if _HAS_TRITON:
 _EF_TABLES: dict = {}
 
 
+# Warps per program for every edge-frame kernel launch, overridable per GPU
+# without a code change (read once at import):  ECENET_EF_WARPS=2 python ...
+# The kernels' tiles are small ((BLOCK_R, 16)-ish), so fewer warps than the
+# Triton default of 4 may win; sweep alongside profile_step.
+_EF_WARPS = int(os.environ.get('ECENET_EF_WARPS', 4))
+
+
 def _next_pow2(x: int) -> int:
     """Smallest power of two ≥ x, floored at 16. tl.arange REQUIRES a power
     of two (a multiple of 16 like 48 or 96 compiles to "arange's range must
@@ -492,7 +501,7 @@ def _e2n_forward_triton(g_cos, g_sin, edge_dst, D_block, n_atoms, n_base):
             g_cos.contiguous(), g_sin.contiguous(), D_block.contiguous(),
             perm, aptr, srcoff, okc, oks, Delta,
             n_base, S, P,
-            SP=_next_pow2(S), RB=_next_pow2(n_base))
+            SP=_next_pow2(S), RB=_next_pow2(n_base), num_warps=_EF_WARPS)
         return Delta
 
     # Per-edge: pack+unrotate is exactly the dx backward kernel's math
@@ -508,7 +517,8 @@ def _e2n_forward_triton(g_cos, g_sin, edge_dst, D_block, n_atoms, n_base):
         g_cos.contiguous(), g_sin.contiguous(), D_block.contiguous(),
         cos_col, cos_ok, sin_col, sin_ok, h_global,
         n_base, n_base, S, P,
-        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
+        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+        num_warps=_EF_WARPS)
     Delta = torch.zeros(n_atoms, n_base, S, dtype=g_cos.dtype,
                         device=g_cos.device)
     Delta.index_add_(0, edge_dst, h_global)
@@ -539,7 +549,8 @@ def _ef_forward_triton(A_emb, edge_i, edge_j, D_block, n_ch, n_ang):
         cos_col, cos_ok, sin_col, sin_ok,
         A_cos, A_sin,
         C, R, S, P,
-        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
+        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+        num_warps=_EF_WARPS)
     return A_cos, A_sin
 
 
@@ -558,7 +569,8 @@ def _ef_backward_triton(dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block,
     A_emb_c = A_emb.contiguous()
     args = (cos_col, cos_ok, sin_col, sin_ok)
     block_r = _ef_block_r(R)
-    kw = dict(SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
+    kw = dict(SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+              num_warps=_EF_WARPS)
 
     def _scatter(dA_both):
         # scatter back to atoms (torch: well-optimized, visible to compile)
@@ -838,7 +850,8 @@ class EdgeToNodeFused(torch.autograd.Function):
                     g_cos.contiguous(), g_sin.contiguous(),
                     cos_col, cos_ok, sin_col, sin_ok, dD,
                     n_base, n_base, n_sph, P,
-                    SP=_next_pow2(n_sph), P16=_next_pow2(P), BLOCK_R=block_r)
+                    SP=_next_pow2(n_sph), P16=_next_pow2(P), BLOCK_R=block_r,
+                    num_warps=_EF_WARPS)
             return dg_cos, dg_sin, None, dD, None, None, None, None, None
 
         # Eager (double-differentiable) path.
@@ -893,7 +906,8 @@ class PackUnrotateFused(torch.autograd.Function):
                     D_block.contiguous(),
                     cos_col, cos_ok, sin_col, sin_ok, h_global,
                     n_base, n_base, S, P,
-                    SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
+                    SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+                    num_warps=_EF_WARPS)
             else:
                 h = _pack_grads(m_cos, m_sin, cos_flat_idx, sin_flat_idx,
                                 cos_valid, sin_valid,
@@ -919,7 +933,8 @@ class PackUnrotateFused(torch.autograd.Function):
             P = (n_ch // n_base) * n_ang
             block_r = _ef_block_r(n_base)
             tabs = _ef_tables(S, n_ang, dh.device)
-            kw = dict(SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r)
+            kw = dict(SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+              num_warps=_EF_WARPS)
 
             # Merged path: dh (the dominant read) loaded once → dm AND dD.
             if need_dm and need_dd and block_r >= n_base:
