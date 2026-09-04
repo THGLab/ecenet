@@ -197,6 +197,32 @@ def test_triton_vs_reference():
         print(f"  triton vs fp64 ref (F={F}, m_max={m_max}): "
               f"fwd {f_err:.1e}, dA {b_err:.1e}")
 
+        # m-major layout (strides (F, 1, n_e·F) — what EquivariantLinear's
+        # einsum emits): the kernel reads it via strides, no contiguous copy.
+        # Must match the contiguous-input result bit-for-bit-ish.
+        def as_m_major(t):
+            out = torch.empty(t.shape[2], t.shape[0], t.shape[1],
+                              device=t.device, dtype=t.dtype).permute(1, 2, 0)
+            out.copy_(t)
+            return out
+
+        def run_mm(fn):
+            a = as_m_major(A_cos).requires_grad_(True)
+            b = as_m_major(A_sin).requires_grad_(True)
+            oc, os = fn(a, b)
+            (oc * goc + os * gos).sum().backward()
+            return oc, os, a.grad, b.grad
+
+        mm = run_mm(lambda a, b: RealSpaceFused.apply(
+            a, b, nl.cos_synth, nl.sin_synth, nl.cos_analysis, nl.sin_analysis,
+            nl.activation))
+        f_mm = max((ker[0] - mm[0]).abs().max(), (ker[1] - mm[1]).abs().max()).item()
+        b_mm = max((ker[2] - mm[2]).abs().max(), (ker[3] - mm[3]).abs().max()).item()
+        assert f_mm < 1e-6, f"m-major fwd F={F},m={m_max}: {f_mm:.2e}"
+        assert b_mm < 1e-6, f"m-major grad F={F},m={m_max}: {b_mm:.2e}"
+        print(f"  triton m-major layout (F={F}, m_max={m_max}): "
+              f"fwd {f_mm:.1e}, dA {b_mm:.1e}")
+
 
 def _structure(n=7, n_types=4, seed=0):
     g = torch.Generator().manual_seed(seed)
