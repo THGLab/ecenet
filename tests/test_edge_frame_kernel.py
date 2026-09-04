@@ -441,6 +441,24 @@ def test_triton_paths():
     print("test_triton_paths[pack_unrotate]: OK")
 
 
+def test_triton_packed_d():
+    """CUDA-only: run test_triton_paths under BOTH _EF_PACKD settings, so the
+    packed-D kernels (the default) and the table-gather kernels (the
+    ECENET_EF_PACKD=0 fallback) both stay pinned to the fp64 reference."""
+    if not torch.cuda.is_available():
+        print("test_triton_packed_d: SKIP (no CUDA)")
+        return
+    import ecenet.edge_frame_kernel as efk
+    old = efk._EF_PACKD
+    try:
+        for packed in (True, False):
+            efk._EF_PACKD = packed
+            test_triton_paths()
+            print(f"test_triton_packed_d[packed={packed}]: OK")
+    finally:
+        efk._EF_PACKD = old
+
+
 def test_model_integration():
     """Full ECENet (no MP): energy and autograd forces identical flag on/off."""
     import ecenet as _ecenet
@@ -524,6 +542,7 @@ if __name__ == "__main__":
     test_pack_unrotate_matches_mp_ops()
     test_pack_unrotate_gradchecks()
     test_triton_paths()
+    test_triton_packed_d()
     test_model_integration()
     test_mp_integration()
     print("\nAll tests passed.")
