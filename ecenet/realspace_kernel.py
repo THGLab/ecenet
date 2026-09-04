@@ -231,17 +231,20 @@ def _fp32(*ts):
 
 
 def _rows(t):
-    """View a (n_e, F, n_ang) operand as R = n_e·F rows of n_ang coefficients
-    WITHOUT copying, returning (tensor, s_row, s_col) for the kernel's stride
-    arithmetic. Rows flatten whenever stride(0) == F·stride(1), which covers
-    both layouts the model produces: dense row-major, and the m-major output
-    of EquivariantLinear's einsum (strides (F, 1, R)) — the layout the old
-    `.contiguous()` copied at full read+write cost on every call. Both are
-    fully coalesced under the kernel's per-operand strides (m-major rows are
-    unit-stride). Anything else falls back to one contiguous copy."""
+    """View a (n_e, F, n_ang) operand as R = n_e·F rows of n_ang coefficients,
+    returning (tensor, s_row, s_col) for the kernel's stride arithmetic.
+
+    The copy is skipped only for row-major layouts (rows collapse AND the
+    coefficient axis is unit-stride) — the case the kernel loads as one
+    vectorized coalesced tile. Reading EquivariantLinear's m-major einsum
+    output (strides (F, 1, R)) in place was tried and MEASURED ~4-6x slower
+    on an A100 than copying it contiguous first, despite its unit-stride
+    rows — the tile load degrades to strided scalar accesses across three
+    ~45 MB-apart streams. So the m-major layout takes the contiguous copy;
+    revisit only with a transposed-tile load variant benchmarked in hand."""
     t = t.to(torch.float32)
     n_e, F, n_ang = t.shape
-    if t.stride(0) != F * t.stride(1):
+    if t.stride(2) != 1 or t.stride(0) != F * t.stride(1):
         t = t.contiguous()
     return t, t.stride(1), t.stride(2)
 
