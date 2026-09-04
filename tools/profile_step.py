@@ -38,6 +38,15 @@ parser.add_argument('--edge_frame_fused', action='store_true',
 parser.add_argument('--edge_frame_e2n', action='store_true',
                     help="With --edge_frame_fused: ALSO fuse the MP layers' "
                          'pack+unrotate (their step 3).')
+parser.add_argument('--torch_profile', action='store_true',
+                    help='After the timing sections, run the forward and the '
+                         'joint E+F step under torch.profiler and print the top '
+                         'ops by self CUDA time (plus a top-memory table). This '
+                         'is the view the per-section timers cannot give: the '
+                         'backward decomposed by op, and record_function-tagged '
+                         'kernel regions.')
+parser.add_argument('--profile_rows', type=int, default=25,
+                    help='--torch_profile: rows per table (default 25)')
 args = parser.parse_args()
 
 dtype  = torch.float32 if args.float32 else torch.float64
@@ -382,4 +391,54 @@ if les_module is not None:
             return torch.autograd.grad(e, p)[0]
 
     time_fn("forward_pbc + E_lr + forces (joint graph)", fwd_forces_les)
+print()
+
+# ── 5. torch.profiler breakdown (--torch_profile) ─────────────────────────────
+# The per-section timers above can only see the forward, op by op; the backward
+# (the larger half of a force call) and the true kernel-level cost of composite
+# blocks are invisible to them. This profiles the same closures used in Totals
+# and prints per-op aggregates:
+#   * forward-only table — kernel costs of the real forward path;
+#   * joint-step table   — forward + backward together: rows that grow between
+#     the two tables (aten::mm vs MmBackward0 etc.) are the backward; the
+#     record_function tags (edge_frame_fused, pack_unrotate_fused, ...) mark
+#     our Triton regions in both;
+#   * joint-step memory table — top self-CUDA allocators, for the saved-tensor
+#     footprint behind large-box OOMs.
+if args.torch_profile:
+    from torch.profiler import ProfilerActivity, profile
+
+    acts = [ProfilerActivity.CPU]
+    if device.type == 'cuda':
+        acts.append(ProfilerActivity.CUDA)
+    sort_key = ('self_cuda_time_total' if device.type == 'cuda'
+                else 'self_cpu_time_total')
+
+    def fwd_only():
+        return model.forward_pbc(fresh_pos(), types, edge_i, edge_j,
+                                 shift_e, nb_src, nb_dst, shift_n)
+
+    joint_fn = fwd_forces_les if les_module is not None else fwd_forces
+    joint_label = ('joint E_sr + E_lr + forces' if les_module is not None
+                   else 'joint E + forces')
+
+    def run_profile(fn, label, n=args.n_time):
+        fn()                                 # warm (allocator, autotune caches)
+        sync()
+        with profile(activities=acts, profile_memory=True) as prof:
+            for _ in range(n):
+                fn()
+            sync()
+        ka = prof.key_averages()
+        sep(f"torch.profiler: {label} (x{n}, top {args.profile_rows} by self "
+            f"{'CUDA' if device.type == 'cuda' else 'CPU'} time)")
+        print(ka.table(sort_by=sort_key, row_limit=args.profile_rows))
+        return ka
+
+    run_profile(fwd_only, "forward only")
+    ka_joint = run_profile(joint_fn, joint_label)
+
+    if device.type == 'cuda':
+        sep(f"torch.profiler: {joint_label} (top 10 by self CUDA memory)")
+        print(ka_joint.table(sort_by='self_cuda_memory_usage', row_limit=10))
 print()
