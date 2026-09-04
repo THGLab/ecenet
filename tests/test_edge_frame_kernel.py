@@ -442,22 +442,21 @@ def test_triton_paths():
 
 
 def test_triton_packed_d():
-    """CUDA-only: the ECENET_EF_PACKD merged-backward variants (dense packed-D
-    tile IO instead of per-element table gathers) pass the same fp64
-    comparisons as the default kernels — test_triton_paths rerun with the
-    module flag on covers both EdgeFrameFused and PackUnrotateFused merged
-    backwards."""
+    """CUDA-only: run test_triton_paths under BOTH _EF_PACKD settings, so the
+    packed-D kernels (the default) and the table-gather kernels (the
+    ECENET_EF_PACKD=0 fallback) both stay pinned to the fp64 reference."""
     if not torch.cuda.is_available():
         print("test_triton_packed_d: SKIP (no CUDA)")
         return
     import ecenet.edge_frame_kernel as efk
     old = efk._EF_PACKD
-    efk._EF_PACKD = True
     try:
-        test_triton_paths()
+        for packed in (True, False):
+            efk._EF_PACKD = packed
+            test_triton_paths()
+            print(f"test_triton_packed_d[packed={packed}]: OK")
     finally:
         efk._EF_PACKD = old
-    print("test_triton_packed_d: OK (packed-D merged backward)")
 
 
 def test_model_integration():

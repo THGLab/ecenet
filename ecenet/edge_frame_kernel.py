@@ -452,6 +452,74 @@ if _HAS_TRITON:
         tl.store(dds_ptr + d_off, acc_s, mask=d_mask)
 
     @triton.jit
+    def _ef_fwd_packed_kernel(a_ptr, ei_ptr, ej_ptr, dcp_ptr, dsp_ptr,
+                              outc_ptr, outs_ptr,
+                              C, R, S, P,
+                              SP: tl.constexpr, P16: tl.constexpr,
+                              BLOCK_R: tl.constexpr):
+        # _ef_fwd_kernel with the column-gathered D loads replaced by tiles of
+        # the pre-packed (E, S, P) Dc/Ds (ok-zeros baked in by _pack_D).
+        e = tl.program_id(0)
+        offs_r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_k = tl.arange(0, SP)
+        offs_p = tl.arange(0, P16)
+        row_ok = offs_r < R
+
+        ei = tl.load(ei_ptr + e)
+        ej = tl.load(ej_ptr + e)
+        atom = tl.where(offs_r < C, ei, ej)
+        ch = tl.where(offs_r < C, offs_r, offs_r - C)
+        a_ptrs = a_ptr + (atom * C + ch)[:, None] * S + offs_k[None, :]
+        A = tl.load(a_ptrs, mask=row_ok[:, None] & (offs_k[None, :] < S), other=0.0)
+
+        d_off = e * (S * P) + offs_k[:, None] * P + offs_p[None, :]
+        d_mask = (offs_k[:, None] < S) & (offs_p[None, :] < P)
+        Dc = tl.load(dcp_ptr + d_off, mask=d_mask, other=0.0)
+        Ds = tl.load(dsp_ptr + d_off, mask=d_mask, other=0.0)
+
+        OC = tl.dot(A, Dc, input_precision="ieee")                # (BLOCK_R, P16)
+        OS = tl.dot(A, Ds, input_precision="ieee")
+        out_off = e * (R * P) + offs_r[:, None] * P + offs_p[None, :]
+        st_mask = row_ok[:, None] & (offs_p[None, :] < P)
+        tl.store(outc_ptr + out_off, OC, mask=st_mask)
+        tl.store(outs_ptr + out_off, OS, mask=st_mask)
+
+    @triton.jit
+    def _ef_bwd_dx_packed_kernel(dc_ptr, ds_ptr, dct_ptr, dst_ptr,
+                                 cosk_ptr, sink_ptr, dab_ptr,
+                                 C, R, S, P,
+                                 SP: tl.constexpr, P16: tl.constexpr,
+                                 BLOCK_R: tl.constexpr):
+        # _ef_bwd_dx_kernel on the pre-packed (E, P, S) transposed D. The
+        # ok-masks on the grad loads (the eager path's ·valid) stay.
+        e = tl.program_id(0)
+        offs_r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_k = tl.arange(0, SP)
+        offs_p = tl.arange(0, P16)
+        row_ok = offs_r < R
+        p_ok = offs_p < P
+        k_ok = offs_k < S
+
+        cos_ok = tl.load(cosk_ptr + offs_p, mask=p_ok, other=0)
+        sin_ok = tl.load(sink_ptr + offs_p, mask=p_ok, other=0)
+
+        g_off = e * (R * P) + offs_r[:, None] * P + offs_p[None, :]
+        dC = tl.load(dc_ptr + g_off,
+                     mask=row_ok[:, None] & (cos_ok[None, :] > 0), other=0.0)
+        dS = tl.load(ds_ptr + g_off,
+                     mask=row_ok[:, None] & (sin_ok[None, :] > 0), other=0.0)
+
+        t_off = e * (P * S) + offs_p[:, None] * S + offs_k[None, :]
+        t_mask = p_ok[:, None] & k_ok[None, :]
+        DcT = tl.load(dct_ptr + t_off, mask=t_mask, other=0.0)
+        DsT = tl.load(dst_ptr + t_off, mask=t_mask, other=0.0)
+
+        dA = tl.dot(dC, DcT, input_precision="ieee") \
+           + tl.dot(dS, DsT, input_precision="ieee")              # (BLOCK_R, SP)
+        dab_off = e * (R * S) + offs_r[:, None] * S + offs_k[None, :]
+        tl.store(dab_ptr + dab_off, dA, mask=row_ok[:, None] & k_ok[None, :])
+
+    @triton.jit
     def _e2n_fwd_kernel(gc_ptr, gs_ptr, d_ptr, perm_ptr, aptr_ptr,
                         srcoff_ptr, okc_ptr, oks_ptr,
                         delta_ptr,
@@ -502,11 +570,14 @@ _EF_TABLES: dict = {}
 # Triton default of 4 may win; sweep alongside profile_step.
 _EF_WARPS = int(os.environ.get('ECENET_EF_WARPS', 4))
 
-# Packed-D variants of the merged backward kernels (see the kernel comment
-# block): trades the scalar table-gathered D loads / dD scatter-stores
-# (L1-bound per ncu) for dense pre-packed tensors and vectorized tile IO.
-# Off by default until benchmarked; module-level so tests can toggle it.
-_EF_PACKD = os.environ.get('ECENET_EF_PACKD', '0') == '1'
+# Packed-D kernel variants (see the kernel comment block): trade the scalar
+# table-gathered D loads / dD scatter-stores (L1-bound per ncu, 75-86% L1
+# with DRAM at 9-18%) for dense pre-packed tensors and vectorized tile IO,
+# packed once per step on the shared D_block object. Measured on the A100
+# (512-atom box): merged backwards 2.33→1.35 / 1.98→1.65 ms per call, joint
+# force step 111.4→107.8 ms. Default ON; ECENET_EF_PACKD=0 restores the
+# table-gather kernels. Module-level so tests can toggle it.
+_EF_PACKD = os.environ.get('ECENET_EF_PACKD', '1') == '1'
 
 
 def _pack_D(D_block, cos_col, cos_ok, sin_col, sin_ok):
@@ -713,6 +784,15 @@ def _ef_forward_triton(A_emb, edge_i, edge_j, D_block, n_ch, n_ang):
     A_sin = torch.empty_like(A_cos)
     block_r = _ef_block_r(R)
     grid = (E, triton.cdiv(R, block_r))
+    if _EF_PACKD:
+        Dc, Ds, _, _ = _get_packed_D(D_block, n_ang)
+        _ef_fwd_packed_kernel[grid](
+            A_emb.contiguous(), edge_i.contiguous(), ej.contiguous(),
+            Dc, Ds, A_cos, A_sin,
+            C, R, S, P,
+            SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+            num_warps=_EF_WARPS)
+        return A_cos, A_sin
     _ef_fwd_kernel[grid](
         A_emb.contiguous(), edge_i.contiguous(), ej.contiguous(),
         D_block.contiguous(),
@@ -1090,16 +1170,27 @@ class PackUnrotateFused(torch.autograd.Function):
                                        device=m_cos.device)
                 block_r = _ef_block_r(n_base)
                 grid = (E, triton.cdiv(n_base, block_r))
-                _ef_bwd_dx_kernel[grid](
-                    m_cos.contiguous(), m_sin.contiguous(),
-                    # forward wants h @ Dᵀ where the dx kernel computes
-                    # Σ_p g[·,p]·D[k, col(p)] — i.e. it contracts against D's
-                    # COLUMNS, which is exactly the transpose we need.
-                    D_block.contiguous(),
-                    cos_col, cos_ok, sin_col, sin_ok, h_global,
-                    n_base, n_base, S, P,
-                    SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
-                    num_warps=_EF_WARPS)
+                if _EF_PACKD:
+                    # forward wants h @ Dᵀ; the packed dx kernel contracts
+                    # against DcT/DsT (E, P, S), exactly that transpose.
+                    _, _, DcT, DsT = _get_packed_D(D_block, n_ang)
+                    _ef_bwd_dx_packed_kernel[grid](
+                        m_cos.contiguous(), m_sin.contiguous(),
+                        DcT, DsT, cos_ok, sin_ok, h_global,
+                        n_base, n_base, S, P,
+                        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+                        num_warps=_EF_WARPS)
+                else:
+                    _ef_bwd_dx_kernel[grid](
+                        m_cos.contiguous(), m_sin.contiguous(),
+                        # forward wants h @ Dᵀ where the dx kernel computes
+                        # Σ_p g[·,p]·D[k, col(p)] — i.e. it contracts against
+                        # D's COLUMNS, which is exactly the transpose we need.
+                        D_block.contiguous(),
+                        cos_col, cos_ok, sin_col, sin_ok, h_global,
+                        n_base, n_base, S, P,
+                        SP=_next_pow2(S), P16=_next_pow2(P), BLOCK_R=block_r,
+                        num_warps=_EF_WARPS)
             else:
                 h = _pack_grads(m_cos, m_sin, cos_flat_idx, sin_flat_idx,
                                 cos_valid, sin_valid,
