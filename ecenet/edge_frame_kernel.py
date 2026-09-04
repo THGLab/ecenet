@@ -516,15 +516,33 @@ def _pack_D(D_block, cos_col, cos_ok, sin_col, sin_ok):
     return Dc.contiguous(), Ds.contiguous()
 
 
-def _unpack_dD(ddc, dds, cos_col, cos_ok, sin_col, sin_ok, S):
+_UNPACK_IDX: dict = {}
+
+
+def _unpack_indices(S, n_ang, device):
+    """Static integer index pairs for _unpack_dD, cached per (S, n_ang,
+    device). MUST be integer tensors: boolean-mask indexing at call time
+    forces a host-device sync per backward (measured ~10 ms of CPU stall per
+    EdgeFrameFusedBackward — it erased the packed kernels' entire win)."""
+    key = (S, n_ang, str(device))
+    if key not in _UNPACK_IDX:
+        cos_col, cos_ok, sin_col, sin_ok = _ef_tables(S, n_ang, device)
+        vc = cos_ok.bool()
+        vs = sin_ok.bool()
+        _UNPACK_IDX[key] = (vc.nonzero().flatten(), cos_col[vc].long(),
+                            vs.nonzero().flatten(), sin_col[vs].long())
+    return _UNPACK_IDX[key]
+
+
+def _unpack_dD(ddc, dds, S, n_ang):
     """Inverse of _pack_D for the gradient: scatter packed (E, S, P) columns
     back into (E, S, S). cos and sin column sets are disjoint; slots no p
-    touches stay 0 (matches the zeros-init of the table-scatter path)."""
+    touches stay 0 (matches the zeros-init of the table-scatter path).
+    Integer-index ops only — fully async, no host sync."""
+    pc, cc, ps, sc = _unpack_indices(S, n_ang, ddc.device)
     dD = ddc.new_zeros(ddc.shape[0], S, S)
-    vc = cos_ok.bool()
-    vs = sin_ok.bool()
-    dD[:, :, cos_col[vc].long()] = ddc[:, :, vc]
-    dD[:, :, sin_col[vs].long()] = dds[:, :, vs]
+    dD[:, :, cc] = ddc[:, :, pc]
+    dD[:, :, sc] = dds[:, :, ps]
     return dD
 
 
@@ -748,7 +766,7 @@ def _ef_backward_triton(dA_cos, dA_sin, A_emb, edge_i, edge_j, D_block,
                 edge_j.contiguous(), DcT, DsT, args[1], args[3],
                 dA_both, ddc, dds,
                 C, R, S, P, **kw)
-            return _scatter(dA_both), _unpack_dD(ddc, dds, *args, S)
+            return _scatter(dA_both), _unpack_dD(ddc, dds, S, n_ang)
         dD = torch.zeros_like(D_block)     # columns no p touches stay 0
         _ef_bwd_merged_kernel[(E,)](
             dA_cos, dA_sin, A_emb_c, edge_i.contiguous(), edge_j.contiguous(),
@@ -1132,7 +1150,7 @@ class PackUnrotateFused(torch.autograd.Function):
                         Dc, Ds, tabs[1], tabs[3],
                         dm_cos, dm_sin, ddc, dds,
                         n_base, S, P, **kw)
-                    return (dm_cos, dm_sin, _unpack_dD(ddc, dds, *tabs, S),
+                    return (dm_cos, dm_sin, _unpack_dD(ddc, dds, S, n_ang),
                             None, None, None, None)
                 dD = torch.zeros_like(D_block)
                 _pu_bwd_merged_kernel[(E,)](
