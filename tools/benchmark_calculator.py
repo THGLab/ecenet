@@ -7,9 +7,10 @@ this: one machine, one protocol, every model at its best settings.
 
 Scope: competitors trained on the SPICE MACE-OFF split, for a 1-to-1
 comparison — MACE-OFF (foundation shorthands or checkpoint paths), eSEN
-(fairchem, conserving checkpoints), and DPA (DeePMD-kit, --head for
-multi-task branches); the custom module:function hook
-covers anything else. Competitor packages pin conflicting torch versions: run
+(fairchem, conserving checkpoints), DPA (DeePMD-kit, --head for
+multi-task branches), and AllScAIP (fairchem; only OMol25-trained
+checkpoints are public, so its row is an architecture-cost datapoint, not a
+SPICE-accuracy one); the custom module:function hook covers anything else. Competitor packages pin conflicting torch versions: run
 each model in its own conda env and collate with --csv, which appends one
 identical row per run.
 
@@ -95,20 +96,60 @@ def _calc_mace(args):
     return MACECalculator(model_paths=args.checkpoint, **kw)
 
 
+def _fairchem_settings(args, **overrides):
+    """fairchem InferenceSettings honouring this tool's flags. fairchem wraps
+    every forward in its own TF32 context manager keyed on settings.tf32,
+    which overrides the process-wide flags --tf32 sets — pass it here or the
+    run is silently fp32. base_precision_dtype follows --float32 so the CSV
+    dtype column stays truthful (fairchem's own default is float32).
+    Starts from fairchem's 'default' preset (merge_mole + compile)."""
+    from fairchem.core.units.mlip_unit.api.inference import (
+        InferenceSettings, inference_settings_default)
+    kw = vars(inference_settings_default())
+    kw.update(tf32=args.tf32,
+              base_precision_dtype=torch.float32 if args.float32 else torch.float64)
+    kw.update(overrides)
+    return InferenceSettings(**kw)
+
+
 def _calc_esen(args):
     """eSEN via fairchem-core v2. --checkpoint: a local checkpoint file, or a
     pretrained-model name known to fairchem's registry. For MD/benchmarking
     use a *conserving* eSEN checkpoint (autograd forces — the like-for-like
     comparison with ECENet/MACE), not a direct-force variant. Expect API
     drift across fairchem majors (v1 was OCPCalculator) — adjust in its env;
-    some multi-task units also want task_name= on the calculator."""
-    from fairchem.core import FAIRChemCalculator, pretrained_mlip
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        from fairchem.core.units.mlip_unit import load_predict_unit
-        unit = load_predict_unit(args.checkpoint, device=_device(args))
-    else:
-        unit = pretrained_mlip.get_predict_unit(args.checkpoint, device=_device(args))
-    return FAIRChemCalculator(unit)
+    some multi-task units also want --head (task_name) on the calculator."""
+    from fairchem.core import FAIRChemCalculator
+    return FAIRChemCalculator.from_model_checkpoint(
+        args.checkpoint, task_name=args.head,
+        inference_settings=_fairchem_settings(args), device=_device(args))
+
+
+def _calc_allscaip(args):
+    """AllScAIP (arXiv:2603.06567) via fairchem-core >= 2.20. --checkpoint:
+    registry name 'allscaip-md-conserving-all-omol' (use the conserving one —
+    autograd forces, like the others) or a local .pt; the files live in the
+    gated HF repo facebook/OMol25 (`hf auth login` with an approved account).
+    Only the OMol25-trained 85M 'md' models are released — the paper's
+    SPICE-trained AllScAIP-sm (34M) is not, so this row measures the
+    architecture's cost, not a SPICE-fitted model. --head: task_name
+    (default omol). --fuse: torch.compile with the inputs padded to
+    max_atoms = n_atoms (AllScAIP's fixed-size contract; the atom count
+    never changes inside one run of this tool, so the padding is free).
+    Conserving checkpoints always run math SDPA (fairchem falls back from
+    flash/memory-efficient attention for gradient forces), and the
+    all-to-all node attention is O(N^2) — expect the per-atom cost to grow
+    with --repeat, unlike the local models."""
+    from fairchem.core import FAIRChemCalculator
+    if not args.float32:
+        # fairchem 2.22: AllScAIP's radius graph mixes float32 image offsets
+        # with a float64 cell ("expected m1 and m2 to have the same dtype")
+        sys.exit('[allscaip] float32 only — pass --float32')
+    settings = _fairchem_settings(args, compile=args.fuse,
+                                  max_atoms=args.n_atoms if args.fuse else None)
+    return FAIRChemCalculator.from_model_checkpoint(
+        args.checkpoint, task_name=args.head or 'omol',
+        inference_settings=settings, device=_device(args))
 
 
 def _calc_dpa(args):
@@ -128,10 +169,11 @@ def _calc_custom(args):
 
 
 FACTORIES = {'ecenet': _calc_ecenet, 'mace': _calc_mace, 'esen': _calc_esen,
-             'dpa': _calc_dpa, 'custom': _calc_custom}
+             'allscaip': _calc_allscaip, 'dpa': _calc_dpa, 'custom': _calc_custom}
 
 INSTALL_HINT = {'mace': 'pip install mace-torch',
                 'esen': 'pip install fairchem-core',
+                'allscaip': 'pip install "fairchem-core>=2.20"',
                 'dpa': 'pip install deepmd-kit[torch]'}
 
 
@@ -162,7 +204,8 @@ def main():
     p.add_argument('--factory', default=None,
                    help="--calc custom: 'module:function', called as function(args)")
     p.add_argument('--head', default=None,
-                   help='--calc dpa: model branch for multi-task checkpoints')
+                   help='--calc dpa: model branch for multi-task checkpoints; '
+                        '--calc esen/allscaip: fairchem task_name')
     p.add_argument('--box', required=True, help='any ASE-readable structure file')
     p.add_argument('--frame_idx', type=int, default=-1)
     p.add_argument('--repeat', type=int, nargs=3, default=None, metavar=('A', 'B', 'C'),
@@ -178,8 +221,9 @@ def main():
                         'and friends in its own environment.')
     p.add_argument('--fuse', action='store_true',
                    help="enable the model's fast paths (ecenet: edge-frame + "
-                        'activation fusion; mace: enable_cueq; no-op for '
-                        'factories without a hook)')
+                        'activation fusion; mace: enable_cueq; allscaip: '
+                        'torch.compile padded to n_atoms; no-op for factories '
+                        'without a hook)')
     p.add_argument('--device', default=None, help='default: cuda if available')
     p.add_argument('--n_warmup', type=int, default=5)
     p.add_argument('--n_time', type=int, default=20, help='timed single-point calls')
@@ -207,6 +251,7 @@ def main():
     if args.repeat:
         atoms = atoms.repeat(tuple(args.repeat))
     n_atoms = len(atoms)
+    args.n_atoms = n_atoms          # for factories with fixed-size contracts
 
     try:
         atoms.calc = FACTORIES[args.calc](args)
