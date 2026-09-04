@@ -196,8 +196,7 @@ time_fn(f"sph_to_angular (repeat_interleave + gather){_ef}",
         lambda: model.sph_to_angular(A_rot))
 
 if args.edge_frame_fused:
-    from ecenet.edge_frame_kernel import edge_frame_fused, edge_frame_fused_single, \
-        pack_unrotate_fused
+    from ecenet.edge_frame_kernel import edge_frame_fused, edge_frame_fused_single, pack_unrotate_fused
     time_fn("edge-frame fused (gather+rotate+reshape)",
             lambda: edge_frame_fused(A_emb, edge_i, edge_j, D_block_main,
                                      model.sph_to_angular))
